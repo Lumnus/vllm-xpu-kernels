@@ -3,7 +3,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #include "ops.h"
 #include "utils.h"
@@ -51,6 +54,43 @@ inline void async_h2d_with_staging(
   // so record the event on it to ensure the staging buffer remains alive
   // until the DMA transfer completes.
   record_host_alloc_event_if_possible(staging_ptr, staging.get_context());
+}
+
+// B70-K1: an H2D batch whose sources are all USM host allocations (pinned,
+// e.g. torch pin_memory=True / the KV offload pool) can DMA straight from the
+// source; staging only adds a pinned allocation the size of the whole load
+// (kept forever in torch's host cache for sizes <= pinned_max_cached_size_mb)
+// plus a host memcpy of every byte.  Pageable sources still stage.
+// VLLM_XPU_H2D_BATCH_STAGING=1 restores staging for every H2D batch (the
+// snapshot / mutate-after-return contract); read per call, so tests can flip it.
+inline bool h2d_batch_force_staging() {
+  const char* v = std::getenv("VLLM_XPU_H2D_BATCH_STAGING");
+  return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+inline bool all_sources_usm_host(
+    const uint64_t* src_ptrs,
+    const uint64_t* sizes,
+    int64_t n,
+    const sycl::context& ctx) {
+  for (int64_t i = 0; i < n; i++) {
+    if (sizes[i] == 0) continue;
+    if (sycl::get_pointer_type(reinterpret_cast<const void*>(src_ptrs[i]), ctx) !=
+        sycl::usm::alloc::host) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline void log_h2d_batch_direct_once() {
+  static std::once_flag flag;
+  std::call_once(flag, [] {
+    std::fprintf(
+        stderr,
+        "B70-K1: swap_blocks_batch H2D copies directly from USM-host "
+        "(pinned) sources, no pinned staging buffer\n");
+  });
 }
 
 }  // namespace
@@ -231,8 +271,25 @@ void xpuAsyncMemcpyBatch(
     total_bytes += sizes[i];
   }
 
-  if (needs_staging) {
-    // H2D: allocate one contiguous pinned staging buffer, snapshot all source
+  if (needs_staging && !h2d_batch_force_staging() &&
+      all_sources_usm_host(
+          src_ptrs, sizes, n, vllm::xpu::vllmGetQueue(0).get_context())) {
+    // H2D from pinned (USM host) sources: direct async DMA, no staging
+    // (B70-K1).  The caller must keep the source bytes unchanged until the
+    // copies complete on the current stream (vLLM's KV offload holds a ref on
+    // every loaded block until the transfer event has completed; CUDA's
+    // cuMemcpyBatchAsync path makes the same assumption).
+    log_h2d_batch_direct_once();
+    for (int64_t i = 0; i < n; i++) {
+      size_t sz = static_cast<size_t>(sizes[i]);
+      if (sz == 0) continue;
+      queue.memcpy(
+          reinterpret_cast<void*>(dst_ptrs[i]),
+          reinterpret_cast<const void*>(src_ptrs[i]),
+          sz);
+    }
+  } else if (needs_staging) {
+    // H2D from pageable sources (or staging forced): allocate one contiguous pinned staging buffer, snapshot all source
     // blocks, then submit all async DMAs.  This avoids N separate allocator
     // round-trips and protects against caller mutation after return.
     auto staging = at::getHostAllocator(at::kXPU)->allocate(

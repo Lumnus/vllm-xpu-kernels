@@ -112,6 +112,9 @@ MINI_PYTEST_PARAMS = {
     "test_swap_blocks_batch_h2d_mutation_race": {
         "device": ["xpu:0"],
     },
+    "test_swap_blocks_batch_h2d_pinned_direct": {
+        "device": ["xpu:0"],
+    },
     "test_gather_and_maybe_dequant_cache_mla": {
         "block_size": [8],
         "num_blocks": [8],
@@ -1059,8 +1062,13 @@ def test_swap_blocks_batch(
 
 @pytest.mark.parametrize("device", DEVICES)
 @torch.inference_mode()
-def test_swap_blocks_batch_h2d_mutation_race(device: str) -> None:
-    """Verify staging buffer protects against caller mutation for H2D batch."""
+def test_swap_blocks_batch_h2d_mutation_race(device: str, monkeypatch) -> None:
+    """Verify staging buffer protects against caller mutation for H2D batch.
+
+    Pinned sources are copied directly since B70-K1; the snapshot contract
+    holds only with VLLM_XPU_H2D_BATCH_STAGING=1, which this test sets.
+    """
+    monkeypatch.setenv("VLLM_XPU_H2D_BATCH_STAGING", "1")
     num_mappings = 16
     num_heads = 8
     head_size = 8
@@ -1114,6 +1122,57 @@ def test_swap_blocks_batch_h2d_mutation_race(device: str) -> None:
             dst_val[0][db].cpu(),
             msg=f"Value block {sb}→{db} corrupted by post-call mutation",
         )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_swap_blocks_batch_h2d_pinned_direct(device: str, monkeypatch) -> None:
+    """B70-K1: H2D batch from a pinned (USM host) source takes the direct
+    path (no staging); bytes must match once the stream has completed, and a
+    mutation after synchronize must not reach the destination."""
+    monkeypatch.delenv("VLLM_XPU_H2D_BATCH_STAGING", raising=False)
+    num_mappings = 32
+    num_heads = 8
+    head_size = 64
+    block_size = 16
+    num_blocks = 64
+    dtype = torch.bfloat16
+    seed = 0
+
+    seed_everything(seed)
+    torch.xpu.set_device(device)
+
+    src_blocks = random.sample(range(num_blocks), num_mappings)
+    dst_blocks = random.sample(range(num_blocks), num_mappings)
+    block_mapping = list(zip(src_blocks, dst_blocks))
+
+    src_key, src_val = create_kv_caches_with_pinned(num_blocks, block_size, 1,
+                                                    num_heads, head_size,
+                                                    "auto", dtype, seed, "cpu")
+    assert src_key[0].is_pinned() and src_val[0].is_pinned()
+    dst_key, dst_val = create_kv_caches_with_random(num_blocks, block_size, 1,
+                                                    num_heads, head_size,
+                                                    "auto", dtype, seed)
+
+    src_key_clone = src_key[0].clone()
+    src_val_clone = src_val[0].clone()
+    block_size_in_bytes = src_key[0].element_size() * src_key[0].stride(0)
+
+    for src_cache, dst_cache in [(src_key[0], dst_key[0]),
+                                 (src_val[0], dst_val[0])]:
+        sp, dp, sz = _build_batch_args(src_cache, dst_cache, block_mapping,
+                                       block_size_in_bytes)
+        ops.swap_blocks_batch(sp, dp, sz)
+
+    torch.xpu.synchronize()
+    src_key[0].fill_(0)
+    src_val[0].fill_(0)
+
+    for sb, db in block_mapping:
+        torch.testing.assert_close(src_key_clone[sb].cpu(),
+                                   dst_key[0][db].cpu())
+        torch.testing.assert_close(src_val_clone[sb].cpu(),
+                                   dst_val[0][db].cpu())
 
 
 @pytest.mark.skipif(torch.xpu.device_count() < 2,
