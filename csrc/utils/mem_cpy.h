@@ -40,8 +40,12 @@ void xpuAsyncMemcpy(
  * The copy direction is auto-detected from the first non-zero entry's USM
  * pointer types.  All entries must share the same direction.
  *
- * For H2D: snapshots all source blocks through a single contiguous pinned
- *   staging buffer so the caller may safely mutate host memory immediately.
+ * For H2D from pinned (USM host) sources: direct async DMA, no staging
+ *   (B70-K1).  The caller must not mutate the source until the copies have
+ *   completed on the current stream.
+ * For H2D from pageable sources, or with VLLM_XPU_H2D_BATCH_STAGING=1:
+ *   snapshots all source blocks through a single contiguous pinned staging
+ *   buffer so the caller may safely mutate host memory immediately.
  * For D2H / D2D: direct async DMA without staging.
  *
  * @param src_ptrs   Array of N raw source addresses
