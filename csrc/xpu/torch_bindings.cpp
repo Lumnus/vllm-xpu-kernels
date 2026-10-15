@@ -79,6 +79,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "Tensor rows_per_expert, int N, int K, int num_experts) -> Tensor");
   xpu_ops.impl(
       "cutlass_grouped_gemm_w4a8", torch::kXPU, &cutlass_grouped_gemm_w4a8);
+  xpu_ops.def(
+      "moe_int4_gemv(Tensor A, Tensor B, Tensor B_scale, "
+      "Tensor rows_per_expert, Tensor! D, int N, int K, int num_experts) -> "
+      "()");
+  xpu_ops.impl("moe_int4_gemv", torch::kXPU, &moe_int4_gemv);
 #endif
 
   xpu_ops.def(
