@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Cyclic ownership of intact 128-wide expert groups, with unchanged W4 data.
+
+Global group 5*expert+group is owned by its index modulo four. Every rank
+stores 640 groups: exactly the bytes of the former 128 complete experts.
+Redistribution happens once, before graph capture or KV capacity allocation.
+"""
+import copy
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+
+torch.ops.load_library(str(Path(__file__).with_name('libastra_groups.so')))
+torch.ops.load_library(str(Path(__file__).with_name('libastra_batch.so')))
+_prepared_layers = 0
+
+
+def exchange(tensor, kind, cpu_group):
+    """Return this rank's groups in global-ID order using one CPU all-to-all."""
+    cpu = tensor.detach().cpu()
+    if kind in ('w1', 's1'):
+        last = cpu.shape[-1]
+        groups = cpu.reshape(128, 2, 5, 128, last).permute(0, 2, 1, 3, 4)
+        groups = groups.contiguous().reshape(640, 256, last)
+    elif kind == 'w2':
+        groups = cpu.reshape(128, 2560, 5, 64).permute(0, 2, 1, 3)
+        groups = groups.contiguous().reshape(640, 2560, 64)
+    else:
+        assert kind == 's2'
+        groups = cpu.permute(0, 2, 1).contiguous().reshape(640, 2560, 1)
+    # Each original rank's 640 consecutive global groups contributes 160 to
+    # every destination. Receive order is source rank, hence global ID order.
+    send = groups.reshape(160, 4, *groups.shape[1:]).transpose(0, 1)
+    send = send.contiguous().reshape_as(groups)
+    receive = torch.empty_like(groups)
+    dist.all_to_all_single(receive, send, group=cpu_group)
+    return receive
+
+
+def prepare(module):
+    global _prepared_layers
+    if not (
+        module.recipe == 'int4' and module.ep_size == 4
+        and module.num_experts == 128 and module.inter_size == 640
+        and module.w13.shape == (128, 1280, 1280)
+        and module.w2.shape == (128, 2560, 320)
+        and module.gemm1_wei_scales.shape == (128, 1280, 20)
+        and module.gemm2_wei_scales.shape == (128, 2560, 5)
+        and module.gemm1_wei_scales.dtype == torch.bfloat16
+        and module.gemm2_wei_scales.dtype == torch.bfloat16
+        and module.activation == 'silu' and module.n_experts_per_token == 10
+        and module.w13_bias is None and module.w2_bias is None
+        and not module.gemm1_clamp_limit and module.expert_map is not None
+    ):
+        return
+    expected = torch.full((512,), -1, dtype=torch.int32)
+    expected[module.ep_rank * 128:(module.ep_rank + 1) * 128] = torch.arange(128)
+    if not torch.equal(module.expert_map.cpu(), expected):
+        return
+    from vllm.distributed import get_tp_group
+    group = get_tp_group()
+    assert group.world_size == 4 and group.rank_in_group == module.ep_rank
+    tensors = [module.w13, module.gemm1_wei_scales,
+               module.w2, module.gemm2_wei_scales]
+    shapes = [(640, 256, 1280), (640, 256, 20),
+              (640, 2560, 64), (640, 2560, 1)]
+    for kind, tensor in zip(('w1', 's1', 'w2', 's2'), tensors):
+        received = exchange(tensor, kind, group.cpu_group)
+        assert received.numel() == tensor.numel() and received.dtype == tensor.dtype
+        # Keep the existing allocation and Parameter aliases; no extra device
+        # weight table survives this copy and no quantization is performed.
+        tensor.copy_(received.reshape_as(tensor))
+    local = copy.copy(module)
+    local.w13, local.gemm1_wei_scales, local.w2, local.gemm2_wei_scales = [
+        tensor.view(shape) for tensor, shape in zip(tensors, shapes)]
+    local.num_experts = local.local_experts_num = local.total_experts_num = 640
+    local.inter_size = 128
+    local.n_experts_per_token = 20
+    local.ep_size = 1
+    local.expert_map = None
+    local._astra_groups = None
+    module._astra_groups = local
+    _prepared_layers += 1
+    if _prepared_layers in (1, 48):
+        from vllm.logger import init_logger
+        init_logger(__name__).info(
+            'Astra group ownership ready: layers=%d, rank=%d, groups=640, '
+            'group_width=128, weight_bytes_unchanged=True',
+            _prepared_layers, module.ep_rank)
+
+
+def apply(module, output, hidden, weights, ids, expert_map, activation_scales):
+    local = module._astra_groups
+    assert hidden.dtype == torch.bfloat16 and hidden.shape[1] == 2560
+    assert ids.shape == weights.shape == (hidden.shape[0], 10)
+    assert expert_map is None and activation_scales is None
+    if hidden.shape[0] == 8:
+        torch.ops.astra_groups_v2.forward(
+            hidden, local.w13, local.gemm1_wei_scales,
+            local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
+        return
+    if hidden.shape[0] in (16, 24, 32):
+        # Compact actual token rows across requests, retaining their reuse.
+        # The native path fuses route metadata, gate/up/activation and gather;
+        # the outer consumer still reduces the entire block exactly once.
+        torch.ops.astra_batch.forward(
+            hidden, local.w13, local.gemm1_wei_scales,
+            local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
+        return
+    # Each selected expert has one group here, plus a second for one rank.
+    # Expand to at most 20 local routes, not 50 global virtual-expert routes.
+    first = (module.ep_rank - ids.remainder(4)).remainder(4)
+    slot = (5 * ids + first) // 4
+    local_ids = torch.stack((slot, torch.where(first == 0, slot + 1, -1)), dim=-1)
+    local_ids = local_ids.flatten(1)
+    valid = ids.repeat_interleave(2, dim=1) >= 0
+    local_ids = torch.where(valid, local_ids, -1)
+    local_weights = weights.repeat_interleave(2, dim=1)
+    fallback(local, output, hidden, local_weights, local_ids)
+
+
+def fallback(local, output, hidden, weights, ids):
+    """The existing remap/GEMM/gather operations specialized for 20 routes."""
+    rows = hidden.shape[0]
+    remapped = torch.empty((rows * 20, 2560), device=hidden.device, dtype=hidden.dtype)
+    counts = torch.zeros(640, device=hidden.device, dtype=torch.int32)
+    inverse = torch.empty((rows, 20), device=hidden.device, dtype=torch.int32)
+    torch.ops.astra_groups_v2.remap(
+        hidden, None, remapped, None, None, counts, inverse, ids, 640, 640)
+    up = torch.empty((rows * 20, 256), device=hidden.device, dtype=hidden.dtype)
+    act = torch.empty((rows * 20, 128), device=hidden.device, dtype=hidden.dtype)
+    down = torch.empty_like(remapped)
+
+    def gemm(x, weight, scales, out, n, k):
+        if rows <= 32:
+            torch.ops.astra_moe_k.grouped(
+                x, weight, scales, out, counts, n, k, 640, 6)
+        else:
+            torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+                ptr_A=x, ptr_A_scale=None, ptr_B=weight, ptr_B_scale=scales,
+                ptr_bias=None, ptr_D=out, rows_per_expert=counts,
+                N=n, K=k, num_experts=640)
+
+    gemm(remapped, local.w13, local.gemm1_wei_scales, up, 256, 2560)
+    torch.ops._C.silu_and_mul(act, up)
+    gemm(act, local.w2, local.gemm2_wei_scales, down, 2560, 128)
+    torch.ops.astra_groups_v2.gather(output, down, weights, inverse, 640)
