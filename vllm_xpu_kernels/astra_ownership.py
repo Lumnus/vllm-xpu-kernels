@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 torch.ops.load_library(str(Path(__file__).with_name('libastra_groups.so')))
 torch.ops.load_library(str(Path(__file__).with_name('libastra_batch.so')))
+torch.ops.load_library(str(Path(__file__).with_name('libbeyond_prefill.so')))
 _prepared_layers = 0
 
 
@@ -105,6 +106,14 @@ def apply(module, output, hidden, weights, ids, expert_map, activation_scales):
         # The native path fuses route metadata, gate/up/activation and gather;
         # the outer consumer still reduces the entire block exactly once.
         torch.ops.astra_batch.forward(
+            hidden, local.w13, local.gemm1_wei_scales,
+            local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
+        return
+    if 0 < hidden.shape[0] <= 1024:
+        # One input row per routed expert is shared by that expert's one or
+        # two owned groups. Gate/up coexecution writes only the activation.
+        # Keep C1 and C2-C4's specialized paths above; no extra collective.
+        torch.ops.astra_prefill2.forward(
             hidden, local.w13, local.gemm1_wei_scales,
             local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
         return
