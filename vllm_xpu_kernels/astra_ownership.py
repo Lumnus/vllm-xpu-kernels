@@ -16,6 +16,7 @@ torch.ops.load_library(str(Path(__file__).with_name('libastra_batch.so')))
 torch.ops.load_library(str(Path(__file__).with_name('libbeyond_prefill.so')))
 torch.ops.load_library(str(Path(__file__).with_name('libdominant_w4_layout.so')))
 torch.ops.load_library(str(Path(__file__).with_name('libserving_prefill.so')))
+torch.ops.load_library(str(Path(__file__).with_name('liblong_prefill_v3.so')))
 _prepared_layers = 0
 
 
@@ -121,9 +122,11 @@ def apply(module, output, hidden, weights, ids, expert_map, activation_scales):
         # One input row per routed expert is shared by that expert's one or
         # two owned groups. Gate/up coexecution writes only the activation.
         # Keep C1 and C2-C4's specialized paths above; no extra collective.
-        torch.ops.astra_prefill2.forward(
+        # Share route metadata across eight adjacent output columns. Keep the
+        # existing group weights, BF16 partials and ordered FP32 route sum.
+        torch.ops.long_prefill_v3.forward(
             hidden, local.w13, local.gemm1_wei_scales,
-            local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
+            local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output, 0)
         return
     # Each selected expert has one group here, plus a second for one rank.
     # Expand to at most 20 local routes, not 50 global virtual-expert routes.
