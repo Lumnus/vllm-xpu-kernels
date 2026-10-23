@@ -15,6 +15,7 @@ torch.ops.load_library(str(Path(__file__).with_name('libastra_groups.so')))
 torch.ops.load_library(str(Path(__file__).with_name('libastra_batch.so')))
 torch.ops.load_library(str(Path(__file__).with_name('libbeyond_prefill.so')))
 torch.ops.load_library(str(Path(__file__).with_name('libdominant_w4_layout.so')))
+torch.ops.load_library(str(Path(__file__).with_name('libserving_prefill.so')))
 _prepared_layers = 0
 
 
@@ -107,6 +108,12 @@ def apply(module, output, hidden, weights, ids, expert_map, activation_scales):
         # The native path fuses route metadata, gate/up/activation and gather;
         # the outer consumer still reduces the entire block exactly once.
         torch.ops.astra_batch.forward(
+            hidden, local.w13, local.gemm1_wei_scales,
+            local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
+        return
+    if 0 < hidden.shape[0] <= 256:
+        # Short prefills have few rows per expert; avoid 32-row tile padding.
+        torch.ops.serving_prefill8.forward(
             hidden, local.w13, local.gemm1_wei_scales,
             local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
         return
