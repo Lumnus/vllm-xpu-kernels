@@ -14,6 +14,7 @@ import torch.distributed as dist
 torch.ops.load_library(str(Path(__file__).with_name('libastra_groups.so')))
 torch.ops.load_library(str(Path(__file__).with_name('libastra_batch.so')))
 torch.ops.load_library(str(Path(__file__).with_name('libbeyond_prefill.so')))
+torch.ops.load_library(str(Path(__file__).with_name('libdominant_w4_layout.so')))
 _prepared_layers = 0
 
 
@@ -97,9 +98,9 @@ def apply(module, output, hidden, weights, ids, expert_map, activation_scales):
     assert ids.shape == weights.shape == (hidden.shape[0], 10)
     assert expert_map is None and activation_scales is None
     if hidden.shape[0] == 8:
-        torch.ops.astra_groups_v2.forward(
+        torch.ops.dominant_w4_layout.forward(
             hidden, local.w13, local.gemm1_wei_scales,
-            local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
+            local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output, 1)
         return
     if hidden.shape[0] in (16, 24, 32):
         # Compact actual token rows across requests, retaining their reuse.
