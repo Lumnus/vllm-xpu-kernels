@@ -46,6 +46,9 @@ def exchange(tensor, kind, cpu_group):
 
 def prepare(module):
     global _prepared_layers
+    if _os.getenv("B70_ASTRA_OWNERSHIP", "1") != "1":
+        # B70-V32-06: keep vLLM's EP expert layout (no cyclic group ownership).
+        return
     if not (
         module.recipe == 'int4' and module.ep_size == 4
         and module.num_experts == 128 and module.inter_size == 640
