@@ -18,6 +18,8 @@ torch.ops.load_library(str(Path(__file__).with_name('libdominant_w4_layout.so'))
 torch.ops.load_library(str(Path(__file__).with_name('libserving_prefill.so')))
 torch.ops.load_library(str(Path(__file__).with_name('liblong_prefill_v3.so')))
 _prepared_layers = 0
+import os as _os
+_B70_MID = _os.getenv("B70_ASTRA_MID", "prefill8")
 
 
 def exchange(tensor, kind, cpu_group):
@@ -112,13 +114,17 @@ def apply(module, output, hidden, weights, ids, expert_map, activation_scales):
             hidden, local.w13, local.gemm1_wei_scales,
             local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
         return
-    if 0 < hidden.shape[0] <= 256:
+    if 32 < hidden.shape[0] <= 64 and _B70_MID == "fallback":
+        # B70-V32-05: 5-8 decode requests x (1+K=7) rows through the generic
+        # 20-route path (cutlass grouped GEMM) instead of the prefill kernel.
+        pass
+    elif 0 < hidden.shape[0] <= 256:
         # Short prefills have few rows per expert; avoid 32-row tile padding.
         torch.ops.serving_prefill8.forward(
             hidden, local.w13, local.gemm1_wei_scales,
             local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
         return
-    if 0 < hidden.shape[0] <= 1024:
+    if 0 < hidden.shape[0] <= 1024 and not (32 < hidden.shape[0] <= 64 and _B70_MID == "fallback"):
         # One input row per routed expert is shared by that expert's one or
         # two owned groups. Gate/up coexecution writes only the activation.
         # Keep C1 and C2-C4's specialized paths above; no extra collective.
