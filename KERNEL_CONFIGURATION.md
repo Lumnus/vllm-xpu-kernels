@@ -370,6 +370,14 @@ VLLM_PAGED_DECODE_CONFIG=paged_decode_full.conf pip install .
 VLLM_PAGED_DECODE_CONFIG=paged_decode_default.conf pip install .
 ```
 
+### Missing kernel at runtime: reference fallback
+
+When `flash_attn_varlen_func` hits a config that was not compiled, it warns once
+and runs a PyTorch reference implementation instead (much slower). The fallback
+is not used during XPU graph capture, where it cannot run; the error above is
+raised instead. Set `VLLM_XPU_DISABLE_ATTN_FALLBACK=1` to raise in every case,
+e.g. to make a deployment fail at startup rather than run degraded.
+
 ### How to check which configs were compiled
 
 CMake prints a summary during build:

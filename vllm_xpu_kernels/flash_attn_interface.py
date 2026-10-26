@@ -614,6 +614,19 @@ def flash_attn_varlen_func(
         except RuntimeError as e:
             if "not compiled" not in str(e):
                 raise
+            # The reference implementation reads sequence lengths on the
+            # host, so it cannot run inside XPU graph capture. Raise there,
+            # and wherever the user asked for no fallback, instead of
+            # degrading silently.
+            if (torch.xpu.is_current_stream_capturing()
+                    or os.environ.get("VLLM_XPU_DISABLE_ATTN_FALLBACK",
+                                      "0") == "1"):
+                raise RuntimeError(
+                    "XPU attention kernel not compiled for this config and "
+                    "the PyTorch reference fallback is not allowed here "
+                    "(XPU graph capture, or "
+                    "VLLM_XPU_DISABLE_ATTN_FALLBACK=1). Rebuild with the "
+                    f"config line below.\n{e}") from e
             # Fallback to PyTorch reference implementation.
             # Emit the notice once per unique missing config and write
             # it straight to stderr.
