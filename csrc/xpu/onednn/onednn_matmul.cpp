@@ -4,6 +4,7 @@
 #include "fp8_gemm_w8a16.h"
 #include "int4_gemm_w4a16.h"
 #include "int4_gemm_w4a8.h"
+#include "int8_gemm_w8a8.h"
 
 inline bool is_supported_fp8(at::ScalarType t) {
   return (t == at::ScalarType::Float8_e5m2) ||
@@ -272,6 +273,57 @@ torch::Tensor int4_gemm_w4a16(
   torch::Tensor result = check_and_create_output_tensor(A, B, A.scalar_type());
 
   oneDNN::dnnl_matmul_w4a16_int4(result, A, B, bias, B_scale, B_zp, group_size);
+  return result;
+}
+
+torch::Tensor int8_scaled_mm(
+    const torch::Tensor& A,        // [m, k] int8
+    const torch::Tensor& A_scale,  // f32, m (per-token) or 1 (per-tensor)
+    const torch::Tensor& B,        // [k, n] int8 (NT view of [n, k] or NN)
+    const torch::Tensor& B_scale,  // f32, n (per-channel) or 1 (per-tensor)
+    c10::ScalarType out_dtype,     // f16 or bf16
+    const std::optional<torch::Tensor>& bias) {  // [n] or None
+  TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "int8_scaled_mm: 2-D A and B");
+  TORCH_CHECK(
+      A.scalar_type() == at::ScalarType::Char &&
+          B.scalar_type() == at::ScalarType::Char,
+      "int8_scaled_mm: A and B must be int8");
+  TORCH_CHECK(A.stride(1) == 1, "int8_scaled_mm: A rows must be contiguous");
+  TORCH_CHECK(A.size(1) == B.size(0), "int8_scaled_mm: K mismatch");
+  TORCH_CHECK(
+      out_dtype == at::ScalarType::Half ||
+          out_dtype == at::ScalarType::BFloat16,
+      "int8_scaled_mm: out dtype must be f16 or bf16");
+  const int64_t m = A.size(0);
+  const int64_t n = B.size(1);
+  TORCH_CHECK(
+      A_scale.scalar_type() == at::ScalarType::Float &&
+          B_scale.scalar_type() == at::ScalarType::Float,
+      "int8_scaled_mm: scales must be float32");
+  TORCH_CHECK(
+      A_scale.numel() == m || A_scale.numel() == 1,
+      "int8_scaled_mm: A_scale must be per-token [m] or per-tensor [1]");
+  TORCH_CHECK(
+      B_scale.numel() == n || B_scale.numel() == 1,
+      "int8_scaled_mm: B_scale must be per-channel [n] or per-tensor [1]");
+  if (bias.has_value() && bias->defined()) {
+    TORCH_CHECK(
+        bias->numel() == n && bias->is_contiguous(),
+        "int8_scaled_mm: bias must be contiguous [n]");
+  }
+  const at::DeviceGuard device_guard(A.device());
+  torch::Tensor result = at::empty({m, n}, A.options().dtype(out_dtype));
+  if (m == 0 || n == 0) return result;
+
+  torch::Tensor a_sc = A_scale.numel() == 1
+                           ? A_scale.reshape({1}).contiguous()
+                           : A_scale.reshape({m, 1}).contiguous();
+  torch::Tensor b_sc = B_scale.numel() == 1
+                           ? B_scale.reshape({1}).contiguous()
+                           : B_scale.reshape({1, n}).contiguous();
+  std::optional<torch::Tensor> b;
+  if (bias.has_value() && bias->defined()) b = bias->reshape({n});
+  oneDNN::dnnl_matmul_w8a8_int8(result, A, a_sc, B, b_sc, b);
   return result;
 }
 

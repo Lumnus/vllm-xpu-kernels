@@ -62,6 +62,16 @@ torch::Tensor int4_gemm_w4a16(
     int64_t group_size,
     const std::optional<torch::Tensor>& g_idx);
 
+// B70: W8A8 int8 GEMM (oneDNN), symmetric s8 x s8, per-token or per-tensor
+// activation scale, per-channel or per-tensor weight scale, f16/bf16 out.
+torch::Tensor int8_scaled_mm(
+    const torch::Tensor& A,
+    const torch::Tensor& A_scale,
+    const torch::Tensor& B,
+    const torch::Tensor& B_scale,
+    c10::ScalarType out_dtype,
+    const std::optional<torch::Tensor>& bias);
+
 torch::Tensor int4_gemm_w4a8(
     const torch::Tensor& A_,
     const torch::Tensor& A_scale,

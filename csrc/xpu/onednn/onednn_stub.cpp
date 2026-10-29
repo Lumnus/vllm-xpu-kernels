@@ -78,6 +78,16 @@ torch::Tensor int4_gemm_w4a16(
   onednn_not_built("int4_gemm_w4a16");
 }
 
+torch::Tensor int8_scaled_mm(
+    const torch::Tensor& A,
+    const torch::Tensor& A_scale,
+    const torch::Tensor& B,
+    const torch::Tensor& B_scale,
+    c10::ScalarType out_dtype,
+    const std::optional<torch::Tensor>& bias) {
+  onednn_not_built("int8_scaled_mm");
+}
+
 torch::Tensor int4_gemm_w4a8(
     const torch::Tensor& A_,
     const torch::Tensor& A_scale,
