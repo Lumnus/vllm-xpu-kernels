@@ -16,8 +16,6 @@
 
 #include "quantization/int8/int8_quant_math.h"
 
-#pragma float_control(precise, on, push)
-
 namespace vllm {
 
 template <typename scalar_t, typename scale_t, int VEC>
@@ -105,8 +103,6 @@ class dynamic_per_token_int8_quant_kernel {
 };
 
 }  // namespace vllm
-
-#pragma float_control(pop)
 
 namespace {
 

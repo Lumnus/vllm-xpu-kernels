@@ -13,9 +13,10 @@
 
 #include <cstdint>
 
-// icpx defaults to -ffp-model=fast; a reciprocal-multiply or a contracted
-// op here would break the exact match with the reference.
-#pragma float_control(precise, on, push)
+// icpx defaults to -ffp-model=fast and SYCL fp32 division to 2.5 ulp; either
+// would break the exact match. The device TU (int8_quant.cpp) is therefore
+// compiled with -ffp-model=precise -foffload-fp32-prec-div (CMakeLists.txt);
+// '#pragma float_control' is ignored for spir64 and cannot do it.
 
 namespace vllm {
 namespace int8q {
@@ -42,4 +43,3 @@ inline float max_f(float a, float b) { return a > b ? a : b; }
 }  // namespace int8q
 }  // namespace vllm
 
-#pragma float_control(pop)
