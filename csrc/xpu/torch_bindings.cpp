@@ -55,6 +55,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "bias) -> Tensor");
   xpu_ops.impl("int4_gemm_w4a8", torch::kXPU, &int4_gemm_w4a8);
 
+  // B70: W8A8 int8 GEMM (oneDNN); per-token/per-tensor A scale,
+  // per-channel/per-tensor B scale.
+  xpu_ops.def(
+      "int8_scaled_mm(Tensor A, Tensor A_scale, Tensor B, Tensor B_scale, "
+      "ScalarType out_dtype, Tensor? bias) -> Tensor");
+  xpu_ops.impl("int8_scaled_mm", torch::kXPU, &int8_scaled_mm);
+
 #ifdef VLLM_MOE_ENABLED
   xpu_ops.def(
       "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor? ptr_A_scale, "
