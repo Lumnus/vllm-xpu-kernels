@@ -71,6 +71,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "cutlass_grouped_gemm_interface",
       torch::kXPU,
       &cutlass_grouped_gemm_interface);
+
+  // B70 W4A8 grouped GEMM: int8 per-token activations x int4 g128 weights.
+  xpu_ops.def(
+      "cutlass_grouped_gemm_w4a8(Tensor ptr_A, Tensor ptr_A_scale, "
+      "Tensor ptr_B, Tensor ptr_B_scale, Tensor? ptr_bias, Tensor ptr_D, "
+      "Tensor rows_per_expert, int N, int K, int num_experts) -> Tensor");
+  xpu_ops.impl(
+      "cutlass_grouped_gemm_w4a8", torch::kXPU, &cutlass_grouped_gemm_w4a8);
 #endif
 
   xpu_ops.def(
