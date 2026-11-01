@@ -16,6 +16,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "cutlass_grouped_gemm_w4a8",
       torch::kXPU,
       &cutlass_grouped_gemm_w4a8_xe2);
+  m.def(
+      "cutlass_grouped_gemm_w4a8_silu_quant(Tensor ptr_A, Tensor ptr_A_scale, "
+      "Tensor ptr_B, Tensor ptr_B_scale, Tensor? ptr_bias, Tensor! q_out, "
+      "Tensor! q_scale, Tensor rows_per_expert, int inter, int K, "
+      "int num_experts) -> ()");
+  m.impl(
+      "cutlass_grouped_gemm_w4a8_silu_quant",
+      torch::kXPU,
+      &cutlass_grouped_gemm_w4a8_silu_quant_xe2);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

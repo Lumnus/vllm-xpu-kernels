@@ -94,3 +94,36 @@ torch::Tensor cutlass_grouped_gemm_w4a8(
   TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
 #endif
 }
+
+void cutlass_grouped_gemm_w4a8_silu_quant(
+    torch::Tensor ptr_A,
+    torch::Tensor ptr_A_scale,
+    torch::Tensor ptr_B,
+    torch::Tensor ptr_B_scale,
+    const c10::optional<at::Tensor>& ptr_bias,
+    torch::Tensor q_out,
+    torch::Tensor q_scale,
+    torch::Tensor rows_per_expert,
+    int64_t inter,
+    int64_t K,
+    int64_t num_experts) {
+#ifdef VLLM_XPU_ENABLE_XE2
+  TORCH_CHECK(
+      vllm::xpu::is_xe2_arch(),
+      "cutlass_grouped_gemm_w4a8_silu_quant needs an Xe2 GPU");
+  cutlass_grouped_gemm_w4a8_silu_quant_xe2(
+      ptr_A,
+      ptr_A_scale,
+      ptr_B,
+      ptr_B_scale,
+      ptr_bias,
+      q_out,
+      q_scale,
+      rows_per_expert,
+      inter,
+      K,
+      num_experts);
+#else
+  TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
+#endif
+}
