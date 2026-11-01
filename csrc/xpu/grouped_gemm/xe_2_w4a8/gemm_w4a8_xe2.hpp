@@ -153,7 +153,6 @@ CUTE_DEVICE void xe_gemm_w4a8(
   // Value i of the C fragment is column n_lane0 + (i / SG_M) * 16 (the
   // layout the stock bias epilogue relies on; s32 == f32 layout).
   float wsc[N_COLS];
-  float asc[SG_M];  // AG > 0: this flush's activation scale per row
   const int ag_num = AG > 0 ? static_cast<int>(get<1>(A.shape())) / AG : 1;
 
   clear(tCrC);
@@ -186,21 +185,6 @@ CUTE_DEVICE void xe_gemm_w4a8(
       }
     }
 
-    if constexpr (AG > 0) {
-      if (k_tile % k_tiles_per_flush == 0) {
-        // Value i = c * SG_M + sm sits on the row of value sm (the column
-        // block varies with c only), so one scale per sm.
-        const int ag = (k_tile * tile_k) / AG;
-        CUTLASS_PRAGMA_UNROLL
-        for (int sm = 0; sm < SG_M; ++sm) {
-          const int m = get<0>(tCcC(sm));
-          asc[sm] = m < gemm_m
-                        ? AScales[static_cast<int64_t>(m) * ag_num + ag]
-                        : 0.0f;
-        }
-      }
-    }
-
     if (k_tile_prefetch < k_tile_count) {
       prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
       prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
@@ -214,14 +198,29 @@ CUTE_DEVICE void xe_gemm_w4a8(
     barrier_wait(barrier_scope);
 
     if ((k_tile + 1) % k_tiles_per_flush == 0 || k_tile + 1 == k_tile_count) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int c = 0; c < N_COLS; ++c) {
+      if constexpr (AG > 0) {
+        // Value i = c * SG_M + sm sits on the row of value sm (the column
+        // block varies with c only): one activation scale per sm, loaded
+        // here so nothing extra stays live across the MMA.
+        const int ag = (k_tile * tile_k) / AG;
         CUTLASS_PRAGMA_UNROLL
         for (int sm = 0; sm < SG_M; ++sm) {
-          const int i = c * SG_M + sm;
-          if constexpr (AG > 0) {
-            tCrF(i) += static_cast<float>(tCrC(i)) * (wsc[c] * asc[sm]);
-          } else {
+          const int m = get<0>(tCcC(sm));
+          const float as =
+              m < gemm_m ? AScales[static_cast<int64_t>(m) * ag_num + ag]
+                         : 0.0f;
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < N_COLS; ++c) {
+            const int i = c * SG_M + sm;
+            tCrF(i) += static_cast<float>(tCrC(i)) * (wsc[c] * as);
+          }
+        }
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int c = 0; c < N_COLS; ++c) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int sm = 0; sm < SG_M; ++sm) {
+            const int i = c * SG_M + sm;
             tCrF(i) += static_cast<float>(tCrC(i)) * wsc[c];
           }
         }

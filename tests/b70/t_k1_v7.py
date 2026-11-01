@@ -364,7 +364,8 @@ def run_gemm_prefill(fm, w4, T, seed, grid):
     ids, _ = routing(T, seed + T)
     rpe = torch.zeros(fm.num_experts, dtype=torch.int32, device=DEV)
     loc = fm.expert_map[ids.long()]
-    rpe.index_add_(0, loc[loc >= 0].int(), torch.ones_like(loc[loc >= 0], dtype=torch.int32))
+    sel = loc[loc >= 0].long()
+    rpe.index_add_(0, sel, torch.ones_like(sel, dtype=torch.int32))
     rows = int(rpe.sum().item())
     op = torch.ops._xpu_C.cutlass_grouped_gemm_w4a8
     glu = torch.ops._xpu_C.cutlass_grouped_gemm_w4a8_silu_quant

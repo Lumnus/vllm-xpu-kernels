@@ -104,36 +104,39 @@ void w8a16_launch(
 
             for (int c = c_beg + lane; c < c_end; c += kSG) {
               const int k = c * 16;
-              float xf[MC][16];
+              // Activations stay packed (MC x 16 x 16-bit) and convert per
+              // element: keeps the live set ~MC*8 + NR*MC + NR*4 GRFs.
+              XV xv[MC][2];
 #pragma unroll
               for (int m = 0; m < MC; ++m) {
                 if (m < mc) {
                   const XV* xp = reinterpret_cast<const XV*>(
                       X + static_cast<int64_t>(m0 + m) * K + k);
-                  const XV x0 = xp[0];
-                  const XV x1 = xp[1];
-#pragma unroll
-                  for (int j = 0; j < 8; ++j) {
-                    xf[m][j] = static_cast<float>(x0[j]);
-                    xf[m][8 + j] = static_cast<float>(x1[j]);
-                  }
+                  xv[m][0] = xp[0];
+                  xv[m][1] = xp[1];
                 } else {
-#pragma unroll
-                  for (int j = 0; j < 16; ++j) xf[m][j] = 0.f;
+                  xv[m][0] = XV(static_cast<T>(0.f));
+                  xv[m][1] = XV(static_cast<T>(0.f));
                 }
               }
+              WV wv[NR];
 #pragma unroll
               for (int r = 0; r < NR; ++r) {
                 const int n = n0 + r;
-                if (n < N) {
-                  const WV w = *reinterpret_cast<const WV*>(
-                      W + static_cast<int64_t>(n) * K + k);
+                wv[r] = n < N ? *reinterpret_cast<const WV*>(
+                                    W + static_cast<int64_t>(n) * K + k)
+                              : WV(static_cast<int8_t>(0));
+              }
 #pragma unroll
-                  for (int j = 0; j < 16; ++j) {
-                    const float wf = static_cast<float>(w[j]);
+              for (int j = 0; j < 16; ++j) {
+                float wf[NR];
 #pragma unroll
-                    for (int m = 0; m < MC; ++m) acc[r][m] += wf * xf[m][j];
-                  }
+                for (int r = 0; r < NR; ++r) wf[r] = static_cast<float>(wv[r][j]);
+#pragma unroll
+                for (int m = 0; m < MC; ++m) {
+                  const float xf = static_cast<float>(xv[m][j >> 3][j & 7]);
+#pragma unroll
+                  for (int r = 0; r < NR; ++r) acc[r][m] += wf[r] * xf;
                 }
               }
             }
