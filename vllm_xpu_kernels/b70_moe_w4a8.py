@@ -14,7 +14,7 @@ fp32, and the token scale is applied once at the end.
 With ``B70_W4A8_FUSED_ACT=1`` (B70 K1, default off) gemm1 runs
 ``cutlass_grouped_gemm_w4a8_silu_quant`` instead: its epilogue computes
 silu(gate) * up in fp32 and writes it as int8 with one fp32 scale per (row,
-64 columns), which gemm2 consumes directly (A_scale [rows, inter/64]); the
+128 columns), which gemm2 consumes directly (A_scale [rows, inter/128]); the
 bf16 gemm1 output, the silu_and_mul kernel and the second quant_rows go away.
 
 The op is taken from ``_xpu_C`` when the installed wheel has it, else from the
@@ -159,7 +159,7 @@ def apply(impl,
         total_experts_num=impl.total_experts_num,
         local_experts_num=impl.local_experts_num)
 
-    glu = load_glu_op() if fused_act_enabled() and inter % 64 == 0 else None
+    glu = load_glu_op() if fused_act_enabled() and inter % 128 == 0 else None
     if glu is not None:
         global _LOGGED_FUSED
         if not _LOGGED_FUSED:
@@ -167,9 +167,9 @@ def apply(impl,
             import logging
             logging.getLogger("vllm_xpu_kernels").warning(
                 "B70-K1: W4A8 MoE fused gemm1 epilogue on (silu*up -> int8, "
-                "per-row x 64-col scales; inter=%d)", inter)
+                "per-row x 128-col scales; inter=%d)", inter)
         aq = torch.empty((n_moe, inter), dtype=torch.int8, device=dev)
-        asc = torch.empty((n_moe, inter // 64), dtype=torch.float32,
+        asc = torch.empty((n_moe, inter // 128), dtype=torch.float32,
                           device=dev)
         glu(remapped.view(torch.int8), remapped_sc, impl.w13,
             impl.gemm1_wei_scales, impl.w13_bias, aq, asc, rows_per_expert,

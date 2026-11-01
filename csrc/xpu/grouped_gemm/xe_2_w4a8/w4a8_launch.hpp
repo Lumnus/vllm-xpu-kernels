@@ -51,12 +51,15 @@ template <int TM, int TK>
 using w4a8_policy_s2 = w4a8_policy<TM, 128, TK, 1, 4>;
 
 // Fused gemm1 (silu-and-mul + int8 quant) tiles, N in activation columns.
+// 128 activation columns per WG tile (one activation-scale group), 8 SGs.
 template <int TK>
-using glu_policy_big = w4a8_policy<64, 128, TK, 4, 8>;
+using glu_policy_big = w4a8_policy<128, 128, TK, 4, 8>;
 template <int TM, int TK>
-using glu_policy_small = w4a8_policy<TM, 64, TK, 1, 4>;
+using glu_policy_small = w4a8_policy<TM, 128, TK, 1, 8>;
 
-static constexpr int kActGroup = 64;  // activation-scale group of gemm2's A
+// Activation-scale group of gemm2's A = the weight group (128): gemm2 folds
+// its int32 partial at the same points as with per-row scales.
+static constexpr int kActGroup = 128;
 
 template <typename, typename, class, int, int, int>
 class W4A8GemmName;
@@ -115,11 +118,14 @@ CUTE_DEVICE void MoEGEMMW4A8(
     const int32_t gemm_n,
     const int32_t gemm_k,
     int32_t* atomic_buffer,
-    const sycl::local_accessor<int32_t, 1>& slm_mem_const) {
+    const sycl::local_accessor<int32_t, 1>& slm_mem_const,
+    const sycl::local_accessor<float, 1>& slm_as_acc) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto wg_tile = mma.tile_mnk();
   auto wg_tile_m = get<0>(wg_tile);
   auto wg_tile_n = get<1>(wg_tile);
+  float* slm_as = static_cast<float*>(
+      slm_as_acc.template get_multi_ptr<sycl::access::decorated::no>().get());
 
   int group_id = item.get_group_linear_id();
   int gemm_n_pad = (gemm_n + wg_tile_n - 1) / wg_tile_n * wg_tile_n;
@@ -184,7 +190,8 @@ CUTE_DEVICE void MoEGEMMW4A8(
           D_tensor,
           tile_coord,
           mma,
-          mma_f);
+          mma_f,
+          slm_as);
 
       if (local_id == 0) {
         slm_mem[0] = cutlass::atomicAdd(atomic_buffer, 1);
@@ -376,11 +383,14 @@ void launch(const PlainArgs& p) {
 
   p.q->submit([&](sycl::handler& cgh) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), cgh);
+    static constexpr int TM = get<0>(typename policy::WGTile{});
+    sycl::local_accessor<float, 1> slm_as(
+        sycl::range<1>(AG > 0 ? TM * (a.K / AG) : 1), cgh);
     cgh.parallel_for<W4A8GemmName<bf16, bf16, policy, GroupSize, AG, PF>>(
         sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
           MoEGEMMW4A8<GmemTiledCopyD, GroupSize, AG, PF>(
               a.a, a.a_scale, a.b, a.b_scale, a.bias, a.d, mma, mma_f,
-              a.rows, a.E, a.N, a.K, a.atomic, local_mem);
+              a.rows, a.E, a.N, a.K, a.atomic, local_mem, slm_as);
         });
   });
 }
