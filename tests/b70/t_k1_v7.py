@@ -18,7 +18,12 @@ Modes (comma list, default all):
            the knob grid B70_W4A8_PREFETCH {4,6} x B70_W4A8_SMALL_TILE {0,1,2} x B70_W4A8_TILE_K {64,32};
            plus GEMM-only gemm1 / gemm2 ms and TOPS at 4096 tokens (prefill).
 
-Prints one JSON line per case (DENSE / DBENCH / GLU / MOE / MBENCH) and writes --out.
+  hcdet    determinism + batch invariance of b70_w8a8_fused_gemm (the int8 HC down path): for each shape, a
+           256-row pool; every row's output must be bit-identical across 2 runs, across batch compositions
+           (sub-batches of 1..256 rows in shuffled order, so M crosses the 8/16/32/64 tiles and the split-K
+           choice), across B70_I8D_KSPLIT 1/2/4/16 and across B70_I8D_TILE variants.
+
+Prints one JSON line per case (DENSE / DBENCH / GLU / MOE / MBENCH / HCDET) and writes --out.
 """
 import argparse
 import json
@@ -175,6 +180,14 @@ def run_dbench(ms, D, rot):
                 xq8, xs8 = q_act(x)
                 xq8, xs8 = xq8.contiguous(), xs8.reshape(-1).contiguous()
                 arms["w8a8_gemm_only"] = lambda i: torch.ops._xpu_C.b70_w8a8_gemm(xq8, xs8, qs[i][0], qs[i][1], None)
+                for tile in ("64x64", "128x64", "32x128", "64x128"):
+                    def tiled(i, tile=tile):
+                        os.environ["B70_I8D_TILE"] = tile  # read per call on the host, fixed in the graph
+                        try:
+                            return torch.ops._xpu_C.b70_w8a8_gemm(xq8, xs8, qs[i][0], qs[i][1], None)
+                        finally:
+                            os.environ.pop("B70_I8D_TILE", None)
+                    arms[f"w8a8_gemm_{tile}"] = tiled
             if hasattr(torch.ops._xpu_C, "int8_scaled_mm") and hasattr(torch.ops._C, "dynamic_per_token_scaled_int8_quant"):
                 def onednn(i):
                     xq = torch.empty((M, K), dtype=torch.int8, device=DEV)
@@ -412,9 +425,59 @@ def run_gemm_prefill(fm, w4, T, seed, grid):
     return r
 
 
+# --------------------------------------------------------------------------- hcdet
+def run_hcdet(seed):
+    """Bitwise: same input -> same output for every run, batch composition, split and tile."""
+    res = []
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    for name in ("hc_down", "gdn_in", "attn_o", "shared_gate_up"):
+        K, N = DENSE_SHAPES[name]
+        w = (torch.randn(N, K, generator=g) * 0.02).to(torch.bfloat16)
+        wq, ws = (t.to(DEV) for t in q_weight(w))
+        pool = torch.randn(256, K, generator=g).to(torch.bfloat16)
+        pool[:, :16] *= 20  # outlier channels, as in HC streams
+        pool = pool.to(DEV)
+        op = lambda x: torch.ops._xpu_C.b70_w8a8_fused_gemm(x.contiguous(), wq, ws, None)  # noqa: E731
+        ref = op(pool)
+        ref2 = op(pool)
+        sync()
+        r = {"shape": name, "K": K, "N": N, "run_to_run_equal": bool(torch.equal(ref, ref2))}
+        bad = []
+        perm = torch.randperm(256, generator=g)
+        for m in (1, 2, 3, 7, 8, 9, 13, 16, 17, 31, 33, 63, 64, 65, 96, 128, 200, 256):
+            idx = perm[:m].to(DEV)
+            out = op(pool.index_select(0, idx))
+            sync()
+            if not torch.equal(out, ref.index_select(0, idx)):
+                bad.append(f"M{m}")
+        for ks in ("1", "2", "4", "16"):
+            os.environ["B70_I8D_KSPLIT"] = ks
+            for m in (8, 64):
+                idx = perm[:m].to(DEV)
+                out = op(pool.index_select(0, idx))
+                sync()
+                if not torch.equal(out, ref.index_select(0, idx)):
+                    bad.append(f"ks{ks}_M{m}")
+        os.environ.pop("B70_I8D_KSPLIT", None)
+        for tile in ("64x64", "128x64", "32x128", "64x128"):
+            os.environ["B70_I8D_TILE"] = tile
+            for m in (8, 64):
+                idx = perm[:m].to(DEV)
+                out = op(pool.index_select(0, idx))
+                sync()
+                if not torch.equal(out, ref.index_select(0, idx)):
+                    bad.append(f"tile{tile}_M{m}")
+        os.environ.pop("B70_I8D_TILE", None)
+        r["mismatches"] = bad
+        r["ok"] = r["run_to_run_equal"] and not bad
+        print("HCDET", json.dumps(r), flush=True)
+        res.append(r)
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="dense,dbench,moe,mbench")
+    ap.add_argument("--mode", default="hcdet,dense,dbench,moe,mbench")
     ap.add_argument("--dense-m", default="1,2,4,8,16,32,64")
     ap.add_argument("--rot", type=int, default=8, help="weight copies rotated per graph (defeats L2)")
     ap.add_argument("--experts", type=int, default=128, help="local experts (D8: 512 / EP4)")
@@ -432,7 +495,7 @@ def main():
     from vllm_xpu_kernels import b70_moe_w4a8 as w4
     print("DEVICE", torch.xpu.get_device_name(0), "kernels", getattr(vllm_xpu_kernels, "__version__", "?"),
           flush=True)
-    for o in ("b70_w8a16_gemm", "b70_w8a8_fused_gemm", "cutlass_grouped_gemm_w4a8_silu_quant"):
+    for o in ("b70_w8a16_gemm", "b70_w8a8_fused_gemm", "b70_w8a8_gemm", "cutlass_grouped_gemm_w4a8_silu_quant"):
         assert hasattr(torch.ops._xpu_C, o), f"_xpu_C has no {o}: wrong wheel?"
     grid = [(4, 0, 64)] if args.grid == "default" else [
         (pf, st, tk) for pf in (4, 6) for st in (0, 1, 2) for tk in (64, 32)]
@@ -440,6 +503,9 @@ def main():
     ms = [int(m) for m in args.dense_m.split(",")]
     out = {"args": vars(args)}
     D = w1_path() if ("dense" in modes or "dbench" in modes) else None
+    if "hcdet" in modes:
+        out["hcdet"] = run_hcdet(args.seed)
+        print("HCDET_ALL_OK", all(r["ok"] for r in out["hcdet"]), flush=True)
     if "dense" in modes:
         out["dense"] = run_dense(ms, D)
         print("DENSE_ALL_OK", all(r["ok"] for r in out["dense"]), flush=True)
