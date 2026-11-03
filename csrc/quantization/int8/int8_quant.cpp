@@ -90,13 +90,13 @@ class dynamic_per_token_int8_quant_kernel {
         out_vec_t q;
 #pragma unroll
         for (int j = 0; j < VEC; ++j) {
-          q.v[j] = int8q::quantize_one(static_cast<float>(x.v[j]), s);
+          q.v[j] = int8q::quantize_one<scalar_t>(static_cast<float>(x.v[j]), s);
         }
         vout[i] = q;
       }
     } else {
       for (int i = tid; i < hidden_size; i += nthr) {
-        row_out[i] = int8q::quantize_one(static_cast<float>(row_in[i]), s);
+        row_out[i] = int8q::quantize_one<scalar_t>(static_cast<float>(row_in[i]), s);
       }
     }
   }
