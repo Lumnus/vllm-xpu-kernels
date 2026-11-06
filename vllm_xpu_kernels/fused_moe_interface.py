@@ -29,6 +29,9 @@ NATIVE_BLOCK_FP8_ENV = "VLLM_XPU_FUSED_MOE_NATIVE_BLOCK_FP8"
 # VLLM_XPU_FUSED_MOE_INT4_GEMV=0.
 INT4_GEMV_ENV = "VLLM_XPU_FUSED_MOE_INT4_GEMV"
 INT4_GEMV_MAX_ROWS = 8
+# wu1ff group ownership, direct MoE and small-batch GEMM. They need the native
+# overlay libs next to this file, so they import only when this is on.
+ASTRA_HOOKS_ENV = "B70_ASTRA_HOOKS"
 
 
 def _is_env_enabled(env_name: str, default: str = "0") -> bool:
@@ -375,6 +378,10 @@ class XpuFusedMoe:
         else:
             self.total_experts_num = self.num_experts * self.ep_size
         self.local_experts_num = self.num_experts
+        self._astra_hooks = _is_env_enabled(ASTRA_HOOKS_ENV)
+        if self._astra_hooks:
+            from .astra_ownership import prepare as prepare_ownership
+            prepare_ownership(self)
 
     def apply(
         self,
@@ -469,6 +476,19 @@ class XpuFusedMoe:
 
     def _grouped_gemm(self, A, A_scale, B, B_scale, bias, D,
                       rows_per_expert, N, K):
+        if self._astra_hooks:
+            from .astra500_moe import astra_grouped_gemm
+            astra_grouped_gemm(ptr_A=A,
+                               ptr_A_scale=A_scale,
+                               ptr_B=B,
+                               ptr_B_scale=B_scale,
+                               ptr_bias=bias,
+                               ptr_D=D,
+                               rows_per_expert=rows_per_expert,
+                               N=N,
+                               K=K,
+                               num_experts=self.num_experts)
+            return
         if (self._use_int4_gemv and A_scale is None and bias is None
                 and A.shape[0] <= INT4_GEMV_MAX_ROWS
                 and A.dtype in (torch.float16, torch.bfloat16)
@@ -503,6 +523,16 @@ class XpuFusedMoe:
         activation_hook=None,
         output_hook=None,
     ):
+        if self._astra_hooks and activation_hook is None and output_hook is None:
+            from .astra_ownership import apply as apply_ownership
+            from .astra_structural import direct_moe
+            if getattr(self, "_astra_groups", None) is not None:
+                return apply_ownership(self, output, hidden_states,
+                                       topk_weights, topk_ids, expert_map,
+                                       a1q_scale)
+            if direct_moe(self, output, hidden_states, topk_weights, topk_ids,
+                          expert_map, a1q_scale):
+                return
         num_rows, hidden_size = hidden_states.shape
         num_moe_inputs = self.n_experts_per_token * num_rows
         act_quant = a1q_scale is not None
