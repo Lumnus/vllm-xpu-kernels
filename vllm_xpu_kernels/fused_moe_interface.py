@@ -224,6 +224,23 @@ def implement_zp(qweight):
 
     return result
 
+
+def _repack_int4_in_place(weight, experts_per_step=16):
+    """implement_zp over [E, N, K // 2] uint8 weights, written back into
+    their own storage; the weights are then viewed as int8.
+
+    Peak temporary memory is a few experts, and the storage (device memory or
+    a host-memory view) stays where it is. The weights must be contiguous:
+    making a strided view contiguous would allocate a device copy.
+    """
+    data = weight.data
+    assert data.is_contiguous(), (
+        "int4 MoE weights must be contiguous to be repacked in place")
+    for i in range(0, data.shape[0], experts_per_step):
+        data[i:i + experts_per_step].copy_(
+            implement_zp(data[i:i + experts_per_step]))
+    weight.data = data.view(torch.int8)
+
 class XpuFusedMoe:
     def __init__(
         self,
@@ -272,18 +289,17 @@ class XpuFusedMoe:
         # consumes the loaded layout directly, so it skips the rewrite.
         if not self._use_ref and not hasattr(w13, "xpu_fused_moe"):
             if is_int4:
-                # change u4 to s4 to avoid zero point in gemm kernel
-                # The buffer must be int8: the grouped GEMM detects packed
-                # int4 weights via `B_dtype == at::kChar` (see
+                # change u4 to s4 to avoid zero point in gemm kernel, in
+                # place, a few experts at a time. The weights may live in
+                # host memory seen from the device (vLLM's --cpu-offload-gb):
+                # a new buffer would be allocated on the device and the
+                # weights rebound to it.
+                # The result is viewed as int8: the grouped GEMM detects
+                # packed int4 weights via `B_dtype == at::kChar` (see
                 # csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp),
                 # and only then reads them as [E, N, K // 2].
-                w13_tmp = torch.empty_like(w13, dtype=torch.int8)
-                w2_tmp = torch.empty_like(w2, dtype=torch.int8)
-                for i in range(num_experts):
-                    w13_tmp[i] = implement_zp(w13[i])
-                    w2_tmp[i] = implement_zp(w2[i])
-                w13.data = w13_tmp.contiguous()
-                w2.data = w2_tmp.contiguous()
+                _repack_int4_in_place(w13)
+                _repack_int4_in_place(w2)
 
             to_kernel_layout = _to_xe2_layout \
                 if self._uses_xe2 else _to_xe3_layout
