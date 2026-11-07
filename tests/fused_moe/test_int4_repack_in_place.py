@@ -25,6 +25,14 @@ def test_repack_in_place_matches_implement_zp():
     assert torch.equal(w.data.view(torch.uint8), want)
 
 
+def test_repack_in_place_rejects_strided_weights():
+    w = torch.nn.Parameter(torch.zeros((4, 16, 24),
+                                       dtype=torch.uint8).transpose(1, 2),
+                           requires_grad=False)
+    with pytest.raises(AssertionError, match="contiguous"):
+        _repack_int4_in_place(w)
+
+
 def _host_view(t: torch.Tensor) -> torch.Tensor:
     import vllm_xpu_kernels._C  # noqa: F401
     return torch.ops._C.get_xpu_view_from_cpu_tensor(t)

@@ -233,9 +233,12 @@ def _repack_int4_in_place(weight, experts_per_step=16):
     their own storage; the weights are then viewed as int8.
 
     Peak temporary memory is a few experts, and the storage (device memory or
-    a host-memory view) stays where it is.
+    a host-memory view) stays where it is. The weights must be contiguous:
+    making a strided view contiguous would allocate a device copy.
     """
-    data = weight.data.contiguous()
+    data = weight.data
+    assert data.is_contiguous(), (
+        "int4 MoE weights must be contiguous to be repacked in place")
     for i in range(0, data.shape[0], experts_per_step):
         data[i:i + experts_per_step].copy_(
             implement_zp(data[i:i + experts_per_step]))
