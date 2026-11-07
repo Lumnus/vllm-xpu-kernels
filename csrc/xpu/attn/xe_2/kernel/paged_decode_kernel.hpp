@@ -32,6 +32,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
@@ -637,7 +639,14 @@ class ReduceSplitK {
     // using it as the tile count turns each thread's multi-iteration loop
     // into ~1 iteration per (now more numerous) workgroup, restoring full
     // core occupancy without changing the reduction math.
-    int num_hd_tiles = cute::max(1, num_vals_per_thread);
+    //
+    // B70 gate: tiling is off unless B70_KERNEL_PAGED_DECODE_SPLITK_TILE=1
+    // (read once). One tile is the original single-workgroup-per-head launch.
+    static const bool b70_tile_on = [] {
+      const char* v = std::getenv("B70_KERNEL_PAGED_DECODE_SPLITK_TILE");
+      return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    int num_hd_tiles = b70_tile_on ? cute::max(1, num_vals_per_thread) : 1;
     return {
         args.kernel,
         TileScheduler::to_underlying_arguments(
