@@ -119,6 +119,9 @@ MINI_PYTEST_PARAMS = {
     "test_swap_blocks_batch_h2d_registered_no_snapshot": {
         "device": ["xpu:0"],
     },
+    "test_swap_blocks_batch_h2d_registered_partial": {
+        "device": ["xpu:0"],
+    },
     "test_gather_and_maybe_dequant_cache_mla": {
         "block_size": [8],
         "num_blocks": [8],
@@ -1225,6 +1228,102 @@ def test_swap_blocks_batch_h2d_registered_no_snapshot(device: str) -> None:
     assert failed_trial is None, (
         f"trial {failed_trial}: registered source was staged, not read in "
         "stream order")
+
+
+# Source spans (offset, size) in bytes, given the range size R and a block
+# size B, inside a 3R-byte mmap whose middle third [R, 2R) is registered.
+# "direct": every span lies wholly inside the registered range. "staged": at
+# least one span reaches outside it, so the whole batch must be staged.
+_REG_PARTIAL_CASES = {
+    # Whole range, and the first and last block: both edges inclusive.
+    "whole": ("direct", lambda R, B: [(R, R)]),
+    "edges": ("direct", lambda R, B: [(R, B), (2 * R - B, B)]),
+    # Starts inside, ends one byte past the end of the range.
+    "past_end": ("staged", lambda R, B: [(2 * R - B, B + 1)]),
+    # Starts one byte before the range, ends inside.
+    "before_start": ("staged", lambda R, B: [(R - 1, B)]),
+    # Covers the range and one byte on each side.
+    "superset": ("staged", lambda R, B: [(R - 1, R + 2)]),
+    # One partly covered source stages the whole batch.
+    "mixed_batch": ("staged",
+                    lambda R, B: [(R, B), (R + B, B), (2 * R - B, B + 1)]),
+    # Control: pageable, never registered.
+    "unregistered": ("staged", lambda R, B: [(0, B)]),
+}
+
+
+@pytest.mark.parametrize("case", list(_REG_PARTIAL_CASES))
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_swap_blocks_batch_h2d_registered_partial(device: str,
+                                                  case: str) -> None:
+    """With snapshot_src=False, a source counts as registered only if all of
+    it lies inside one xpu_host_register'd range. A source only partly
+    covered must be staged (snapshot at call time), and so must the rest of
+    its batch.
+
+    Staged vs direct is read from the data: the CPU rewrites the source right
+    after the call while the copy is queued behind other work. A staged copy
+    always delivers the old bytes; a direct copy delivers the new ones once
+    the queue is busy long enough, so "direct" passes if any trial sees them
+    and "staged" requires every trial to see the old ones."""
+    torch.xpu.set_device(device)
+
+    block = 1 << 16
+    n_blocks = 16
+    reg = n_blocks * block  # R: page-aligned, multiple of the page size
+    mm = 4096
+    trials = 8
+    old, new = 3, 7
+    expect, spans_of = _REG_PARTIAL_CASES[case]
+
+    a = torch.randn(mm, mm, device=device, dtype=torch.float32)
+    b = torch.randn(mm, mm, device=device, dtype=torch.float32)
+
+    with mmap.mmap(-1, 3 * reg) as region:
+        host = torch.frombuffer(memoryview(region), dtype=torch.uint8)
+        base = host.data_ptr()
+        assert ops.xpu_host_register(base + reg, reg)
+        try:
+            spans = spans_of(reg, block)
+            total = sum(size for _, size in spans)
+            dst = torch.empty(total, device=device, dtype=torch.uint8)
+            src_ptrs, dst_ptrs, offset = [], [], 0
+            for off, size in spans:
+                src_ptrs.append(base + off)
+                dst_ptrs.append(dst.data_ptr() + offset)
+                offset += size
+            sp = torch.tensor(np.array(src_ptrs, dtype=np.uint64))
+            dp = torch.tensor(np.array(dst_ptrs, dtype=np.uint64))
+            sz = torch.tensor(
+                np.array([size for _, size in spans], dtype=np.uint64))
+
+            seen_new = seen_old = 0
+            for _ in range(trials):
+                host.fill_(old)
+                dst.fill_(0)
+                torch.xpu.synchronize(device)
+                c = a
+                for _ in range(12):
+                    c = torch.mm(c, b)
+                ops.swap_blocks_batch(sp, dp, sz, snapshot_src=False)
+                host.fill_(new)
+                torch.xpu.synchronize(device)
+                seen_new += bool(torch.all(dst == new))
+                seen_old += bool(torch.all(dst == old))
+        finally:
+            assert ops.xpu_host_unregister(base + reg)
+            del host
+
+    if expect == "staged":
+        assert seen_old == trials, (
+            f"{case}: {trials - seen_old} of {trials} trials were not "
+            "staged; a source outside the registered range was read in "
+            "stream order")
+    else:
+        assert seen_new > 0, (
+            f"{case}: no trial read the source in stream order; a source "
+            "wholly inside the registered range was staged")
 
 
 @pytest.mark.skipif(torch.xpu.device_count() < 2,
