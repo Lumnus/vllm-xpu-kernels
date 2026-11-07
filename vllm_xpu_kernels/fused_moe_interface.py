@@ -406,6 +406,8 @@ class XpuFusedMoe:
         a non-local or invalid expert. Hooks require the kernel path and
         unquantized activations.
         """
+        if expert_map is None:
+            expert_map = self.expert_map
         if activation_hook is not None or output_hook is not None:
             if self._use_ref:
                 raise NotImplementedError(
@@ -521,9 +523,6 @@ class XpuFusedMoe:
         act_is_packed_mxfp4 = native_act_scale and self.recipe == "mxfp4"
         gemm_hidden_size = 2 * hidden_size \
             if act_is_packed_mxfp4 else hidden_size
-
-        if expert_map is None and self.ep_size > 1:
-            expert_map = self.expert_map
 
         # mx recipes need the activation scales in the per-expert MN-major,
         # M-padded-to-4 surface the mxfp grouped-GEMM mainloop indexes. Both
