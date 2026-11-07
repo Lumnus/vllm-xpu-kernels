@@ -610,8 +610,9 @@ if(BASIC_KERNELS_ENABLED)
       "csrc/topk_per_row.cpp"
       "csrc/ngram_embedding_kernels.cpp")
   include_directories("/usr/include")
-  # B70: the int8 act quant must match the torch reference bit for bit:
-  # IEEE fp32 division and no fast-math on host and device for this TU.
+  # The int8 act quant must match the torch reference bit for bit: IEEE fp32
+  # division and no fast-math for this TU ('#pragma float_control' is ignored
+  # for spir64).
   set_source_files_properties(
     "csrc/quantization/int8/int8_quant.cpp"
     PROPERTIES COMPILE_OPTIONS "-ffp-model=precise;-foffload-fp32-prec-div")

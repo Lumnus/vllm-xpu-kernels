@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// B70 (Lumnus): scalar math of the dynamic per-token symmetric int8 quant.
+// Scalar math of the dynamic per-token symmetric int8 quant.
 //
-// Bit-for-bit mirror of vllm._xpu_ops.xpu_ops.dynamic_per_token_int8_quant_ref
+// Bit-for-bit mirror of vLLM's dynamic_per_token_int8_quant_ref
+// (vllm/_xpu_ops.py)
 // (use_sym_quant=True, bits=8):
 //   absmax = max(|min(row)|, |max(row)|)                 (exact in fp32)
 //   scale  = clamp(absmax / 127, min=1e-5)               (fp32, IEEE div)
-//   scale  = scale.to(input.dtype)                       (RNE to bf16/fp16, in integer ops)
-//   q      = clamp(round_half_even(x_fp32 / scale_fp32), -128, 127)  (exact tie test for 16-bit x)
+//   scale  = scale.to(input.dtype)                       (RNE, integer ops)
+//   q      = clamp(round_half_even(x_fp32 / scale_fp32), -128, 127)
+// For 16-bit input the rounding uses an exact tie test; see quantize_one.
 // Header-only and free of SYCL so the same code is compiled into the device
-// kernel and into the host-side CPU reference test.
+// kernel and into the host-side CPU check.
 #pragma once
 
 #include <cstdint>
@@ -60,7 +62,7 @@ inline float round_to_bf16(float s) {
 // range (the scale here is in [1e-5, 65504 / 127]). Below 2^-14 fp16 is
 // subnormal with a fixed quantum of 2^-24.
 inline float round_to_fp16(float s) {
-  if (s != s) return s;  // NaN
+  if (s != s) return s;        // NaN
   if (s < 6.103515625e-05f) {  // 2^-14
     return rint_half_even(s * 16777216.0f) * 5.9604644775390625e-08f;
   }
@@ -91,20 +93,22 @@ inline float token_scale_from_absmax(float absmax) {
   return round_to_dtype<scalar_t>(s);
 }
 
-// x / scale, rounded half to even, against the exact quotient. The device's
-// fp32 division is not exact on exact results (measured on Xe2: quotients that
-// are exactly q + 0.5 came back truncated toward zero, also with
-// -foffload-fp32-prec-div), so ties are not decided from the quotient. For
-// 16-bit x and scale (at most 11 significant bits each) (f + 0.5) * scale is
-// exact in fp32, so comparing it with x decides the rounding exactly, and an
-// inexact quotient is never close enough to a tie for torch's fp32 division to
-// round onto it. The quotient only has to pick the right f.
+// x / scale, rounded half to even, against the exact quotient. Measured on
+// Xe2: quotients that are exactly q + 0.5 came out truncated toward zero, also
+// with explicit half-even rounding of the quotient and with
+// -foffload-fp32-prec-div, consistent with a device quotient just under the
+// tie. So ties are not decided from the quotient. For 16-bit x and scale (at
+// most 11 significant bits each) (f + 0.5) * scale is exact in fp32, so
+// comparing it with x decides the rounding exactly, and an inexact quotient is
+// never close enough to a tie for an IEEE fp32 division to round onto it. The
+// quotient only has to pick the right f.
 template <typename scalar_t>
 inline int8_t quantize_one(float x, float scale) {
   const float t = x / scale;
   float q;
-  if constexpr (std::is_same_v<scalar_t, c10::BFloat16> ||
-                std::is_same_v<scalar_t, c10::Half>) {
+  if constexpr (
+      std::is_same_v<scalar_t, c10::BFloat16> ||
+      std::is_same_v<scalar_t, c10::Half>) {
     const float f = __builtin_floorf(t);
     const float boundary = (f + 0.5f) * scale;
     if (x > boundary) {
@@ -128,4 +132,3 @@ inline float max_f(float a, float b) { return a > b ? a : b; }
 
 }  // namespace int8q
 }  // namespace vllm
-

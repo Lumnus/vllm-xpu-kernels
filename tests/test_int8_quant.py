@@ -75,3 +75,20 @@ def test_int8_quant_exact_ties(dtype, absmax, scale, odd, scale_f32):
     torch.ops._C.dynamic_per_token_scaled_int8_quant(q, x, s)
     assert s.to(torch.float32).item() == scale
     assert torch.equal(q.cpu().view(-1), expected)
+
+
+@pytest.mark.parametrize("bad", ["out", "scales"])
+@pytest.mark.parametrize("m", [0, 4])
+@torch.inference_mode()
+def test_int8_quant_rejects_other_device(bad, m):
+    # Rejected before anything is queued, empty input included.
+    x = torch.randn(m, 64, device=DEVICE).to(torch.bfloat16)
+    q = torch.empty_like(x, dtype=torch.int8)
+    s = torch.empty(m, 1, device=DEVICE, dtype=torch.float32)
+    if bad == "out":
+        q = q.cpu()
+    else:
+        s = s.cpu()
+    with pytest.raises(RuntimeError,
+                       match=f"{bad} must be on the input's device"):
+        torch.ops._C.dynamic_per_token_scaled_int8_quant(q, x, s)

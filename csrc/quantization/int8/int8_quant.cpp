@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// B70 (Lumnus): native dynamic per-token symmetric int8 activation quant.
+// Dynamic per-token symmetric int8 activation quantization.
 //
 // One work-group per token row: pass 1 reduces |x| to the row absmax
 // (reduce_over_group), every work-item derives the same scale, pass 2
-// re-reads the row (L1/L3-resident: K <= 17408 bf16 = 34 KiB) and writes
-// int8. Math lives in int8_quant_math.h and matches
-// vllm._xpu_ops.xpu_ops.dynamic_per_token_int8_quant_ref exactly.
+// re-reads the row (cache-resident for typical hidden sizes, e.g. 17408 bf16 =
+// 34 KiB) and writes int8. Math lives in int8_quant_math.h and matches vLLM's
+// dynamic_per_token_int8_quant_ref (torch reference) exactly.
 #include <ATen/ATen.h>
 #include <ATen/DeviceGuard.h>
 #include <sycl/sycl.hpp>
@@ -63,14 +63,14 @@ class dynamic_per_token_int8_quant_kernel {
         in_vec_t x = vin[i];
 #pragma unroll
         for (int j = 0; j < VEC; ++j) {
-          absmax = int8q::max_f(
-              absmax, int8q::abs_f(static_cast<float>(x.v[j])));
+          absmax =
+              int8q::max_f(absmax, int8q::abs_f(static_cast<float>(x.v[j])));
         }
       }
     } else {
       for (int i = tid; i < hidden_size; i += nthr) {
-        absmax = int8q::max_f(
-            absmax, int8q::abs_f(static_cast<float>(row_in[i])));
+        absmax =
+            int8q::max_f(absmax, int8q::abs_f(static_cast<float>(row_in[i])));
       }
     }
     absmax = sycl::reduce_over_group(
@@ -96,7 +96,8 @@ class dynamic_per_token_int8_quant_kernel {
       }
     } else {
       for (int i = tid; i < hidden_size; i += nthr) {
-        row_out[i] = int8q::quantize_one<scalar_t>(static_cast<float>(row_in[i]), s);
+        row_out[i] =
+            int8q::quantize_one<scalar_t>(static_cast<float>(row_in[i]), s);
       }
     }
   }
@@ -117,16 +118,18 @@ void launch_int8_quant(
     int hidden_size) {
   int wg = 256;
   const int work = VEC > 1 ? hidden_size / VEC : hidden_size;
-  while (wg > 32 && wg / 2 >= work) wg /= 2;
+  while (wg > 32 && wg / 2 >= work)
+    wg /= 2;
   sycl::range<1> grid(num_tokens);
   sycl::range<1> block(wg);
   queue.submit([&](sycl::handler& cgh) {
-    auto kernel = vllm::dynamic_per_token_int8_quant_kernel<scalar_t, scale_t, VEC>(
-        out.data_ptr<int8_t>(),
-        reinterpret_cast<scale_t*>(scales.data_ptr()),
-        reinterpret_cast<scalar_t const*>(input.data_ptr()),
-        in_row_stride,
-        hidden_size);
+    auto kernel =
+        vllm::dynamic_per_token_int8_quant_kernel<scalar_t, scale_t, VEC>(
+            out.data_ptr<int8_t>(),
+            reinterpret_cast<scale_t*>(scales.data_ptr()),
+            reinterpret_cast<scalar_t const*>(input.data_ptr()),
+            in_row_stride,
+            hidden_size);
     cgh.parallel_for(sycl::nd_range<1>(grid * block, block), kernel);
   });
 }
@@ -141,25 +144,42 @@ void launch_int8_quant(
 void dynamic_per_token_scaled_int8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor& scales) {
   TORCH_CHECK(input.dim() >= 1, "int8 quant: input must have rank >= 1");
-  TORCH_CHECK(out.scalar_type() == at::ScalarType::Char, "int8 quant: out must be int8");
+  // The kernel runs on the input's queue and writes out and scales through
+  // raw pointers, so all three must be on that device.
+  TORCH_CHECK(input.is_xpu(), "int8 quant: input must be an XPU tensor");
+  TORCH_CHECK(
+      out.device() == input.device(),
+      "int8 quant: out must be on the input's device");
+  TORCH_CHECK(
+      scales.device() == input.device(),
+      "int8 quant: scales must be on the input's device");
+  TORCH_CHECK(
+      out.scalar_type() == at::ScalarType::Char,
+      "int8 quant: out must be int8");
   TORCH_CHECK(out.is_contiguous(), "int8 quant: out must be contiguous");
-  TORCH_CHECK(out.sizes() == input.sizes(), "int8 quant: out/input shape mismatch");
-  TORCH_CHECK(input.stride(-1) == 1, "int8 quant: input last dim must be contiguous");
+  TORCH_CHECK(
+      out.sizes() == input.sizes(), "int8 quant: out/input shape mismatch");
+  TORCH_CHECK(
+      input.stride(-1) == 1, "int8 quant: input last dim must be contiguous");
   const int64_t hidden64 = input.size(-1);
-  TORCH_CHECK(hidden64 > 0 && hidden64 <= INT32_MAX, "int8 quant: bad hidden size");
+  TORCH_CHECK(
+      hidden64 > 0 && hidden64 <= INT32_MAX, "int8 quant: bad hidden size");
   const int hidden_size = static_cast<int>(hidden64);
   const int64_t num_tokens = input.numel() / hidden_size;
   int64_t in_row_stride = hidden_size;
   if (input.dim() == 2) {
     in_row_stride = input.stride(0);
   } else {
-    TORCH_CHECK(input.is_contiguous(), "int8 quant: rank > 2 input must be contiguous");
+    TORCH_CHECK(
+        input.is_contiguous(), "int8 quant: rank > 2 input must be contiguous");
   }
-  TORCH_CHECK(scales.is_contiguous() && scales.numel() == num_tokens,
-              "int8 quant: scales must be contiguous with one entry per token");
+  TORCH_CHECK(
+      scales.is_contiguous() && scales.numel() == num_tokens,
+      "int8 quant: scales must be contiguous with one entry per token");
   const bool scale_f32 = scales.scalar_type() == at::ScalarType::Float;
-  TORCH_CHECK(scale_f32 || scales.scalar_type() == input.scalar_type(),
-              "int8 quant: scales dtype must be float32 or the input dtype");
+  TORCH_CHECK(
+      scale_f32 || scales.scalar_type() == input.scalar_type(),
+      "int8 quant: scales dtype must be float32 or the input dtype");
   if (num_tokens == 0) return;
 
   const at::DeviceGuard device_guard(input.device());
@@ -170,22 +190,47 @@ void dynamic_per_token_scaled_int8_quant(
         constexpr int VEC = 16 / sizeof(scalar_t);
         const uintptr_t in_addr = reinterpret_cast<uintptr_t>(input.data_ptr());
         const uintptr_t out_addr = reinterpret_cast<uintptr_t>(out.data_ptr());
-        const bool vec_ok = hidden_size % VEC == 0 && in_row_stride % VEC == 0 &&
-                            in_addr % 16 == 0 && out_addr % VEC == 0;
+        const bool vec_ok = hidden_size % VEC == 0 &&
+                            in_row_stride % VEC == 0 && in_addr % 16 == 0 &&
+                            out_addr % VEC == 0;
         if (scale_f32) {
           if (vec_ok)
             launch_int8_quant<scalar_t, float, VEC>(
-                queue, out, input, scales, num_tokens, in_row_stride, hidden_size);
+                queue,
+                out,
+                input,
+                scales,
+                num_tokens,
+                in_row_stride,
+                hidden_size);
           else
             launch_int8_quant<scalar_t, float, 1>(
-                queue, out, input, scales, num_tokens, in_row_stride, hidden_size);
+                queue,
+                out,
+                input,
+                scales,
+                num_tokens,
+                in_row_stride,
+                hidden_size);
         } else {
           if (vec_ok)
             launch_int8_quant<scalar_t, scalar_t, VEC>(
-                queue, out, input, scales, num_tokens, in_row_stride, hidden_size);
+                queue,
+                out,
+                input,
+                scales,
+                num_tokens,
+                in_row_stride,
+                hidden_size);
           else
             launch_int8_quant<scalar_t, scalar_t, 1>(
-                queue, out, input, scales, num_tokens, in_row_stride, hidden_size);
+                queue,
+                out,
+                input,
+                scales,
+                num_tokens,
+                in_row_stride,
+                hidden_size);
         }
       });
 }

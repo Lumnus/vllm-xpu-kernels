@@ -203,7 +203,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "()");
   ops.impl("dynamic_scaled_fp8_quant", torch::kXPU, &dynamic_scaled_fp8_quant);
 
-  // B70: dynamic-per-token symmetric INT8 quant (one scale per row).
+  // Dynamic-per-token symmetric INT8 quant (one scale per row).
   ops.def(
       "dynamic_per_token_scaled_int8_quant(Tensor! result, Tensor input, "
       "Tensor! scale) -> ()");

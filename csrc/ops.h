@@ -257,8 +257,8 @@ void static_scaled_fp8_quant(
 void dynamic_scaled_fp8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor& scale);
 
-// B70: dynamic per-token symmetric int8 activation quant (matches
-// vllm._xpu_ops.xpu_ops.dynamic_per_token_int8_quant_ref).
+// Dynamic per-token symmetric int8 activation quant (matches vLLM's
+// dynamic_per_token_int8_quant_ref).
 void dynamic_per_token_scaled_int8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor& scales);
 
