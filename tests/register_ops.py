@@ -693,7 +693,10 @@ def swap_blocks_batch(
     and must not be modified until the copies have completed. A source in
     xpu_host_register'd memory counts as pinned only if the whole source lies
     inside one registered range, and that range must stay registered until
-    the copies have completed."""
+    the copies have completed. Nothing is retained for the caller: until
+    then the caller must not modify, free, reuse, unregister or unmap a
+    directly copied source. D2H into a registered range is asynchronous and
+    the same rule applies to the destination."""
     torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes,
                                              snapshot_src)
 

@@ -248,6 +248,20 @@ void xpuAsyncMemcpyBatch(
     needs_staging = !all_pinned;
   }
 
+  // D2H into ranges registered with xpu_host_register is DMA-capable like
+  // pinned memory: copy asynchronously, in stream order, when every
+  // destination lies wholly inside one registered range.
+  if (dst_is_pageable) {
+    bool all_registered = true;
+    for (int64_t i = 0; i < n && all_registered; i++) {
+      if (sizes[i] == 0) continue;
+      all_registered = isHostRegistered(
+          reinterpret_cast<const void*>(dst_ptrs[i]),
+          static_cast<size_t>(sizes[i]));
+    }
+    dst_is_pageable = !all_registered;
+  }
+
   if (needs_staging) {
     // H2D: allocate one contiguous pinned staging buffer, snapshot all source
     // blocks, then submit all async DMAs.  This avoids N separate allocator
