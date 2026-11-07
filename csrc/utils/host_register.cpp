@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 
 #include "ops.h"
 #include "utils.h"
@@ -16,9 +17,15 @@ namespace {
 
 // Ranges registered through hostRegister. SYCL reports an imported range as
 // usm::alloc::unknown, so callers that must tell a registered (DMA-capable)
-// range from pageable memory look it up here.
-std::mutex& registeredMutex() {
-  static std::mutex m;
+// range from pageable memory look it up here. Lookups take the lock shared,
+// register and unregister take it exclusive.
+//
+// Ordering: hostRegister records a range only after prepare_for_device_copy
+// has succeeded, and hostUnregister forgets it before
+// release_from_device_copy. A lookup therefore never reports a range that is
+// not page-locked at the time of the lookup.
+std::shared_mutex& registeredMutex() {
+  static std::shared_mutex m;
   return m;
 }
 std::map<uintptr_t, size_t>& registeredRanges() {
@@ -48,7 +55,7 @@ bool hostRegister(void* ptr, size_t n_bytes) {
     return false;
   }
   {
-    std::lock_guard<std::mutex> g(registeredMutex());
+    std::unique_lock<std::shared_mutex> g(registeredMutex());
     registeredRanges()[reinterpret_cast<uintptr_t>(ptr)] = n_bytes;
   }
   return true;
@@ -59,7 +66,7 @@ bool hostUnregister(void* ptr) {
   if (ptr == nullptr) return false;
 
   {
-    std::lock_guard<std::mutex> g(registeredMutex());
+    std::unique_lock<std::shared_mutex> g(registeredMutex());
     registeredRanges().erase(reinterpret_cast<uintptr_t>(ptr));
   }
   auto ctx = vllm::xpu::vllmGetQueue().get_context();
@@ -76,12 +83,17 @@ bool hostUnregister(void* ptr) {
 
 bool isHostRegistered(const void* ptr, size_t n_bytes) {
   const auto p = reinterpret_cast<uintptr_t>(ptr);
-  std::lock_guard<std::mutex> g(registeredMutex());
-  auto& ranges = registeredRanges();
+  std::shared_lock<std::shared_mutex> g(registeredMutex());
+  const auto& ranges = registeredRanges();
+  // Check the last range starting at or before p. Registered ranges are not
+  // expected to overlap; if they do, a miss here only means a staged copy.
   auto it = ranges.upper_bound(p);
   if (it == ranges.begin()) return false;
   --it;
-  return p >= it->first && p + n_bytes <= it->first + it->second;
+  const uintptr_t offset = p - it->first;
+  // Whole-range containment only: a source that runs past the end of its
+  // range, even into an adjacent registered range, is not reported.
+  return offset < it->second && n_bytes <= it->second - offset;
 }
 
 }  // namespace xpu

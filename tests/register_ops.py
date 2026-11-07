@@ -690,7 +690,10 @@ def swap_blocks_batch(
 
     H2D sources are snapshotted at call time by default. With
     snapshot_src=False, pinned sources are copied directly in stream order
-    and must not be modified until the copies have completed."""
+    and must not be modified until the copies have completed. A source in
+    xpu_host_register'd memory counts as pinned only if the whole source lies
+    inside one registered range, and that range must stay registered until
+    the copies have completed."""
     torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes,
                                              snapshot_src)
 
