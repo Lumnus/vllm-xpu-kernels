@@ -1030,6 +1030,53 @@ def test_fused_moe_ep(m, n, k, e, topk, ep_rank, ep_size, dtype, w_dtype,
     torch.testing.assert_close(output, ref_out, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("m,n,k", [(16, 1024, 1024)])
+@pytest.mark.parametrize("ep_rank", [0, 3])
+def test_fused_moe_explicit_expert_map_without_ep(m, n, k, ep_rank):
+    """An expert_map given to the constructor is used at ep_size=1 too: the
+    experts it maps to -1 are skipped, as with the same slice under EP."""
+    seed_everything(7)
+    dtype, e, topk, ep_size = torch.float16, 16, 2, 4
+    a = torch.randn((m, n), device=DEVICE, dtype=dtype) / 16
+    w13 = torch.randn((e, 2 * k, n), device=DEVICE, dtype=dtype) / 16
+    w2 = torch.randn((e, n, k), device=DEVICE, dtype=dtype) / 16
+    scores = torch.randn((m, e), device=DEVICE, dtype=torch.float32)
+    expert_scores, expert_indices = torch.topk(scores, k=topk, dim=-1)
+
+    local = e // ep_size
+    ref_out = ref_fused_moe(a.clone(), w13, None, w2, None,
+                            expert_scores.view(-1, 1), expert_indices.view(-1),
+                            topk, "silu", local, ep_rank, ep_size)
+
+    start = local * ep_rank
+    expert_map = torch.full((e, ), -1, dtype=torch.int32, device=DEVICE)
+    expert_map[start:start + local] = torch.arange(local,
+                                                   dtype=torch.int32,
+                                                   device=DEVICE)
+    fused_moe_impl = XpuFusedMoe(
+        w13=w13[start:start + local],
+        w13_scales=None,
+        w13_bias=None,
+        w2=w2[start:start + local],
+        w2_scales=None,
+        w2_bias=None,
+        n_experts_per_token=topk,
+        activation="silu",
+        num_experts=local,
+        ep_rank=0,
+        ep_size=1,
+        expert_map=expert_map,
+    )
+    output = torch.empty_like(ref_out)
+    fused_moe_impl.apply(
+        output=output,
+        hidden_states=a,
+        topk_weights=expert_scores,
+        topk_ids=expert_indices,
+    )
+    torch.testing.assert_close(output, ref_out, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
