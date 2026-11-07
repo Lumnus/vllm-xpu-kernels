@@ -88,3 +88,60 @@ def test_int4_weights_in_host_memory_stay_there():
     # weights are 78 MiB; scales, activations and the output stay far below
     assert grown < (w13.numel() + w2.numel()) // 4
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.xpu.is_available() or
+    (not torch.ops._xpu_C.is_bmg(0) and not torch.ops._xpu_C.is_pvc(0)),
+    reason="XE2 CUTLASS tests only run on BMG or PVC.")
+@pytest.mark.parametrize("tokens", [8, 16, 64, 512])
+def test_int4_weights_and_scales_in_host_memory(tokens):
+    """vLLM's --cpu-offload-params experts puts the per-group scales on host
+    views too. The int4 grouped GEMM must not issue a block-2D prefetch on
+    them: an out-of-spec one is tolerated in device memory but loses the
+    device in host memory (fixed by #605). Qwen3.6-35B-A3B layer shape."""
+    dev = torch.device("xpu:0")
+    e, k, inter, group, topk = 256, 2048, 512, 128, 8
+    gen = torch.Generator().manual_seed(5)
+    w13 = torch.randint(0,
+                        256, (e, 2 * inter, k // 2),
+                        dtype=torch.uint8,
+                        generator=gen)
+    w2 = torch.randint(0,
+                       256, (e, k, inter // 2),
+                       dtype=torch.uint8,
+                       generator=gen)
+    s13 = (torch.rand(e, 2 * inter, k // group, generator=gen) * 4e-3 +
+           2e-3).to(torch.bfloat16)
+    s2 = (torch.rand(e, k, inter // group, generator=gen) * 4e-3 +
+          2e-3).to(torch.bfloat16)
+    ids = torch.stack(
+        [torch.randperm(e, generator=gen)[:topk] for _ in range(tokens)])
+    weights = torch.softmax(torch.randn(tokens, topk, generator=gen), dim=-1)
+    x = (torch.randn(tokens, k, generator=gen) * 0.5).to(torch.bfloat16).to(dev)
+    topk_w, topk_ids = weights.to(dev), ids.to(dev, torch.int32)
+
+    def run(p13, p2, q13, q2):
+        moe = XpuFusedMoe(w13=p13,
+                          w13_scales=q13,
+                          w13_bias=None,
+                          w2=p2,
+                          w2_scales=q2,
+                          w2_bias=None,
+                          n_experts_per_token=topk,
+                          activation="silu",
+                          num_experts=e)
+        out = torch.empty_like(x)
+        moe.apply(out, x, topk_w, topk_ids)
+        torch.xpu.synchronize()
+        return out
+
+    def param(t):
+        return torch.nn.Parameter(t, requires_grad=False)
+
+    ref = run(param(w13.to(dev)), param(w2.to(dev)), param(s13.to(dev)),
+              param(s2.to(dev)))
+
+    host = [t.clone().pin_memory() for t in (w13, w2, s13, s2)]
+    out = run(*(param(_host_view(t)) for t in host))
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
