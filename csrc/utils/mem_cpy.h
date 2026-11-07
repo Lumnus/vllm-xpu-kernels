@@ -33,9 +33,11 @@ void xpuAsyncMemcpy(
     const void* hctx,
     bool is_pinned);
 
-// True if [ptr, ptr + n_bytes) lies inside one range registered with
+// True if [ptr, ptr + n_bytes) lies wholly inside one range registered with
 // xpu_host_register (prepare_for_device_copy): DMA-capable host memory that
-// sycl::get_pointer_type() reports as usm::alloc::unknown.
+// sycl::get_pointer_type() reports as usm::alloc::unknown. A range only
+// partly covered, or spanning two registered ranges, is reported false.
+// Thread-safe; the answer holds at the time of the call only.
 bool isHostRegistered(const void* ptr, size_t n_bytes);
 
 /**
@@ -50,7 +52,22 @@ bool isHostRegistered(const void* ptr, size_t n_bytes);
  *   With snapshot_src=false and every source in pinned memory (USM host, or
  *   a range registered with xpu_host_register), copies directly from the
  *   sources instead, in stream order; the caller must then not modify the
- *   sources until the copies have completed.
+ *   sources until the copies have completed. A source counts as registered
+ *   only if its whole [src, src + size) lies inside one registered range;
+ *   if any non-empty source is not pinned, the whole batch is staged.
+ *
+ *   Registration vs. enqueue. The pinned check runs once, at call time,
+ *   under the registry lock: a range registered or unregistered before the
+ *   call is seen as such, and a range unregistered before the call is
+ *   staged. Nothing is checked or held after the call returns: the copies
+ *   read the sources when the stream reaches them. With snapshot_src=false
+ *   the caller must therefore keep every source range registered (and
+ *   mapped) until the copies have completed, i.e. synchronize the stream or
+ *   wait on an event recorded after the call before xpu_host_unregister.
+ *   Unregistering while a direct copy is pending is undefined behaviour.
+ *   A register or unregister racing with the call on another thread gives
+ *   either the staged or the direct outcome, both correct, provided the
+ *   rule above holds for the direct one.
  * For D2H / D2D: direct async DMA without staging.
  *
  * @param src_ptrs   Array of N raw source addresses
