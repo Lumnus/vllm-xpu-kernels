@@ -73,6 +73,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "b70_w8a8_fused_gemm(Tensor x, Tensor w, Tensor w_scale, Tensor? bias) "
       "-> Tensor");
   xpu_ops.impl("b70_w8a8_fused_gemm", torch::kXPU, &b70_w8a8_fused_gemm);
+  xpu_ops.def(
+      "b70_w8a8_gemm(Tensor xq, Tensor xs, Tensor w, Tensor w_scale, "
+      "Tensor? bias) -> Tensor");
+  xpu_ops.impl("b70_w8a8_gemm", torch::kXPU, &b70_w8a8_gemm);
 
 #ifdef VLLM_MOE_ENABLED
   xpu_ops.def(
@@ -113,7 +117,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   xpu_ops.impl(
       "cutlass_grouped_gemm_w4a8", torch::kXPU, &cutlass_grouped_gemm_w4a8);
   // B70 K1: fused W4A8 gemm1 (silu-and-mul + int8 quant with per-row,
-  // per-64-column scales in the epilogue).
+  // per-128-column scales in the epilogue).
   xpu_ops.def(
       "cutlass_grouped_gemm_w4a8_silu_quant(Tensor ptr_A, Tensor ptr_A_scale, "
       "Tensor ptr_B, Tensor ptr_B_scale, Tensor? ptr_bias, Tensor! q_out, "

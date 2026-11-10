@@ -12,7 +12,7 @@ Modes (comma list, default all):
   dbench   us per call per shape and M, eager and XPU-graph, rotating R weight copies (defeats L2):
            bf16 F.linear | W1 (if vLLM importable) | oneDNN int8_scaled_mm + quant | w8a16 | w8a8_fused.
   moe      W4A8 MoE (D8: 512 experts / EP4 = 128 local, top-10, hidden 2560, inter 640):
-           gemm-level check of the fused gemm1 (silu*up -> int8 + per-64-col scales) and of gemm2 with
+           gemm-level check of the fused gemm1 (silu*up -> int8 + per-128-col scales) and of gemm2 with
            those scales vs fp64; then the full MoE: fused-act vs unfused W4A8 vs stock W4A16 vs fp32.
   mbench   ms of the full MoE (graph replay and eager) for stock W4A16, W4A8 unfused, W4A8 fused-act, over
            the knob grid B70_W4A8_PREFETCH {4,6} x B70_W4A8_SMALL_TILE {0,1,2} x B70_W4A8_TILE_K {64,32};
@@ -39,6 +39,7 @@ DENSE_SHAPES = {  # name: (K, N) per rank, TP4
     "in_proj_ba": (2560, 24),
 }
 H, INTER, E_GLOBAL, TOPK, G = 2560, 640, 512, 10, 128
+AGC = 128  # activation-scale group of the fused gemm1 output
 
 
 def sync():
@@ -134,7 +135,7 @@ def run_dense(ms, D):
                 refbf = x.double() @ w.double().t() + bias.double()  # unquantized
                 r = {"shape": name, "K": K, "N": N, "M": M, "input": kind}
                 o16 = torch.ops._xpu_C.b70_w8a16_gemm(xd, wqd, wsd, bias.to(DEV))
-                o88 = torch.ops._xpu_C.b70_w8a8_fused_gemm(xd, wqd, wsd, bias.to(DEV)) if M <= 64 else None
+                o88 = torch.ops._xpu_C.b70_w8a8_fused_gemm(xd, wqd, wsd, bias.to(DEV)) if (M <= 64 and N % 16 == 0 and N >= 32) else None
                 sync()
                 r["w8a16_rel_vs_ref"] = rel(o16.cpu(), ref16)
                 r["w8a16_rel_vs_bf16w"] = rel(o16.cpu(), refbf)
@@ -169,8 +170,11 @@ def run_dbench(ms, D, rot):
                 "bf16": lambda i: F.linear(x, ws_[i]),
                 "w8a16": lambda i: torch.ops._xpu_C.b70_w8a16_gemm(x, qs[i][0], qs[i][1], None),
             }
-            if M <= 64:
+            if M <= 64 and N % 16 == 0 and N >= 32:
                 arms["w8a8f"] = lambda i: torch.ops._xpu_C.b70_w8a8_fused_gemm(x, qs[i][0], qs[i][1], None)
+                xq8, xs8 = q_act(x)
+                xq8, xs8 = xq8.contiguous(), xs8.reshape(-1).contiguous()
+                arms["w8a8_gemm_only"] = lambda i: torch.ops._xpu_C.b70_w8a8_gemm(xq8, xs8, qs[i][0], qs[i][1], None)
             if hasattr(torch.ops._xpu_C, "int8_scaled_mm") and hasattr(torch.ops._C, "dynamic_per_token_scaled_int8_quant"):
                 def onednn(i):
                     xq = torch.empty((M, K), dtype=torch.int8, device=DEV)
@@ -238,10 +242,10 @@ def run_glu_gemm(seed):
                         act[r0:r0 + m] = F.silu(h[:, :INTER]) * h[:, INTER:]
                     r0 += m
                 q = torch.empty(M, INTER, dtype=torch.int8, device=DEV)
-                qs = torch.empty(M, INTER // 64, dtype=torch.float32, device=DEV)
+                qs = torch.empty(M, INTER // AGC, dtype=torch.float32, device=DEV)
                 glu(a.to(DEV), a_s.to(DEV), wb.to(DEV), ws.to(DEV), None, q, qs, rpe.to(DEV), INTER, K, E)
                 sync()
-                deq = (q.cpu().double().view(M, INTER // 64, 64) * qs.cpu().double().unsqueeze(-1)).view(M, INTER)
+                deq = (q.cpu().double().view(M, INTER // AGC, AGC) * qs.cpu().double().unsqueeze(-1)).view(M, INTER)
                 # gemm2 with the AG scales vs fp64 over the same int8 + scales
                 d2 = torch.empty(M, H, dtype=torch.bfloat16, device=DEV)
                 op(q, qs, w2.to(DEV), s2.to(DEV), None, d2, rpe.to(DEV), H, INTER, E)
@@ -372,7 +376,7 @@ def run_gemm_prefill(fm, w4, T, seed, grid):
     a8, as8 = w4.quant_rows((torch.randn(rows, H, device=DEV) * 0.5).to(torch.bfloat16))
     i8, is8 = w4.quant_rows((torch.randn(rows, INTER, device=DEV) * 0.5).to(torch.bfloat16))
     q = torch.empty(rows, INTER, dtype=torch.int8, device=DEV)
-    qs = torch.empty(rows, INTER // 64, dtype=torch.float32, device=DEV)
+    qs = torch.empty(rows, INTER // AGC, dtype=torch.float32, device=DEV)
     d1 = torch.empty(rows, 2 * INTER, dtype=torch.bfloat16, device=DEV)
     d2 = torch.empty(rows, H, dtype=torch.bfloat16, device=DEV)
     E = fm.num_experts
@@ -424,6 +428,7 @@ def main():
     args = ap.parse_args()
 
     import vllm_xpu_kernels  # noqa
+    import vllm_xpu_kernels._xpu_C  # noqa: F401  (registers torch.ops._xpu_C)
     from vllm_xpu_kernels import b70_moe_w4a8 as w4
     print("DEVICE", torch.xpu.get_device_name(0), "kernels", getattr(vllm_xpu_kernels, "__version__", "?"),
           flush=True)

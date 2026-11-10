@@ -68,6 +68,12 @@ torch::Tensor b70_w8a16_gemm(
     const torch::Tensor& w,
     const torch::Tensor& w_scale,
     const std::optional<torch::Tensor>& bias);
+torch::Tensor b70_w8a8_gemm(
+    const torch::Tensor& xq,
+    const torch::Tensor& xs,
+    const torch::Tensor& w,
+    const torch::Tensor& w_scale,
+    const std::optional<torch::Tensor>& bias);
 torch::Tensor b70_w8a8_fused_gemm(
     const torch::Tensor& x,
     const torch::Tensor& w,

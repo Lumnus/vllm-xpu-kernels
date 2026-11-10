@@ -9,8 +9,10 @@ fixed cost. These ops consume the same weights unchanged:
   ``torch.ops._xpu_C.b70_w8a16_gemm(x, w, w_scale, bias)``
       weight-only: bf16 x, fp32 FMA, no activation quant pass. M <= ~16.
   ``torch.ops._xpu_C.b70_w8a8_fused_gemm(x, w, w_scale, bias)``
-      per-token int8 quant of x inside the GEMM (same scale rule as
-      scaled_int8_quant), s8 x s8 DPAS. M <= 64, K % 32 == 0, N % 8 == 0.
+      per-token int8 quant (same rule as scaled_int8_quant) + the cutlass
+      s8 x s8 streaming GEMM; weights read once. M <= 64, K % 32 == 0,
+      N % 16 == 0, N >= 32, bf16 x.
+  ``torch.ops._xpu_C.b70_w8a8_gemm(xq, xs, w, w_scale, bias)``  the GEMM alone.
 
 ``mm`` picks one by M and returns None when neither applies (the caller keeps
 its own path). Thresholds come from the caller (vLLM env, see the patch).
@@ -33,7 +35,7 @@ def mm(x: torch.Tensor,
        w: torch.Tensor,
        w_scale: torch.Tensor,
        bias: Optional[torch.Tensor] = None,
-       w8a16_max_m: int = 8,
+       w8a16_max_m: int = 2,
        fused_max_m: int = 64) -> Optional[torch.Tensor]:
     """x [M, K] bf16/fp16 contiguous, w int8 [N, K], w_scale fp32 [N] / [N, 1]."""
     m, k = x.shape
@@ -42,6 +44,7 @@ def mm(x: torch.Tensor,
         return None  # the kernels use 16-byte vector loads
     if m <= w8a16_max_m and k % 16 == 0:
         return torch.ops._xpu_C.b70_w8a16_gemm(x, w, w_scale, bias)
-    if m <= min(fused_max_m, 64) and k % 32 == 0 and n % 8 == 0:
+    if (m <= min(fused_max_m, 64) and k % 32 == 0 and n % 16 == 0 and n >= 32
+            and x.dtype == torch.bfloat16):
         return torch.ops._xpu_C.b70_w8a8_fused_gemm(x, w, w_scale, bias)
     return None
