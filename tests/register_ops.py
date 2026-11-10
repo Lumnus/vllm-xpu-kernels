@@ -696,11 +696,23 @@ def swap_blocks_batch(
     src_ptrs: torch.Tensor,
     dst_ptrs: torch.Tensor,
     sizes: torch.Tensor,
+    snapshot_src: bool = True,
 ) -> None:
     """Batch version of swap_blocks: copies N independent (src, dst, size)
     triples in a single call. The target XPU device is auto-inferred from the
-    device-side pointers in src_ptrs/dst_ptrs."""
-    torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
+    device-side pointers in src_ptrs/dst_ptrs.
+
+    H2D sources are snapshotted at call time by default. With
+    snapshot_src=False, pinned sources are copied directly in stream order
+    and must not be modified until the copies have completed. A source in
+    xpu_host_register'd memory counts as pinned only if the whole source lies
+    inside one registered range, and that range must stay registered until
+    the copies have completed. Nothing is retained for the caller: until
+    then the caller must not modify, free, reuse, unregister or unmap a
+    directly copied source. D2H into a registered range is asynchronous and
+    the same rule applies to the destination."""
+    torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes,
+                                             snapshot_src)
 
 
 def xpu_host_register(ptr: int, n_bytes: int) -> bool:

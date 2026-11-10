@@ -33,6 +33,13 @@ void xpuAsyncMemcpy(
     const void* hctx,
     bool is_pinned);
 
+// True if [ptr, ptr + n_bytes) lies wholly inside one range registered with
+// xpu_host_register (prepare_for_device_copy): DMA-capable host memory that
+// sycl::get_pointer_type() reports as usm::alloc::unknown. A range only
+// partly covered, or spanning two registered ranges, is reported false.
+// Thread-safe; the answer holds at the time of the call only.
+bool isHostRegistered(const void* ptr, size_t n_bytes);
+
 /**
  * @brief Batch async memcpy: copies N independent (src, dst, size) triples
  *        in a single call, amortising per-copy overhead.
@@ -42,18 +49,51 @@ void xpuAsyncMemcpy(
  *
  * For H2D: snapshots all source blocks through a single contiguous pinned
  *   staging buffer so the caller may safely mutate host memory immediately.
- * For D2H / D2D: direct async DMA without staging.
+ *   With snapshot_src=false and every source in pinned memory (USM host, or
+ *   a range registered with xpu_host_register), copies directly from the
+ *   sources instead, in stream order; the caller must then not modify the
+ *   sources until the copies have completed. A source counts as registered
+ *   only if its whole [src, src + size) lies inside one registered range;
+ *   if any non-empty source is not pinned, the whole batch is staged.
+ *
+ *   Registration vs. enqueue. The pinned check runs once, at call time,
+ *   under the registry lock: a range registered or unregistered before the
+ *   call is seen as such, and a range unregistered before the call is
+ *   staged. Nothing is checked or held after the call returns: the copies
+ *   read the sources when the stream reaches them. With snapshot_src=false
+ *   the caller must therefore keep every source range registered (and
+ *   mapped) until the copies have completed, i.e. synchronize the stream or
+ *   wait on an event recorded after the call before xpu_host_unregister.
+ *   Unregistering while a direct copy is pending is undefined behaviour.
+ *   A register or unregister racing with the call on another thread gives
+ *   either the staged or the direct outcome, both correct, provided the
+ *   rule above holds for the direct one.
+ *
+ *   Lifetime. Neither call holds a reference to a raw source: with
+ *   snapshot_src=false the caller owns each source allocation until the
+ *   copies have completed. It must not modify, free, reuse, unregister or
+ *   unmap it before then. The staged path needs none of this; its staging
+ *   buffer is returned to the caching host allocator only after the stream
+ *   has passed the copies.
+ * For D2H / D2D: direct async DMA without staging. A host destination that
+ *   is neither USM host memory nor wholly inside one registered range is
+ *   pageable and is copied synchronously. Registered destinations are copied
+ *   asynchronously and follow the same lifetime rule: keep them allocated,
+ *   registered and untouched by the CPU until the copies have completed.
  *
  * @param src_ptrs   Array of N raw source addresses
  * @param dst_ptrs   Array of N raw destination addresses
  * @param sizes      Array of N byte counts
  * @param n          Number of entries
+ * @param snapshot_src  For H2D from pinned sources: stage (true) or copy
+ *                      directly (false). Pageable sources are always staged.
  */
 void xpuAsyncMemcpyBatch(
     const uint64_t* src_ptrs,
     const uint64_t* dst_ptrs,
     const uint64_t* sizes,
-    int64_t n);
+    int64_t n,
+    bool snapshot_src = true);
 
 }  // namespace xpu
 }  // namespace vllm

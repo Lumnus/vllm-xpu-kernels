@@ -2,14 +2,36 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <mutex>
+#include <shared_mutex>
 
 #include "ops.h"
 #include "utils.h"
+#include "utils/mem_cpy.h"
 
 namespace vllm {
 namespace xpu {
 
 namespace {
+
+// Ranges registered through hostRegister. SYCL reports an imported range as
+// usm::alloc::unknown, so callers that must tell a registered (DMA-capable)
+// range from pageable memory look it up here. Lookups take the lock shared,
+// register and unregister take it exclusive.
+//
+// Ordering: hostRegister records a range only after prepare_for_device_copy
+// has succeeded, and hostUnregister forgets it before
+// release_from_device_copy. A lookup therefore never reports a range that is
+// not page-locked at the time of the lookup.
+std::shared_mutex& registeredMutex() {
+  static std::shared_mutex m;
+  return m;
+}
+std::map<uintptr_t, size_t>& registeredRanges() {
+  static std::map<uintptr_t, size_t> r;
+  return r;
+}
 
 // Page-locks an existing host allocation and imports it into the current
 // device's SYCL context, the SYCL counterpart of cudaHostRegister. Host
@@ -32,6 +54,10 @@ bool hostRegister(void* ptr, size_t n_bytes) {
         "); transfers stay correct but fall back to pageable host memory");
     return false;
   }
+  {
+    std::unique_lock<std::shared_mutex> g(registeredMutex());
+    registeredRanges()[reinterpret_cast<uintptr_t>(ptr)] = n_bytes;
+  }
   return true;
 }
 
@@ -39,6 +65,10 @@ bool hostRegister(void* ptr, size_t n_bytes) {
 bool hostUnregister(void* ptr) {
   if (ptr == nullptr) return false;
 
+  {
+    std::unique_lock<std::shared_mutex> g(registeredMutex());
+    registeredRanges().erase(reinterpret_cast<uintptr_t>(ptr));
+  }
   auto ctx = vllm::xpu::vllmGetQueue().get_context();
   try {
     syclex::release_from_device_copy(ptr, ctx);
@@ -50,6 +80,21 @@ bool hostUnregister(void* ptr) {
 }
 
 }  // namespace
+
+bool isHostRegistered(const void* ptr, size_t n_bytes) {
+  const auto p = reinterpret_cast<uintptr_t>(ptr);
+  std::shared_lock<std::shared_mutex> g(registeredMutex());
+  const auto& ranges = registeredRanges();
+  // Check the last range starting at or before p. Registered ranges are not
+  // expected to overlap; if they do, a miss here only means a staged copy.
+  auto it = ranges.upper_bound(p);
+  if (it == ranges.begin()) return false;
+  --it;
+  const uintptr_t offset = p - it->first;
+  // Whole-range containment only: a source that runs past the end of its
+  // range, even into an adjacent registered range, is not reported.
+  return offset < it->second && n_bytes <= it->second - offset;
+}
 
 }  // namespace xpu
 }  // namespace vllm

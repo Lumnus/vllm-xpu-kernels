@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import mmap
 import random
 
 import numpy as np
@@ -181,6 +182,15 @@ MINI_PYTEST_PARAMS = {
         "device": ["xpu:0"],
     },
     "test_swap_blocks_batch_h2d_mutation_race": {
+        "device": ["xpu:0"],
+    },
+    "test_swap_blocks_batch_h2d_pinned_no_snapshot": {
+        "device": ["xpu:0"],
+    },
+    "test_swap_blocks_batch_h2d_registered_no_snapshot": {
+        "device": ["xpu:0"],
+    },
+    "test_swap_blocks_batch_h2d_registered_partial": {
         "device": ["xpu:0"],
     },
     "test_gather_and_maybe_dequant_cache_mla": {
@@ -1224,6 +1234,229 @@ def test_swap_blocks_batch_h2d_mutation_race(device: str) -> None:
             dst_val[0][db].cpu(),
             msg=f"Value block {sb}→{db} corrupted by post-call mutation",
         )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_swap_blocks_batch_h2d_pinned_no_snapshot(device: str) -> None:
+    """With snapshot_src=False, H2D from pinned memory reads the source in
+    stream order: it must see a non-blocking D2H copy into the same pinned
+    buffer that was queued just before it."""
+    torch.xpu.set_device(device)
+
+    n_blocks = 32
+    block_elems = 1 << 12
+    mm = 2048
+    trials = 8
+    poison, value = -7.0, 3.0
+
+    src = torch.empty(n_blocks * block_elems,
+                      device=device,
+                      dtype=torch.float32)
+    host = torch.full(src.shape, poison, dtype=src.dtype, pin_memory=True)
+    assert host.is_pinned()
+    dst = torch.empty_like(src)
+    stride_bytes = block_elems * src.element_size()
+    block_mapping = [(i, i) for i in range(n_blocks)]
+    sp, dp, sz = _build_batch_args(host.view(n_blocks, block_elems),
+                                   dst.view(n_blocks, block_elems),
+                                   block_mapping, stride_bytes)
+
+    a = torch.randn(mm, mm, device=device, dtype=torch.float32)
+    b = torch.randn(mm, mm, device=device, dtype=torch.float32)
+
+    for t in range(trials):
+        host.fill_(poison)
+        dst.fill_(poison)
+        torch.xpu.synchronize(device)
+        # Keep the stream busy so the D2H copy is still pending when
+        # swap_blocks_batch is called.
+        c = a
+        for _ in range(6):
+            c = torch.mm(c, b)
+        src.fill_(value + t)
+        host.copy_(src, non_blocking=True)
+        ops.swap_blocks_batch(sp, dp, sz, snapshot_src=False)
+        torch.xpu.synchronize(device)
+        assert torch.all(dst == value + t), (
+            f"trial {t}: H2D copy did not see the preceding D2H copy")
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_swap_blocks_batch_h2d_registered_no_snapshot(device: str) -> None:
+    """Host memory registered with xpu_host_register is reported by SYCL as
+    usm::alloc::unknown, not USM host. With snapshot_src=False it must still
+    be copied directly, in stream order: the H2D copy must see a D2H copy
+    into the same registered range that was queued just before it. The order
+    comes from the in-order queue, not from timing.
+
+    Negative control: with snapshot_src=True the source is snapshotted at
+    call time, while the D2H copy still waits behind other work, so the
+    poison arrives. That shows the test tells the two paths apart."""
+    torch.xpu.set_device(device)
+
+    n_blocks = 32
+    block_elems = 1 << 12
+    block_bytes = block_elems * 4
+    total = n_blocks * block_bytes
+    mm = 2048
+    trials = 8
+    poison, value = -7.0, 3.0
+
+    src = torch.empty(n_blocks * block_elems,
+                      device=device,
+                      dtype=torch.float32)
+    dst = torch.empty_like(src)
+    a = torch.randn(mm, mm, device=device, dtype=torch.float32)
+    b = torch.randn(mm, mm, device=device, dtype=torch.float32)
+    mapping = [(i, i) for i in range(n_blocks)]
+
+    seen = {False: [], True: []}
+    with mmap.mmap(-1, total) as region:
+        host = torch.frombuffer(memoryview(region), dtype=torch.float32)
+        assert ops.xpu_host_register(host.data_ptr(), total)
+        try:
+            d2h = _build_batch_args(src.view(n_blocks, block_elems),
+                                    host.view(n_blocks, block_elems),
+                                    mapping, block_bytes)
+            h2d = _build_batch_args(host.view(n_blocks, block_elems),
+                                    dst.view(n_blocks, block_elems),
+                                    mapping, block_bytes)
+            for snapshot in (False, True):
+                for t in range(trials):
+                    host.fill_(poison)
+                    dst.fill_(0.0)
+                    torch.xpu.synchronize(device)
+                    # Keep the stream busy so the D2H copy is still pending
+                    # when swap_blocks_batch is called.
+                    c = a
+                    for _ in range(6):
+                        c = torch.mm(c, b)
+                    src.fill_(value + t)
+                    ops.swap_blocks_batch(*d2h)
+                    ops.swap_blocks_batch(*h2d, snapshot_src=snapshot)
+                    torch.xpu.synchronize(device)
+                    got = ("value" if torch.all(dst == value + t) else
+                           "poison" if torch.all(dst == poison) else "mixed")
+                    seen[snapshot].append(got)
+        finally:
+            assert ops.xpu_host_unregister(host.data_ptr())
+            del host
+
+    assert seen[False] == ["value"] * trials, (
+        f"snapshot_src=False: {seen[False]}; the registered source was not "
+        "read in stream order")
+    assert "poison" in seen[True], (
+        f"snapshot_src=True: {seen[True]}; the staged copy never ran ahead "
+        "of the D2H copy, so this test cannot tell staged from direct")
+
+
+# Source spans (offset, size) in bytes, given the range size R and a block
+# size B, inside a 3R-byte mmap whose middle third [R, 2R) is registered.
+# "direct": every span lies wholly inside the registered range. "staged": at
+# least one span reaches outside it, so the whole batch must be staged.
+_REG_PARTIAL_CASES = {
+    # Whole range, and the first and last block: both edges inclusive.
+    "whole": ("direct", lambda R, B: [(R, R)]),
+    "edges": ("direct", lambda R, B: [(R, B), (2 * R - B, B)]),
+    # Starts inside, ends one byte past the end of the range.
+    "past_end": ("staged", lambda R, B: [(2 * R - B, B + 1)]),
+    # Starts one byte before the range, ends inside.
+    "before_start": ("staged", lambda R, B: [(R - 1, B)]),
+    # Covers the range and one byte on each side.
+    "superset": ("staged", lambda R, B: [(R - 1, R + 2)]),
+    # One partly covered source stages the whole batch.
+    "mixed_batch": ("staged",
+                    lambda R, B: [(R, B), (R + B, B), (2 * R - B, B + 1)]),
+    # Control: pageable, never registered.
+    "unregistered": ("staged", lambda R, B: [(0, B)]),
+}
+
+
+@pytest.mark.parametrize("case", list(_REG_PARTIAL_CASES))
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_swap_blocks_batch_h2d_registered_partial(device: str,
+                                                  case: str) -> None:
+    """With snapshot_src=False, a source counts as registered only if all of
+    it lies inside one xpu_host_register'd range. A source only partly
+    covered must be staged (snapshot at call time), and so must the rest of
+    its batch.
+
+    Staged vs direct is read from the data, with the copy queued behind
+    other work. "direct": a D2H copy into the same spans, queued just before
+    the call, must be what arrives in every trial (stream order; a snapshot
+    at call time would hold the old bytes). "staged": the CPU rewrites the
+    source right after the call, which the staged path allows, and every
+    trial must deliver the old bytes."""
+    torch.xpu.set_device(device)
+
+    block = 1 << 16
+    n_blocks = 16
+    reg = n_blocks * block  # R: page-aligned, multiple of the page size
+    mm = 4096
+    trials = 8
+    old, new = 3, 7
+    expect, spans_of = _REG_PARTIAL_CASES[case]
+
+    a = torch.randn(mm, mm, device=device, dtype=torch.float32)
+    b = torch.randn(mm, mm, device=device, dtype=torch.float32)
+
+    with mmap.mmap(-1, 3 * reg) as region:
+        host = torch.frombuffer(memoryview(region), dtype=torch.uint8)
+        base = host.data_ptr()
+        assert ops.xpu_host_register(base + reg, reg)
+        try:
+            spans = spans_of(reg, block)
+            total = sum(size for _, size in spans)
+            dst = torch.empty(total, device=device, dtype=torch.uint8)
+            src_ptrs, dst_ptrs, offset = [], [], 0
+            for off, size in spans:
+                src_ptrs.append(base + off)
+                dst_ptrs.append(dst.data_ptr() + offset)
+                offset += size
+            sp = torch.tensor(np.array(src_ptrs, dtype=np.uint64))
+            dp = torch.tensor(np.array(dst_ptrs, dtype=np.uint64))
+            sz = torch.tensor(
+                np.array([size for _, size in spans], dtype=np.uint64))
+            # Producer for "direct": the device writes `new` into the spans.
+            prod = torch.full((total, ), new, device=device, dtype=torch.uint8)
+            prod_ptrs = [prod.data_ptr() + d - dst.data_ptr() for d in dst_ptrs]
+            produce = (torch.tensor(np.array(prod_ptrs, dtype=np.uint64)), sp,
+                       sz)
+
+            seen_new = seen_old = 0
+            for _ in range(trials):
+                host.fill_(old)
+                dst.fill_(0)
+                torch.xpu.synchronize(device)
+                c = a
+                for _ in range(12):
+                    c = torch.mm(c, b)
+                if expect == "direct":
+                    ops.swap_blocks_batch(*produce)
+                    ops.swap_blocks_batch(sp, dp, sz, snapshot_src=False)
+                else:
+                    ops.swap_blocks_batch(sp, dp, sz, snapshot_src=False)
+                    host.fill_(new)
+                torch.xpu.synchronize(device)
+                seen_new += bool(torch.all(dst == new))
+                seen_old += bool(torch.all(dst == old))
+        finally:
+            assert ops.xpu_host_unregister(base + reg)
+            del host
+
+    if expect == "staged":
+        assert seen_old == trials, (
+            f"{case}: {trials - seen_old} of {trials} trials were not "
+            "staged; a source outside the registered range was read in "
+            "stream order")
+    else:
+        assert seen_new == trials, (
+            f"{case}: {trials - seen_new} of {trials} trials missed the "
+            "preceding D2H copy; a source wholly inside the registered range "
+            "was not read in stream order")
 
 
 @pytest.mark.skipif(torch.xpu.device_count() < 2,
