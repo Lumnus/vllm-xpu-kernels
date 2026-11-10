@@ -6,7 +6,7 @@ vLLM on PYTHONPATH is optional: with it the dense bench also times W1's live pat
 (vllm b70_dense_int8._b70_int8_dense_mm: scaled_int8_quant + Triton/oneDNN).
 
 Modes (comma list, default all):
-  dense    exactness of b70_w8a16_gemm and b70_w8a8_fused_gemm at the D8 per-rank shapes, M 1..64:
+  dense    exactness of int8_dense_w8a16_gemm and int8_dense_w8a8_fused_gemm at the D8 per-rank shapes, M 1..64:
            vs an fp64 reference over the same int8 weights (W8A16: bf16 x; W8A8: x quantized per token
            exactly as scaled_int8_quant does), vs BF16 F.linear on the unquantized weights, and vs W1.
   dbench   us per call per shape and M, eager and XPU-graph, rotating R weight copies (defeats L2):
@@ -18,7 +18,7 @@ Modes (comma list, default all):
            the knob grid B70_W4A8_PREFETCH {4,6} x B70_W4A8_SMALL_TILE {0,1,2} x B70_W4A8_TILE_K {64,32};
            plus GEMM-only gemm1 / gemm2 ms and TOPS at 4096 tokens (prefill).
 
-  hcdet    determinism + batch invariance of b70_w8a8_fused_gemm (the int8 HC down path): for each shape, a
+  hcdet    determinism + batch invariance of int8_dense_w8a8_fused_gemm (the int8 HC down path): for each shape, a
            256-row pool; every row's output must be bit-identical across 2 runs, across batch compositions
            (sub-batches of 1..256 rows in shuffled order, so M crosses the 8/16/32/64 tiles and the split-K
            choice), across B70_I8D_KSPLIT 1/2/4/16 and across B70_I8D_TILE variants.
@@ -139,8 +139,8 @@ def run_dense(ms, D):
                 ref88 = (xq.double() @ wq.double().t()) * xs.double() * ws.double().t() + bias.double()
                 refbf = x.double() @ w.double().t() + bias.double()  # unquantized
                 r = {"shape": name, "K": K, "N": N, "M": M, "input": kind}
-                o16 = torch.ops._xpu_C.b70_w8a16_gemm(xd, wqd, wsd, bias.to(DEV))
-                o88 = torch.ops._xpu_C.b70_w8a8_fused_gemm(xd, wqd, wsd, bias.to(DEV)) if (M <= 64 and N % 16 == 0 and N >= 32) else None
+                o16 = torch.ops._xpu_C.int8_dense_w8a16_gemm(xd, wqd, wsd, bias.to(DEV))
+                o88 = torch.ops._xpu_C.int8_dense_w8a8_fused_gemm(xd, wqd, wsd, bias.to(DEV)) if (M <= 64 and N % 16 == 0 and N >= 32) else None
                 sync()
                 r["w8a16_rel_vs_ref"] = rel(o16.cpu(), ref16)
                 r["w8a16_rel_vs_bf16w"] = rel(o16.cpu(), refbf)
@@ -173,18 +173,18 @@ def run_dbench(ms, D, rot):
             r = {"shape": name, "K": K, "N": N, "M": M, "rot": rot}
             arms = {
                 "bf16": lambda i: F.linear(x, ws_[i]),
-                "w8a16": lambda i: torch.ops._xpu_C.b70_w8a16_gemm(x, qs[i][0], qs[i][1], None),
+                "w8a16": lambda i: torch.ops._xpu_C.int8_dense_w8a16_gemm(x, qs[i][0], qs[i][1], None),
             }
             if M <= 64 and N % 16 == 0 and N >= 32:
-                arms["w8a8f"] = lambda i: torch.ops._xpu_C.b70_w8a8_fused_gemm(x, qs[i][0], qs[i][1], None)
+                arms["w8a8f"] = lambda i: torch.ops._xpu_C.int8_dense_w8a8_fused_gemm(x, qs[i][0], qs[i][1], None)
                 xq8, xs8 = q_act(x)
                 xq8, xs8 = xq8.contiguous(), xs8.reshape(-1).contiguous()
-                arms["w8a8_gemm_only"] = lambda i: torch.ops._xpu_C.b70_w8a8_gemm(xq8, xs8, qs[i][0], qs[i][1], None)
+                arms["w8a8_gemm_only"] = lambda i: torch.ops._xpu_C.int8_dense_w8a8_gemm(xq8, xs8, qs[i][0], qs[i][1], None)
                 for tile in ("64x64", "128x64", "32x128", "64x128"):
                     def tiled(i, tile=tile):
                         os.environ["B70_I8D_TILE"] = tile  # read per call on the host, fixed in the graph
                         try:
-                            return torch.ops._xpu_C.b70_w8a8_gemm(xq8, xs8, qs[i][0], qs[i][1], None)
+                            return torch.ops._xpu_C.int8_dense_w8a8_gemm(xq8, xs8, qs[i][0], qs[i][1], None)
                         finally:
                             os.environ.pop("B70_I8D_TILE", None)
                     arms[f"w8a8_gemm_{tile}"] = tiled
@@ -437,7 +437,7 @@ def run_hcdet(seed):
         pool = torch.randn(256, K, generator=g).to(torch.bfloat16)
         pool[:, :16] *= 20  # outlier channels, as in HC streams
         pool = pool.to(DEV)
-        op = lambda x: torch.ops._xpu_C.b70_w8a8_fused_gemm(x.contiguous(), wq, ws, None)  # noqa: E731
+        op = lambda x: torch.ops._xpu_C.int8_dense_w8a8_fused_gemm(x.contiguous(), wq, ws, None)  # noqa: E731
         ref = op(pool)
         ref2 = op(pool)
         sync()
@@ -492,10 +492,10 @@ def main():
 
     import vllm_xpu_kernels  # noqa
     import vllm_xpu_kernels._xpu_C  # noqa: F401  (registers torch.ops._xpu_C)
-    from vllm_xpu_kernels import b70_moe_w4a8 as w4
+    from vllm_xpu_kernels import moe_w4a8 as w4
     print("DEVICE", torch.xpu.get_device_name(0), "kernels", getattr(vllm_xpu_kernels, "__version__", "?"),
           flush=True)
-    for o in ("b70_w8a16_gemm", "b70_w8a8_fused_gemm", "b70_w8a8_gemm", "cutlass_grouped_gemm_w4a8_silu_quant"):
+    for o in ("int8_dense_w8a16_gemm", "int8_dense_w8a8_fused_gemm", "int8_dense_w8a8_gemm", "cutlass_grouped_gemm_w4a8_silu_quant"):
         assert hasattr(torch.ops._xpu_C, o), f"_xpu_C has no {o}: wrong wheel?"
     grid = [(4, 0, 64)] if args.grid == "default" else [
         (pf, st, tk) for pf in (4, 6) for st in (0, 1, 2) for tk in (64, 32)]

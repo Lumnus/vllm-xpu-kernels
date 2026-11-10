@@ -413,16 +413,16 @@ class XpuFusedMoe:
             if a1q_scale is not None:
                 raise NotImplementedError(
                     "MoE hooks require unquantized activations")
-        # w4a8=True: int4 g128 SiLU experts run the B70 W4A8 grouped GEMM
+        # w4a8=True: int4 g128 SiLU experts run the W4A8 grouped GEMM
         # (int8 per-token activations, s8 x s4 DPAS); anything it cannot take
         # (other dtypes, clamp, act-quant input) stays on the path below.
         if (w4a8 and a1q_scale is None and not self._use_ref
                 and activation_hook is None and output_hook is None):
-            from . import b70_moe_w4a8
-            if getattr(self, "_b70_w4a8_why", "") == "":
-                self._b70_w4a8_why = b70_moe_w4a8.eligible(self)
-            if self._b70_w4a8_why is None:
-                b70_moe_w4a8.apply(self, output, hidden_states, topk_weights,
+            from . import moe_w4a8
+            if getattr(self, "_w4a8_why", "") == "":
+                self._w4a8_why = moe_w4a8.eligible(self)
+            if self._w4a8_why is None:
+                moe_w4a8.apply(self, output, hidden_states, topk_weights,
                                    topk_ids, expert_map)
                 return
         if self._use_ref:

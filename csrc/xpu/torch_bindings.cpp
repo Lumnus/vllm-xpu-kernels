@@ -61,22 +61,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "Tensor B_scale, Tensor B_zp, int group_size, Tensor? bias) -> Tensor");
   xpu_ops.impl("int8_gemm_w8a8", torch::kXPU, &int8_gemm_w8a8);
 
-  // B70 K1: small-M int8 dense GEMMs over W1's int8 weights [N, K] with an
+  // small-M int8 dense GEMMs over W1's int8 weights [N, K] with an
   // fp32 per-row scale. w8a16: bf16 activations, no quant pass (M <= ~16).
   // w8a8_fused: per-token activation quant inside the GEMM, s8 x s8 DPAS
   // (M <= 64).
   xpu_ops.def(
-      "b70_w8a16_gemm(Tensor x, Tensor w, Tensor w_scale, Tensor? bias) -> "
+      "int8_dense_w8a16_gemm(Tensor x, Tensor w, Tensor w_scale, Tensor? bias) -> "
       "Tensor");
-  xpu_ops.impl("b70_w8a16_gemm", torch::kXPU, &b70_w8a16_gemm);
+  xpu_ops.impl("int8_dense_w8a16_gemm", torch::kXPU, &int8_dense_w8a16_gemm);
   xpu_ops.def(
-      "b70_w8a8_fused_gemm(Tensor x, Tensor w, Tensor w_scale, Tensor? bias) "
+      "int8_dense_w8a8_fused_gemm(Tensor x, Tensor w, Tensor w_scale, Tensor? bias) "
       "-> Tensor");
-  xpu_ops.impl("b70_w8a8_fused_gemm", torch::kXPU, &b70_w8a8_fused_gemm);
+  xpu_ops.impl("int8_dense_w8a8_fused_gemm", torch::kXPU, &int8_dense_w8a8_fused_gemm);
   xpu_ops.def(
-      "b70_w8a8_gemm(Tensor xq, Tensor xs, Tensor w, Tensor w_scale, "
+      "int8_dense_w8a8_gemm(Tensor xq, Tensor xs, Tensor w, Tensor w_scale, "
       "Tensor? bias) -> Tensor");
-  xpu_ops.impl("b70_w8a8_gemm", torch::kXPU, &b70_w8a8_gemm);
+  xpu_ops.impl("int8_dense_w8a8_gemm", torch::kXPU, &int8_dense_w8a8_gemm);
 
 #ifdef VLLM_MOE_ENABLED
   xpu_ops.def(
@@ -109,14 +109,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "()");
   xpu_ops.impl("moe_int4_gemv", torch::kXPU, &moe_int4_gemv);
 
-  // B70 W4A8 grouped GEMM: int8 per-token activations x int4 g128 weights.
+  // W4A8 grouped GEMM: int8 per-token activations x int4 g128 weights.
   xpu_ops.def(
       "cutlass_grouped_gemm_w4a8(Tensor ptr_A, Tensor ptr_A_scale, "
       "Tensor ptr_B, Tensor ptr_B_scale, Tensor? ptr_bias, Tensor ptr_D, "
       "Tensor rows_per_expert, int N, int K, int num_experts) -> Tensor");
   xpu_ops.impl(
       "cutlass_grouped_gemm_w4a8", torch::kXPU, &cutlass_grouped_gemm_w4a8);
-  // B70 K1: fused W4A8 gemm1 (silu-and-mul + int8 quant with per-row,
+  // fused W4A8 gemm1 (silu-and-mul + int8 quant with per-row,
   // per-128-column scales in the epilogue).
   xpu_ops.def(
       "cutlass_grouped_gemm_w4a8_silu_quant(Tensor ptr_A, Tensor ptr_A_scale, "

@@ -1,21 +1,21 @@
-// B70 K1: small-M int8 dense GEMMs over the weights B70-IP-W1 already holds
+// small-M int8 dense GEMMs over the weights the int8 linear path already holds
 // (int8 [N, K] symmetric per output row, RTN, fp32 scale [N] / [N, 1]).
 //
 // Decode on the D8 shapes runs M = 8..64 rows, where W1's path (a separate
 // scaled_int8_quant kernel, then Triton scaled_mm) costs 1.3-1.5x BF16 on the
 // small shapes: fixed cost, not math. Two kernels replace it:
 //
-// b70_w8a16_gemm (weight-only, M <= ~16): y[m, n] = ws[n] * sum_k x[m,k] w[n,k]
+// int8_dense_w8a16_gemm (weight-only, M <= ~16): y[m, n] = ws[n] * sum_k x[m,k] w[n,k]
 //   bf16 x, int8 w, fp32 FMA. No activation quant pass, half the weight bytes
 //   of BF16. A work-group = KS sub-groups over the K slices of NR output rows;
 //   each lane streams 16 int8 weights (one 128-bit load) per row and step and
 //   reuses each activation vector across the NR rows; M is tiled by MC rows in
 //   registers. Reduction: sub-group, then SLM over the KS slices.
 //
-// b70_w8a8_fused_gemm (any M; tuned for M <= 64): a per-token quant kernel (the scaled_int8_quant
+// int8_dense_w8a8_fused_gemm (any M; tuned for M <= 64): a per-token quant kernel (the scaled_int8_quant
 //   rule), then the cutlass s8 x s8 streaming GEMM in
 //   xe_2_w4a8/w8a8_dense_xe2.cpp, whose WG tile spans all tokens so the weights
-//   stream from memory once; narrow N splits K over WGs. b70_w8a8_gemm is the
+//   stream from memory once; narrow N splits K over WGs. int8_dense_w8a8_gemm is the
 //   GEMM alone, for already-quantized activations.
 //
 // Both are graph-capturable (no host sync; outputs and the int8 staging
@@ -36,7 +36,7 @@
   #include "xpu/grouped_gemm/xe_2_w4a8/grouped_gemm_w4a8_xe2.h"
 #endif
 
-namespace b70i8 {
+namespace int8_dense {
 
 constexpr int kSG = 16;
 namespace jm = sycl::ext::oneapi::experimental::matrix;
@@ -278,18 +278,18 @@ static void check_args(
       who, ": x and w must be 16-byte aligned (vector loads)");
 }
 
-}  // namespace b70i8
+}  // namespace int8_dense
 
-torch::Tensor b70_w8a16_gemm(
+torch::Tensor int8_dense_w8a16_gemm(
     const torch::Tensor& x,
     const torch::Tensor& w,
     const torch::Tensor& w_scale,
     const std::optional<torch::Tensor>& bias) {
-  b70i8::check_args(x, w, w_scale, bias, "b70_w8a16_gemm");
+  int8_dense::check_args(x, w, w_scale, bias, "int8_dense_w8a16_gemm");
   const int M = static_cast<int>(x.size(0));
   const int K = static_cast<int>(x.size(1));
   const int N = static_cast<int>(w.size(0));
-  TORCH_CHECK(K % 16 == 0, "b70_w8a16_gemm: K must be a multiple of 16");
+  TORCH_CHECK(K % 16 == 0, "int8_dense_w8a16_gemm: K must be a multiple of 16");
   auto y = torch::empty({M, N}, x.options());
   if (M == 0 || N == 0) return y;
   auto& q = vllm::xpu::vllmGetQueue(x.device().index());
@@ -297,14 +297,14 @@ torch::Tensor b70_w8a16_gemm(
   const int8_t* wq = reinterpret_cast<const int8_t*>(w.data_ptr());
   if (x.scalar_type() == at::kBFloat16) {
     using T = vllm::xpu::SyclTypeTrait<c10::BFloat16>::Type;
-    b70i8::w8a16_dispatch<T>(
+    int8_dense::w8a16_dispatch<T>(
         q, reinterpret_cast<const T*>(x.data_ptr()), wq, ws,
         bias.has_value() ? reinterpret_cast<const T*>(bias->data_ptr())
                          : nullptr,
         reinterpret_cast<T*>(y.data_ptr()), M, N, K);
   } else {
     using T = vllm::xpu::SyclTypeTrait<c10::Half>::Type;
-    b70i8::w8a16_dispatch<T>(
+    int8_dense::w8a16_dispatch<T>(
         q, reinterpret_cast<const T*>(x.data_ptr()), wq, ws,
         bias.has_value() ? reinterpret_cast<const T*>(bias->data_ptr())
                          : nullptr,
@@ -313,7 +313,7 @@ torch::Tensor b70_w8a16_gemm(
   return y;
 }
 
-torch::Tensor b70_w8a8_gemm(
+torch::Tensor int8_dense_w8a8_gemm(
     const torch::Tensor& xq,
     const torch::Tensor& xs,
     const torch::Tensor& w,
@@ -321,56 +321,56 @@ torch::Tensor b70_w8a8_gemm(
     const std::optional<torch::Tensor>& bias) {
   TORCH_CHECK(
       xq.dim() == 2 && xq.is_contiguous() && xq.scalar_type() == at::kChar,
-      "b70_w8a8_gemm: xq must be contiguous int8 [M, K]");
+      "int8_dense_w8a8_gemm: xq must be contiguous int8 [M, K]");
   TORCH_CHECK(
       xs.scalar_type() == at::kFloat && xs.is_contiguous() &&
           xs.numel() == xq.size(0),
-      "b70_w8a8_gemm: xs must be contiguous float32 [M] / [M, 1]");
+      "int8_dense_w8a8_gemm: xs must be contiguous float32 [M] / [M, 1]");
   TORCH_CHECK(
       w.dim() == 2 && w.is_contiguous() && w.scalar_type() == at::kChar &&
           w.size(1) == xq.size(1),
-      "b70_w8a8_gemm: w must be contiguous int8 [N, K]");
+      "int8_dense_w8a8_gemm: w must be contiguous int8 [N, K]");
   TORCH_CHECK(
       w_scale.scalar_type() == at::kFloat && w_scale.is_contiguous() &&
           w_scale.numel() == w.size(0),
-      "b70_w8a8_gemm: w_scale must be contiguous float32 [N] / [N, 1]");
+      "int8_dense_w8a8_gemm: w_scale must be contiguous float32 [N] / [N, 1]");
   if (bias.has_value()) {
     TORCH_CHECK(
         bias->is_contiguous() && bias->numel() == w.size(0) &&
             bias->scalar_type() == at::kBFloat16,
-        "b70_w8a8_gemm: bias must be contiguous bf16 [N]");
+        "int8_dense_w8a8_gemm: bias must be contiguous bf16 [N]");
   }
   auto y = torch::empty(
       {xq.size(0), w.size(0)}, xq.options().dtype(at::kBFloat16));
 #if defined(VLLM_XPU_ENABLE_XE2) && defined(VLLM_MOE_ENABLED)
-  b70_w8a8_dense_xe2(xq, xs, w, w_scale, bias, y);
+  w8a8_dense_xe2(xq, xs, w, w_scale, bias, y);
 #else
-  TORCH_CHECK(false, "b70_w8a8_gemm needs the Xe2 MoE kernel build");
+  TORCH_CHECK(false, "int8_dense_w8a8_gemm needs the Xe2 MoE kernel build");
 #endif
   return y;
 }
 
-torch::Tensor b70_w8a8_fused_gemm(
+torch::Tensor int8_dense_w8a8_fused_gemm(
     const torch::Tensor& x,
     const torch::Tensor& w,
     const torch::Tensor& w_scale,
     const std::optional<torch::Tensor>& bias) {
-  b70i8::check_args(x, w, w_scale, bias, "b70_w8a8_fused_gemm");
+  int8_dense::check_args(x, w, w_scale, bias, "int8_dense_w8a8_fused_gemm");
   const int M = static_cast<int>(x.size(0));
   const int K = static_cast<int>(x.size(1));
   const int N = static_cast<int>(w.size(0));
   TORCH_CHECK(
-      x.scalar_type() == at::kBFloat16, "b70_w8a8_fused_gemm: x must be bf16");
+      x.scalar_type() == at::kBFloat16, "int8_dense_w8a8_fused_gemm: x must be bf16");
   TORCH_CHECK(
       K % 32 == 0 && N % 16 == 0 && N >= 32,
-      "b70_w8a8_fused_gemm: needs K % 32 == 0, N % 16 == 0 and N >= 32");
+      "int8_dense_w8a8_fused_gemm: needs K % 32 == 0, N % 16 == 0 and N >= 32");
   auto xq = torch::empty({M, K}, x.options().dtype(at::kChar));
   auto xs = torch::empty({M}, x.options().dtype(at::kFloat));
   if (M == 0) return torch::empty({0, N}, x.options());
   auto& q = vllm::xpu::vllmGetQueue(x.device().index());
   using T = vllm::xpu::SyclTypeTrait<c10::BFloat16>::Type;
-  b70i8::quant_rows_launch<T>(
+  int8_dense::quant_rows_launch<T>(
       q, reinterpret_cast<const T*>(x.data_ptr()),
       reinterpret_cast<int8_t*>(xq.data_ptr()), xs.data_ptr<float>(), M, K);
-  return b70_w8a8_gemm(xq, xs, w, w_scale, bias);
+  return int8_dense_w8a8_gemm(xq, xs, w, w_scale, bias);
 }

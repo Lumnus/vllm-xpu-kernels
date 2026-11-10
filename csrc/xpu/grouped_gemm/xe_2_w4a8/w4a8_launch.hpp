@@ -1,4 +1,4 @@
-// B70 W4A8 grouped GEMM launchers (Xe2 / BMG), shared by the per-variant
+// W4A8 grouped GEMM launchers (Xe2 / BMG), shared by the per-variant
 // translation units (w4a8_inst_*.cpp): each TU instantiates one
 // (prefetch distance, tile K, activation-scale mode) slice of the kernels so
 // the AOT device link compiles them in parallel modules.

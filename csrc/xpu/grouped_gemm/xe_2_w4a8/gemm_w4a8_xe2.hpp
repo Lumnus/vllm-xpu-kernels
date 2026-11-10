@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * B70 W4A8 grouped GEMM mainloop (Xe2 / BMG).
+ * W4A8 grouped GEMM mainloop (Xe2 / BMG).
  *
  * D[m, n] = a_scale[m] * sum_g w_scale[n, g] * sum_{k in g} A8[m, k] * W4[n, k]
  *
@@ -268,7 +268,7 @@ CUTE_DEVICE void xe_gemm_w4a8(
 
 
 /***************************************************************************************************
- * gemm1 with the SiLU-and-mul and the gemm2 activation quantization in the epilogue (B70 K1).
+ * gemm1 with the SiLU-and-mul and the gemm2 activation quantization in the epilogue.
  *
  * w13 is [2*inter, K] per expert, gate rows [0, inter) then up rows [inter, 2*inter) (the
  * layout silu_and_mul reads: out = silu(x[:, :d]) * x[:, d:]). The work-group tile is in

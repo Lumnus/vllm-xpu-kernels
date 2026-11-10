@@ -1,9 +1,9 @@
-// B70 K1 v2: small-M dense W8A8 GEMM on the Xe2 cutlass mainloop (s8 x s8 -> s32 DPAS).
+// small-M dense W8A8 GEMM on the Xe2 cutlass mainloop (s8 x s8 -> s32 DPAS).
 //
 //   Y[m, n] = xs[m] * ws[n] * sum_k Xq[m, k] * W[n, k]  (+ bias[n]),  bf16 out
 //
-//   Xq  int8 [M, K] row-major, per-token symmetric (b70_int8_dense.cpp's quant kernel, or any caller)
-//   W   int8 [N, K] K-contiguous with an fp32 per-row scale (B70-IP-W1's weights, as stored)
+//   Xq  int8 [M, K] row-major, per-token symmetric (int8_dense.cpp's quant kernel, or any caller)
+//   W   int8 [N, K] K-contiguous with an fp32 per-row scale (the int8 linear weights, as stored)
 //
 // Decode M is 1..64: the WG tile spans ALL tokens (TM = M rounded up to 8/16/32/64), so the weights stream
 // from memory once and the token rows are what each WG re-reads (L2/L1). Larger M runs 64-row tiles.
@@ -41,7 +41,7 @@
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-namespace B70W8A8 {
+namespace W8A8Dense {
 using namespace cute;
 using bf16 = cute::bfloat16_t;
 
@@ -283,21 +283,21 @@ static at::Tensor& workspace(const at::Device& dev) {
   return (*per_dev)[i];
 }
 
-}  // namespace B70W8A8
+}  // namespace W8A8Dense
 
-void b70_w8a8_dense_xe2(
+void w8a8_dense_xe2(
     const at::Tensor& xq,
     const at::Tensor& xs,
     const at::Tensor& w,
     const at::Tensor& ws,
     const c10::optional<at::Tensor>& bias,
     at::Tensor& y) {
-  using namespace B70W8A8;
+  using namespace W8A8Dense;
   const int M = static_cast<int>(xq.size(0));
   const int K = static_cast<int>(xq.size(1));
   const int N = static_cast<int>(w.size(0));
   TORCH_CHECK(K % 32 == 0 && N % 16 == 0 && N >= 32,
-              "b70_w8a8: needs K % 32 == 0, N % 16 == 0 and N >= 32");
+              "w8a8_dense: needs K % 32 == 0, N % 16 == 0 and N >= 32");
   if (M == 0) return;
   auto& q = at::xpu::getCurrentXPUStream(xq.device().index()).queue();
 

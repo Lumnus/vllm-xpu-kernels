@@ -437,7 +437,7 @@ if(BUILD_SYCL_TLA_KERNELS)
     if(MOE_KERNELS_ENABLED)
       add_subdirectory(csrc/xpu/grouped_gemm/xe_2)
       list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_2")
-      # B70 W4A8 grouped GEMM (int8 act x int4 weights, s8 x s4 DPAS).
+      # W4A8 grouped GEMM (int8 act x int4 weights, s8 x s4 DPAS).
       add_subdirectory(csrc/xpu/grouped_gemm/xe_2_w4a8)
       list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_w4a8_xe_2")
     endif()
@@ -699,7 +699,7 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
       "csrc/xpu/sycl/multimodal_rope.cpp"
       "csrc/xpu/sycl/apply_rotary_emb.cpp"
       "csrc/xpu/rand/exponential.cpp"
-      "csrc/xpu/b70/b70_int8_dense.cpp"
+      "csrc/xpu/int8_dense/int8_dense.cpp"
       "csrc/xpu/utils.cpp"
       "csrc/xpu/vmm.cpp")
   if(MOE_KERNELS_ENABLED)

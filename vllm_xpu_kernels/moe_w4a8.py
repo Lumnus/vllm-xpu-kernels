@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""B70 W4A8 routed experts on the cutlass Xe2 grouped GEMM.
+"""W4A8 routed experts on the cutlass Xe2 grouped GEMM.
 
 The int4 g128 expert weights stay the bytes ``XpuFusedMoe`` holds after
 ``implement_zp`` (signed nibbles, [E, N, K/2], bf16 scales [E, N, K/128]); no
@@ -11,7 +11,7 @@ mixed-precision DPAS s8 x s4 -> s32 reads the nibbles directly (no unpack),
 the int32 partial of each 128-wide K group is scaled by w_scale[n, g] into
 fp32, and the token scale is applied once at the end.
 
-With ``B70_W4A8_FUSED_ACT=1`` (B70 K1, default off) gemm1 runs
+With ``B70_W4A8_FUSED_ACT=1`` (default off) gemm1 runs
 ``cutlass_grouped_gemm_w4a8_silu_quant`` instead: its epilogue computes
 silu(gate) * up in fp32 and writes it as int8 with one fp32 scale per (row,
 128 columns), which gemm2 consumes directly (A_scale [rows, inter/128]); the
@@ -139,7 +139,7 @@ def apply(impl,
             _LOGGED_FUSED = True
             import logging
             logging.getLogger("vllm_xpu_kernels").warning(
-                "B70-K1: W4A8 MoE fused gemm1 epilogue on (silu*up -> int8, "
+                "W4A8 MoE fused gemm1 epilogue on (silu*up -> int8, "
                 "per-row x 128-col scales; inter=%d)", inter)
         aq = torch.empty((n_moe, inter), dtype=torch.int8, device=dev)
         asc = torch.empty((n_moe, inter // 128), dtype=torch.float32,

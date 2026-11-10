@@ -1,4 +1,4 @@
-// B70 W4A8 grouped GEMM (Xe2 / BMG): int8 activations x the int4 expert
+// W4A8 grouped GEMM (Xe2 / BMG): int8 activations x the int4 expert
 // weights XpuFusedMoe holds, s8 x s4 -> s32 DPAS, per-group weight scale and
 // per-row (or per row-and-128-column-group) activation scale in fp32, bf16 out.
 // Same grouping contract as cutlass_grouped_gemm_xe2 (rows of A sorted by
