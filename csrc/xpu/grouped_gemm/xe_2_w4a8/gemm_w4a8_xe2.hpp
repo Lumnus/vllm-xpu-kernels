@@ -67,7 +67,8 @@ CUTE_DEVICE void xe_gemm_w4a8(
     DTensor& C,               // (M,N) bf16/fp16
     Coord<int, int, cute::Underscore, int> blk_coord,
     TiledMMA const& mma,      // s8 x s4 -> s32
-    TiledMMAF const& mma_f) { // twin 16-bit atom, same tile: f32 C layout
+    TiledMMAF const& mma_f,   // twin 16-bit atom, same tile: f32 C layout
+    float* slm_as = nullptr) {  // AG > 0: SLM, tile_m * (K / AG) floats
   static constexpr int sg_local_range = 16;
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto wg_m = get<0>(blk_coord);
@@ -158,6 +159,19 @@ CUTE_DEVICE void xe_gemm_w4a8(
   clear(tCrC);
   clear(tCrF);
 
+  if constexpr (AG > 0) {
+    // The tile's activation scales [tile_m, K/AG] go to SLM once, so the
+    // flushes in the K loop read them at SLM latency (no global load in the
+    // dependency chain, nothing extra live in GRF).
+    const int lsz = item.get_local_range(2);
+    for (int idx = local_id; idx < tile_m * ag_num; idx += lsz) {
+      const int ml = idx / ag_num;
+      const int m = wg_m * tile_m + ml;
+      slm_as[idx] = m < gemm_m ? AScales[static_cast<int64_t>(m) * ag_num + idx % ag_num] : 0.0f;
+    }
+    sycl::group_barrier(item.get_group());
+  }
+
   int k_tile_prefetch = 0;
   CUTE_UNROLL
   for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
@@ -205,10 +219,8 @@ CUTE_DEVICE void xe_gemm_w4a8(
         const int ag = (k_tile * tile_k) / AG;
         CUTLASS_PRAGMA_UNROLL
         for (int sm = 0; sm < SG_M; ++sm) {
-          const int m = get<0>(tCcC(sm));
-          const float as =
-              m < gemm_m ? AScales[static_cast<int64_t>(m) * ag_num + ag]
-                         : 0.0f;
+          const int ml = get<0>(tCcC(sm)) - wg_m * tile_m;
+          const float as = slm_as[ml * ag_num + ag];
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < N_COLS; ++c) {
             const int i = c * SG_M + sm;

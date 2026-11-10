@@ -27,7 +27,7 @@ torch::Tensor cutlass_grouped_gemm_w4a8(
     int64_t num_experts);
 
 // B70 W4A8 fused gemm1: silu(gate) * up of int8 A x int4 w13 [E, 2*inter,
-// K/2], written as int8 q_out [M, inter] + fp32 q_scale [M, inter/64].
+// K/2], written as int8 q_out [M, inter] + fp32 q_scale [M, inter/128].
 void cutlass_grouped_gemm_w4a8_silu_quant(
     torch::Tensor ptr_A,
     torch::Tensor ptr_A_scale,

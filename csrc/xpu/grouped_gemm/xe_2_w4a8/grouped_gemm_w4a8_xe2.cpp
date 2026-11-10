@@ -1,6 +1,6 @@
 // B70 W4A8 grouped GEMM (Xe2 / BMG): int8 activations x the int4 expert
 // weights XpuFusedMoe holds, s8 x s4 -> s32 DPAS, per-group weight scale and
-// per-row (or per row-and-64-column-group) activation scale in fp32, bf16 out.
+// per-row (or per row-and-128-column-group) activation scale in fp32, bf16 out.
 // Same grouping contract as cutlass_grouped_gemm_xe2 (rows of A sorted by
 // expert, rows_per_expert[E], persistent work-groups with an atomic tile
 // counter). The kernels live in w4a8_inst_*.cpp (one slice per TU).
@@ -106,8 +106,8 @@ at::Tensor cutlass_grouped_gemm_w4a8_xe2(
       ptr_A.dim() == 2 && ptr_A.size(1) == K && ptr_A.is_contiguous(),
       "w4a8: A must be contiguous [M, K]");
   const int64_t M = ptr_A.size(0);
-  // A_scale: [M] / [M, 1] (one per row), or [M, K/64] (one per row and
-  // 64-column group, as the fused gemm1 writes it).
+  // A_scale: [M] / [M, 1] (one per row), or [M, K/128] (one per row and
+  // 128-column group, as the fused gemm1 writes it).
   TORCH_CHECK(
       ptr_A_scale.scalar_type() == at::kFloat && ptr_A_scale.is_contiguous(),
       "w4a8: A_scale must be contiguous float32");
@@ -115,7 +115,7 @@ at::Tensor cutlass_grouped_gemm_w4a8_xe2(
                   ptr_A_scale.size(1) == K / MoEW4A8::kActGroup;
   TORCH_CHECK(
       ag ? ptr_A_scale.size(0) == M : ptr_A_scale.numel() == M,
-      "w4a8: A_scale must be [M], [M, 1] or [M, K/64]");
+      "w4a8: A_scale must be [M], [M, 1] or [M, K/128]");
   check_b(ptr_B, ptr_B_scale, N, K, num_experts, "w4a8");
   TORCH_CHECK(N % 64 == 0, "w4a8: N must be a multiple of 64");
   TORCH_CHECK(
@@ -183,7 +183,7 @@ void cutlass_grouped_gemm_w4a8_silu_quant_xe2(
           ptr_A_scale.numel() == M,
       "w4a8 glu: A_scale must be contiguous float32, one per row");
   check_b(ptr_B, ptr_B_scale, 2 * inter, K, num_experts, "w4a8 glu");
-  TORCH_CHECK(inter % AG == 0, "w4a8 glu: inter must be a multiple of 64");
+  TORCH_CHECK(inter % AG == 0, "w4a8 glu: inter must be a multiple of 128");
   TORCH_CHECK(
       q_out.scalar_type() == at::kChar && q_out.dim() == 2 &&
           q_out.size(0) == M && q_out.size(1) == inter &&
@@ -193,7 +193,7 @@ void cutlass_grouped_gemm_w4a8_silu_quant_xe2(
       q_scale.scalar_type() == at::kFloat && q_scale.dim() == 2 &&
           q_scale.size(0) == M && q_scale.size(1) == inter / AG &&
           q_scale.is_contiguous(),
-      "w4a8 glu: q_scale must be contiguous float32 [M, inter/64]");
+      "w4a8 glu: q_scale must be contiguous float32 [M, inter/128]");
   if (ptr_bias.has_value()) {
     TORCH_CHECK(
         ptr_bias->dim() == 2 && ptr_bias->size(0) == num_experts &&
@@ -227,7 +227,5 @@ void cutlass_grouped_gemm_w4a8_silu_quant_xe2(
   p.rows = reinterpret_cast<const int*>(rows_per_expert.data_ptr());
   p.atomic = static_cast<int32_t*>(atomic_buffer.data_ptr());
   p.avg_m = static_cast<int>(M / num_experts);
-  // The 64 x 128 big tile needs inter % 128; fall back to the 32-row tile.
-  if (inter % 128 != 0 && p.avg_m > 128) p.avg_m = 128;
   MoEW4A8::run_glu(p);
 }

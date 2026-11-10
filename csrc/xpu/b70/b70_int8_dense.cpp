@@ -12,23 +12,17 @@
 //   reuses each activation vector across the NR rows; M is tiled by MC rows in
 //   registers. Reduction: sub-group, then SLM over the KS slices.
 //
-// b70_w8a8_fused_gemm (M <= 64): the per-token activation quant runs inside
-//   the GEMM. It computes out^T = W [N, K] x Xq^T [K, M], so the weight rows
-//   are the DPAS A operand (8 rows x 32 int8, row-major, straight from global
-//   memory) and the tokens are the B operand (32 x 16 int8, from SLM):
-//   joint_matrix s8 x s8 -> s32, which IGC lowers to dpas.8x8 s8 on Xe2.
-//   Prologue: every work-group reads its tokens' rows once for the absmax
-//   (scale = amax / 127, the same as scaled_int8_quant), then the main loop
-//   quantizes each K step of the tokens into SLM ([MB][KSTEP][16] int8) and
-//   the S sub-groups each run their KS-wide part of that step on NT 8-row
-//   weight tiles x MB 16-token tiles. Accumulation is int32 over the whole K
-//   (K <= 131072 cannot overflow), then out = acc * xs[m] * ws[n] (+ bias).
+// b70_w8a8_fused_gemm (M <= 64): a per-token quant kernel (the scaled_int8_quant
+//   rule), then the cutlass s8 x s8 streaming GEMM in
+//   xe_2_w4a8/w8a8_dense_xe2.cpp, whose WG tile spans all tokens so the weights
+//   stream from memory once; narrow N splits K over WGs. b70_w8a8_gemm is the
+//   GEMM alone, for already-quantized activations.
 //
-// Both read weights exactly once per work-group; both are graph-capturable
-// (no host sync, no allocation besides the output).
+// Both are graph-capturable (no host sync; outputs and the int8 staging
+// buffer are the only allocations).
 //
-// Knobs (per call): B70_W8A16_NR, B70_W8A16_KS, B70_W8A8F_S, B70_W8A8F_NT
-// override the shape heuristics below (0 / unset = heuristic).
+// Knobs (per call): B70_W8A16_NR, B70_W8A16_KS override the w8a16 heuristic;
+// B70_I8D_TN (64|128), B70_I8D_KSPLIT, B70_I8D_MIN_WGS the W8A8 GEMM's.
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -38,6 +32,9 @@
 
 #include "csrc/utils.h"
 #include "xpu/ops.h"
+#if defined(VLLM_XPU_ENABLE_XE2) && defined(VLLM_MOE_ENABLED)
+  #include "xpu/grouped_gemm/xe_2_w4a8/grouped_gemm_w4a8_xe2.h"
+#endif
 
 namespace b70i8 {
 
@@ -204,203 +201,48 @@ void w8a16_dispatch(
 #undef W8A16_NR
 }
 
-// ------------------------------------------------------------ W8A8 fused
-constexpr int kKS = 64;  // K per sub-group per main-loop step (2 DPAS deep)
-
-template <typename T, int MB, int NT>
-void w8a8f_launch(
-    sycl::queue& q,
-    const T* X,
-    const int8_t* W,
-    const float* WS,
-    const T* Bias,
-    T* Y,
-    int M,
-    int N,
-    int K,
-    int S) {
-  constexpr int MT = MB * 16;  // padded tokens
-  constexpr int RW = NT * 8;   // weight rows per WG
-  const int KSTEP = S * kKS;
-  const int n_wg = (N + RW - 1) / RW;
-  sycl::range<1> local(kSG * S);
-  sycl::range<1> global(static_cast<size_t>(n_wg) * kSG * S);
-  syclex::properties props{syclex::sub_group_size<kSG>, intelex::grf_size<256>};
-
+// ------------------------------------------------------- W8A8 (v2)
+// Per-token symmetric int8 quant (the scaled_int8_quant rule: scale = amax / 127,
+// q = rint(x * 127 / amax)); one work-group per token row. The GEMM is the
+// cutlass s8 x s8 streaming kernel in xe_2_w4a8/w8a8_dense_xe2.cpp.
+template <typename T>
+void quant_rows_launch(
+    sycl::queue& q, const T* X, int8_t* XQ, float* XS, int M, int K) {
+  constexpr int WG = 256;
+  sycl::range<1> local(WG);
+  sycl::range<1> global(static_cast<size_t>(M) * WG);
+  syclex::properties props{syclex::sub_group_size<kSG>};
   q.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> xs(sycl::range<1>(MT), cgh);
-    sycl::local_accessor<float, 1> xinv(sycl::range<1>(MT), cgh);
-    sycl::local_accessor<int8_t, 1> qbuf(
-        sycl::range<1>(static_cast<size_t>(MB) * KSTEP * 16), cgh);
-    sycl::local_accessor<int32_t, 1> cbuf(
-        sycl::range<1>(static_cast<size_t>(S) * RW * MT), cgh);
     cgh.parallel_for(
-        sycl::nd_range<1>(global, local),
-        props,
-        [=](sycl::nd_item<1> it) {
-          auto sg = it.get_sub_group();
-          auto grp = it.get_group();
-          const int s = sg.get_group_linear_id();
-          const int lane = sg.get_local_linear_id();
-          const int lid = static_cast<int>(it.get_local_id(0));
-          const int lsz = kSG * S;
-          const int n_base = static_cast<int>(it.get_group(0)) * RW;
+        sycl::nd_range<1>(global, local), props, [=](sycl::nd_item<1> it) {
           using XV = sycl::vec<T, 8>;
-
-          // 1. Per-token absmax over the whole K (scale = amax / 127).
-          for (int m = s; m < MT; m += S) {
-            float mx = 0.f;
-            if (m < M) {
-              const T* xr = X + static_cast<int64_t>(m) * K;
-              for (int k = lane * 8; k < K; k += kSG * 8) {
-                const XV v = *reinterpret_cast<const XV*>(xr + k);
+          const int m = static_cast<int>(it.get_group(0));
+          const int lid = static_cast<int>(it.get_local_id(0));
+          const T* xr = X + static_cast<int64_t>(m) * K;
+          float mx = 0.f;
+          for (int k = lid * 8; k < K; k += WG * 8) {
+            const XV v = *reinterpret_cast<const XV*>(xr + k);
 #pragma unroll
-                for (int j = 0; j < 8; ++j)
-                  mx = sycl::fmax(mx, sycl::fabs(static_cast<float>(v[j])));
-              }
-            }
-            mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
-            if (lane == 0) {
-              xs[m] = mx * (1.0f / 127.0f);
-              xinv[m] = mx > 0.f ? 127.0f / mx : 0.f;
-            }
+            for (int j = 0; j < 8; ++j)
+              mx = sycl::fmax(mx, sycl::fabs(static_cast<float>(v[j])));
           }
-          sycl::group_barrier(grp);
-
-          jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8,
-                           16>
-              acc[NT][MB];
+          mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
+          const float inv = mx > 0.f ? 127.0f / mx : 0.f;
+          if (lid == 0) XS[m] = mx * (1.0f / 127.0f);
+          int8_t* qr = XQ + static_cast<int64_t>(m) * K;
+          for (int k = lid * 8; k < K; k += WG * 8) {
+            const XV v = *reinterpret_cast<const XV*>(xr + k);
+            sycl::vec<int8_t, 8> o;
 #pragma unroll
-          for (int t = 0; t < NT; ++t)
-#pragma unroll
-            for (int b = 0; b < MB; ++b) jm::joint_matrix_fill(sg, acc[t][b], 0);
-
-          int8_t* qb = qbuf.template get_multi_ptr<sycl::access::decorated::no>()
-                           .get();
-          for (int k0 = 0; k0 < K; k0 += KSTEP) {
-            // 2. Quantize tokens x [0, MT) x [k0, k0 + KSTEP) into SLM,
-            //    B layout: qb[(mb * KSTEP + kk) * 16 + (m % 16)].
-            const int items = MT * (KSTEP / 8);
-            for (int i = lid; i < items; i += lsz) {
-              const int m = i / (KSTEP / 8);
-              const int kk = (i % (KSTEP / 8)) * 8;
-              const int k = k0 + kk;
-              int8_t qv[8];
-              if (m < M && k < K) {
-                const XV v = *reinterpret_cast<const XV*>(
-                    X + static_cast<int64_t>(m) * K + k);
-                const float inv = xinv[m];
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                  float f = sycl::rint(static_cast<float>(v[j]) * inv);
-                  f = sycl::fmin(127.f, sycl::fmax(-127.f, f));
-                  qv[j] = static_cast<int8_t>(f);
-                }
-              } else {
-#pragma unroll
-                for (int j = 0; j < 8; ++j) qv[j] = 0;
-              }
-              int8_t* dst = qb + (static_cast<int>(m / 16) * KSTEP + kk) * 16 +
-                            (m % 16);
-#pragma unroll
-              for (int j = 0; j < 8; ++j) dst[j * 16] = qv[j];
+            for (int j = 0; j < 8; ++j) {
+              float f = sycl::rint(static_cast<float>(v[j]) * inv);
+              f = sycl::fmin(127.f, sycl::fmax(-127.f, f));
+              o[j] = static_cast<int8_t>(f);
             }
-            sycl::group_barrier(grp);
-
-            // 3. This SG's KS-wide part of the step.
-            const int ks0 = k0 + s * kKS;
-#pragma unroll
-            for (int u = 0; u < kKS; u += 32) {
-              const int k = ks0 + u;
-              if (k < K) {
-                jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16,
-                                 jm::layout::row_major>
-                    bm[MB];
-#pragma unroll
-                for (int b = 0; b < MB; ++b) {
-                  jm::joint_matrix_load(
-                      sg, bm[b],
-                      qbuf.template get_multi_ptr<sycl::access::decorated::no>() +
-                          (b * KSTEP + (k - k0)) * 16,
-                      16);
-                }
-#pragma unroll
-                for (int t = 0; t < NT; ++t) {
-                  const int n = n_base + t * 8;
-                  if (n < N) {
-                    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32,
-                                     jm::layout::row_major>
-                        am;
-                    jm::joint_matrix_load(
-                        sg, am,
-                        sycl::address_space_cast<
-                            sycl::access::address_space::global_space,
-                            sycl::access::decorated::no>(const_cast<int8_t*>(
-                            W + static_cast<int64_t>(n) * K + k)),
-                        K);
-#pragma unroll
-                    for (int b = 0; b < MB; ++b)
-                      jm::joint_matrix_mad(sg, acc[t][b], am, bm[b], acc[t][b]);
-                  }
-                }
-              }
-            }
-            sycl::group_barrier(grp);
-          }
-
-          // 4. Partial sums per SG to SLM [S][RW][MT], reduce, rescale, store.
-#pragma unroll
-          for (int t = 0; t < NT; ++t)
-#pragma unroll
-            for (int b = 0; b < MB; ++b)
-              jm::joint_matrix_store(
-                  sg, acc[t][b],
-                  cbuf.template get_multi_ptr<sycl::access::decorated::no>() +
-                      (s * RW + t * 8) * MT + b * 16,
-                  MT, jm::layout::row_major);
-          sycl::group_barrier(grp);
-          for (int i = lid; i < RW * MT; i += lsz) {
-            const int m = i / RW;  // r fastest: adjacent n per lane
-            const int r = i % RW;
-            const int n = n_base + r;
-            if (m < M && n < N) {
-              int32_t sum = 0;
-              for (int t = 0; t < S; ++t) sum += cbuf[(t * RW + r) * MT + m];
-              float v = static_cast<float>(sum) * xs[m] * WS[n];
-              if (Bias != nullptr) v += static_cast<float>(Bias[n]);
-              Y[static_cast<int64_t>(m) * N + n] = static_cast<T>(v);
-            }
+            *reinterpret_cast<sycl::vec<int8_t, 8>*>(qr + k) = o;
           }
         });
   });
-}
-
-template <typename T>
-void w8a8f_dispatch(
-    sycl::queue& q,
-    const T* X,
-    const int8_t* W,
-    const float* WS,
-    const T* B,
-    T* Y,
-    int M,
-    int N,
-    int K) {
-  int S = env_int("B70_W8A8F_S", 0);
-  if (S != 1 && S != 2 && S != 4 && S != 8)
-    S = pow2_floor(std::max(1, std::min(8, K / 256)));
-  int nt = env_int("B70_W8A8F_NT", 0);
-  if (nt != 1 && nt != 2) nt = N >= 2048 ? 2 : 1;
-  const int mb = M <= 16 ? 1 : (M <= 32 ? 2 : 4);
-#define W8A8F_NT(NT)                                                         \
-  if (nt == NT) {                                                            \
-    if (mb == 1) return w8a8f_launch<T, 1, NT>(q, X, W, WS, B, Y, M, N, K, S); \
-    if (mb == 2) return w8a8f_launch<T, 2, NT>(q, X, W, WS, B, Y, M, N, K, S); \
-    return w8a8f_launch<T, 4, NT>(q, X, W, WS, B, Y, M, N, K, S);            \
-  }
-  W8A8F_NT(1)
-  W8A8F_NT(2)
-#undef W8A8F_NT
 }
 
 static void check_args(
@@ -471,6 +313,43 @@ torch::Tensor b70_w8a16_gemm(
   return y;
 }
 
+torch::Tensor b70_w8a8_gemm(
+    const torch::Tensor& xq,
+    const torch::Tensor& xs,
+    const torch::Tensor& w,
+    const torch::Tensor& w_scale,
+    const std::optional<torch::Tensor>& bias) {
+  TORCH_CHECK(
+      xq.dim() == 2 && xq.is_contiguous() && xq.scalar_type() == at::kChar,
+      "b70_w8a8_gemm: xq must be contiguous int8 [M, K]");
+  TORCH_CHECK(
+      xs.scalar_type() == at::kFloat && xs.is_contiguous() &&
+          xs.numel() == xq.size(0),
+      "b70_w8a8_gemm: xs must be contiguous float32 [M] / [M, 1]");
+  TORCH_CHECK(
+      w.dim() == 2 && w.is_contiguous() && w.scalar_type() == at::kChar &&
+          w.size(1) == xq.size(1),
+      "b70_w8a8_gemm: w must be contiguous int8 [N, K]");
+  TORCH_CHECK(
+      w_scale.scalar_type() == at::kFloat && w_scale.is_contiguous() &&
+          w_scale.numel() == w.size(0),
+      "b70_w8a8_gemm: w_scale must be contiguous float32 [N] / [N, 1]");
+  if (bias.has_value()) {
+    TORCH_CHECK(
+        bias->is_contiguous() && bias->numel() == w.size(0) &&
+            bias->scalar_type() == at::kBFloat16,
+        "b70_w8a8_gemm: bias must be contiguous bf16 [N]");
+  }
+  auto y = torch::empty(
+      {xq.size(0), w.size(0)}, xq.options().dtype(at::kBFloat16));
+#if defined(VLLM_XPU_ENABLE_XE2) && defined(VLLM_MOE_ENABLED)
+  b70_w8a8_dense_xe2(xq, xs, w, w_scale, bias, y);
+#else
+  TORCH_CHECK(false, "b70_w8a8_gemm needs the Xe2 MoE kernel build");
+#endif
+  return y;
+}
+
 torch::Tensor b70_w8a8_fused_gemm(
     const torch::Tensor& x,
     const torch::Tensor& w,
@@ -482,27 +361,17 @@ torch::Tensor b70_w8a8_fused_gemm(
   const int N = static_cast<int>(w.size(0));
   TORCH_CHECK(M <= 64, "b70_w8a8_fused_gemm: M must be <= 64");
   TORCH_CHECK(
-      K % 32 == 0 && N % 8 == 0,
-      "b70_w8a8_fused_gemm: needs K % 32 == 0 and N % 8 == 0");
-  auto y = torch::empty({M, N}, x.options());
-  if (M == 0 || N == 0) return y;
+      x.scalar_type() == at::kBFloat16, "b70_w8a8_fused_gemm: x must be bf16");
+  TORCH_CHECK(
+      K % 32 == 0 && N % 16 == 0 && N >= 32,
+      "b70_w8a8_fused_gemm: needs K % 32 == 0, N % 16 == 0 and N >= 32");
+  auto xq = torch::empty({M, K}, x.options().dtype(at::kChar));
+  auto xs = torch::empty({M}, x.options().dtype(at::kFloat));
+  if (M == 0) return torch::empty({0, N}, x.options());
   auto& q = vllm::xpu::vllmGetQueue(x.device().index());
-  const float* ws = w_scale.data_ptr<float>();
-  const int8_t* wq = reinterpret_cast<const int8_t*>(w.data_ptr());
-  if (x.scalar_type() == at::kBFloat16) {
-    using T = vllm::xpu::SyclTypeTrait<c10::BFloat16>::Type;
-    b70i8::w8a8f_dispatch<T>(
-        q, reinterpret_cast<const T*>(x.data_ptr()), wq, ws,
-        bias.has_value() ? reinterpret_cast<const T*>(bias->data_ptr())
-                         : nullptr,
-        reinterpret_cast<T*>(y.data_ptr()), M, N, K);
-  } else {
-    using T = vllm::xpu::SyclTypeTrait<c10::Half>::Type;
-    b70i8::w8a8f_dispatch<T>(
-        q, reinterpret_cast<const T*>(x.data_ptr()), wq, ws,
-        bias.has_value() ? reinterpret_cast<const T*>(bias->data_ptr())
-                         : nullptr,
-        reinterpret_cast<T*>(y.data_ptr()), M, N, K);
-  }
-  return y;
+  using T = vllm::xpu::SyclTypeTrait<c10::BFloat16>::Type;
+  b70i8::quant_rows_launch<T>(
+      q, reinterpret_cast<const T*>(x.data_ptr()),
+      reinterpret_cast<int8_t*>(xq.data_ptr()), xs.data_ptr<float>(), M, K);
+  return b70_w8a8_gemm(xq, xs, w, w_scale, bias);
 }
