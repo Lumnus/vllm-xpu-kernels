@@ -4,6 +4,7 @@
 
 #ifdef VLLM_XPU_ENABLE_XE2
   #include "xe_2/grouped_gemm_xe2.h"
+  #include "xe_2_w4a8/grouped_gemm_w4a8_xe2.h"
 #endif
 #ifdef VLLM_XPU_ENABLE_XE3P
   #include "xe_3/grouped_gemm_xe3.h"
@@ -60,5 +61,36 @@ torch::Tensor cutlass_grouped_gemm_interface(
 #else
   TORCH_CHECK(
       false, "No cutlass grouped GEMM kernel is enabled in this build.");
+#endif
+}
+
+torch::Tensor cutlass_grouped_gemm_w4a8(
+    torch::Tensor ptr_A,
+    torch::Tensor ptr_A_scale,
+    torch::Tensor ptr_B,
+    torch::Tensor ptr_B_scale,
+    const c10::optional<at::Tensor>& ptr_bias,
+    torch::Tensor ptr_D,
+    torch::Tensor rows_per_expert,
+    int64_t N,
+    int64_t K,
+    int64_t num_experts) {
+#ifdef VLLM_XPU_ENABLE_XE2
+  TORCH_CHECK(
+      vllm::xpu::is_xe2_arch(),
+      "cutlass_grouped_gemm_w4a8 needs an Xe2 GPU (s8 x s4 DPAS)");
+  return cutlass_grouped_gemm_w4a8_xe2(
+      ptr_A,
+      ptr_A_scale,
+      ptr_B,
+      ptr_B_scale,
+      ptr_bias,
+      ptr_D,
+      rows_per_expert,
+      N,
+      K,
+      num_experts);
+#else
+  TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
 #endif
 }
