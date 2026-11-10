@@ -11,6 +11,12 @@ mixed-precision DPAS s8 x s4 -> s32 reads the nibbles directly (no unpack),
 the int32 partial of each 128-wide K group is scaled by w_scale[n, g] into
 fp32, and the token scale is applied once at the end.
 
+With ``B70_W4A8_FUSED_ACT=1`` (B70 K1, default off) gemm1 runs
+``cutlass_grouped_gemm_w4a8_silu_quant`` instead: its epilogue computes
+silu(gate) * up in fp32 and writes it as int8 with one fp32 scale per (row,
+64 columns), which gemm2 consumes directly (A_scale [rows, inter/64]); the
+bf16 gemm1 output, the silu_and_mul kernel and the second quant_rows go away.
+
 The op is taken from ``_xpu_C`` when the installed wheel has it, else from the
 standalone ``_b70_w4a8_C`` module in ``B70_W4A8_LIB_DIR`` (loaded next to the
 installed wheel, nothing replaced).
@@ -26,6 +32,8 @@ import torch
 GROUP = 128
 
 _OP = None
+_GLU = None
+_LOGGED_FUSED = False
 
 
 def load_op(lib_dir: Optional[str] = None):
@@ -52,6 +60,26 @@ def load_op(lib_dir: Optional[str] = None):
     torch.ops.load_library(mods[0])
     _OP = torch.ops._b70_w4a8_C.cutlass_grouped_gemm_w4a8
     return _OP
+
+
+def load_glu_op():
+    """The fused gemm1 op (same source as load_op), or None if absent."""
+    global _GLU
+    if _GLU is not None:
+        return _GLU
+    load_op()
+    for ns in ("_xpu_C", "_b70_w4a8_C"):
+        try:
+            _GLU = getattr(getattr(torch.ops, ns),
+                           "cutlass_grouped_gemm_w4a8_silu_quant")
+            return _GLU
+        except (AttributeError, RuntimeError):
+            continue
+    return None
+
+
+def fused_act_enabled() -> bool:
+    return os.environ.get("B70_W4A8_FUSED_ACT", "0") == "1"
 
 
 def quant_rows(x: torch.Tensor):
@@ -131,13 +159,29 @@ def apply(impl,
         total_experts_num=impl.total_experts_num,
         local_experts_num=impl.local_experts_num)
 
-    g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
-    op(remapped.view(torch.int8), remapped_sc, impl.w13,
-       impl.gemm1_wei_scales, impl.w13_bias, g1, rows_per_expert, 2 * inter,
-       hidden, impl.num_experts)
-    act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
-    impl.act_func(act, g1)
-    aq, asc = quant_rows(act)
+    glu = load_glu_op() if fused_act_enabled() and inter % 64 == 0 else None
+    if glu is not None:
+        global _LOGGED_FUSED
+        if not _LOGGED_FUSED:
+            _LOGGED_FUSED = True
+            import logging
+            logging.getLogger("vllm_xpu_kernels").warning(
+                "B70-K1: W4A8 MoE fused gemm1 epilogue on (silu*up -> int8, "
+                "per-row x 64-col scales; inter=%d)", inter)
+        aq = torch.empty((n_moe, inter), dtype=torch.int8, device=dev)
+        asc = torch.empty((n_moe, inter // 64), dtype=torch.float32,
+                          device=dev)
+        glu(remapped.view(torch.int8), remapped_sc, impl.w13,
+            impl.gemm1_wei_scales, impl.w13_bias, aq, asc, rows_per_expert,
+            inter, hidden, impl.num_experts)
+    else:
+        g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
+        op(remapped.view(torch.int8), remapped_sc, impl.w13,
+           impl.gemm1_wei_scales, impl.w13_bias, g1, rows_per_expert,
+           2 * inter, hidden, impl.num_experts)
+        act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
+        impl.act_func(act, g1)
+        aq, asc = quant_rows(act)
     g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
     op(aq, asc, impl.w2, impl.gemm2_wei_scales, impl.w2_bias, g2,
        rows_per_expert, hidden, inter, impl.num_experts)

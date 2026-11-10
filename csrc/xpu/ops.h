@@ -62,6 +62,18 @@ torch::Tensor int4_gemm_w4a16(
     int64_t group_size,
     const std::optional<torch::Tensor>& g_idx);
 
+// B70 K1: small-M int8 dense GEMMs (see csrc/xpu/b70/b70_int8_dense.cpp).
+torch::Tensor b70_w8a16_gemm(
+    const torch::Tensor& x,
+    const torch::Tensor& w,
+    const torch::Tensor& w_scale,
+    const std::optional<torch::Tensor>& bias);
+torch::Tensor b70_w8a8_fused_gemm(
+    const torch::Tensor& x,
+    const torch::Tensor& w,
+    const torch::Tensor& w_scale,
+    const std::optional<torch::Tensor>& bias);
+
 torch::Tensor int4_gemm_w4a8(
     const torch::Tensor& A_,
     const torch::Tensor& A_scale,
