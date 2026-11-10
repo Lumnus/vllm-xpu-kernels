@@ -144,6 +144,15 @@ void launch_int8_quant(
 void dynamic_per_token_scaled_int8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor& scales) {
   TORCH_CHECK(input.dim() >= 1, "int8 quant: input must have rank >= 1");
+  // The kernel runs on the input's queue and writes out and scales through
+  // raw pointers, so all three must be on that device.
+  TORCH_CHECK(input.is_xpu(), "int8 quant: input must be an XPU tensor");
+  TORCH_CHECK(
+      out.device() == input.device(),
+      "int8 quant: out must be on the input's device");
+  TORCH_CHECK(
+      scales.device() == input.device(),
+      "int8 quant: scales must be on the input's device");
   TORCH_CHECK(
       out.scalar_type() == at::ScalarType::Char,
       "int8 quant: out must be int8");
