@@ -5,17 +5,27 @@
 //   Xq  int8 [M, K] row-major, per-token symmetric (b70_int8_dense.cpp's quant kernel, or any caller)
 //   W   int8 [N, K] K-contiguous with an fp32 per-row scale (B70-IP-W1's weights, as stored)
 //
-// Decode M is 1..64. The WG tile spans ALL tokens (TM = M rounded up to 8/16/32/64), so the weights stream
-// from memory exactly once and the (small) token rows are what each WG re-reads, from L2/L1. The int32
-// partial is never flushed inside K (per-row weight scale, per-token act scale): one convert + 2 FMAs per
-// value at the end. N tiles of 64 (or 128) weight rows; when that leaves too few WGs (narrow N, deep K:
-// HC down K10240 N336, the shared expert gate_up K2560 N320) the K loop is split over WGs; partials go
-// to a self-cleaning fp32 workspace with fp32 atomics and the last WG of each tile (a counter, no spin)
-// writes bf16 and re-zeroes the workspace, so the op stays one kernel and graph-capturable.
+// Decode M is 1..64: the WG tile spans ALL tokens (TM = M rounded up to 8/16/32/64), so the weights stream
+// from memory once and the token rows are what each WG re-reads (L2/L1). Larger M runs 64-row tiles.
+// The int32 partial is never flushed inside K (per-row weight scale, per-token act scale): one convert
+// and 2 multiplies per value at the end.
+//
+// Tiles (B70_I8D_TILE): 64x64 (TN x TK), 128x64, 32x128, 64x128. "auto" takes 32x128 for N >= 2048 (the
+// shape vLLM's Triton scaled_mm uses on XPU for M <= 64: BLOCK_M = M, BLOCK_N 32, BLOCK_K 128, no split)
+// and 64x64 with split-K otherwise.
+//
+// Split K (narrow N, deep K: HC down K10240 N336, shared gate_up K2560 N320): the WGs of a tile add their
+// int32 partials into an int32 workspace with integer atomics, and the last WG of the tile (a counter, no
+// spin; the non-spinning variant of sycl-tla's deterministic stream-K fixup, which waits on a lock per
+// split) converts once, writes bf16 and re-zeroes the workspace. Integer addition is exact and
+// associative, so the result is bit-identical for every split count, arrival order and batch
+// composition: a row's output depends only on that row (per-row quant, exact int32 dot, one fp32
+// epilogue). That is the determinism the ordered HC down path needs.
 #include <torch/all.h>
 #include <c10/xpu/XPUStream.h>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <cute/tensor.hpp>
@@ -49,7 +59,7 @@ struct Args {
   const float* ws;
   const bf16* bias;
   bf16* y;
-  float* wsp;   // split-K workspace [M, N] fp32 (zero between calls) or nullptr
+  int* wsp;     // split-K workspace [M, N] int32 (zero between calls) or nullptr
   int* cnt;     // split-K tile counters (zero between calls) or nullptr
   int M, N, K;
   int n_tiles, ksplit, kt_per;
@@ -164,17 +174,17 @@ CUTE_DEVICE void w8a8_tile(
     return;
   }
 
-  // Split K: fp32 atomics into the workspace, then the last WG of the tile finishes it.
+  // Split K: exact int32 atomics into the workspace, then the last WG of the tile finishes it.
   CUTLASS_PRAGMA_UNROLL
   for (int i = 0; i < tCrF.size(); ++i) {
     const int m = get<0>(tCcC(i));
     const int n = get<1>(tCcC(i));
     if (m < p.M && n < p.N && kt_beg < kt_end) {
-      sycl::atomic_ref<float, sycl::memory_order::relaxed,
+      sycl::atomic_ref<int, sycl::memory_order::relaxed,
                        sycl::memory_scope::device,
                        sycl::access::address_space::global_space>
           a(p.wsp[static_cast<int64_t>(m) * p.N + n]);
-      a.fetch_add(static_cast<float>(tCrC(i)) * p.xs[m] * p.ws[n]);
+      a.fetch_add(static_cast<int>(tCrC(i)));
     }
   }
   sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
@@ -194,11 +204,12 @@ CUTE_DEVICE void w8a8_tile(
     const int m = wg_m * tile_m + idx / tile_n;
     const int n = wg_n * tile_n + idx % tile_n;
     if (m < p.M && n < p.N) {
-      sycl::atomic_ref<float, sycl::memory_order::relaxed,
+      sycl::atomic_ref<int, sycl::memory_order::relaxed,
                        sycl::memory_scope::device,
                        sycl::access::address_space::global_space>
           a(p.wsp[static_cast<int64_t>(m) * p.N + n]);
-      float v = a.exchange(0.0f);
+      // Same expression and order as the ksplit == 1 epilogue.
+      float v = static_cast<float>(a.exchange(0)) * p.xs[m] * p.ws[n];
       if (p.bias != nullptr) v += static_cast<float>(p.bias[n]);
       p.y[static_cast<int64_t>(m) * p.N + n] = static_cast<bf16>(v);
     }
@@ -256,7 +267,7 @@ static int env_int(const char* name, int dflt) {
   return (v != nullptr && *v != '\0') ? std::atoi(v) : dflt;
 }
 
-// Self-cleaning split-K workspace per device: fp32 [kWsFloats] then int counters [kWsTiles].
+// Self-cleaning split-K workspace per device: int32 [kWsFloats] then int counters [kWsTiles].
 static constexpr int64_t kWsFloats = 64LL * 16384;
 static constexpr int64_t kWsTiles = 4096;
 static at::Tensor& workspace(const at::Device& dev) {
@@ -267,7 +278,7 @@ static at::Tensor& workspace(const at::Device& dev) {
   const int i = dev.index() < 0 ? 0 : dev.index();
   if (static_cast<int>(per_dev->size()) <= i) per_dev->resize(i + 1);
   if (!(*per_dev)[i].defined()) {
-    (*per_dev)[i] = at::zeros({kWsFloats + kWsTiles}, at::TensorOptions().dtype(at::kFloat).device(dev));
+    (*per_dev)[i] = at::zeros({kWsFloats + kWsTiles}, at::TensorOptions().dtype(at::kInt).device(dev));
   }
   return (*per_dev)[i];
 }
@@ -285,15 +296,30 @@ void b70_w8a8_dense_xe2(
   const int M = static_cast<int>(xq.size(0));
   const int K = static_cast<int>(xq.size(1));
   const int N = static_cast<int>(w.size(0));
-  TORCH_CHECK(M <= 64, "b70_w8a8: M must be <= 64");
   TORCH_CHECK(K % 32 == 0 && N % 16 == 0 && N >= 32,
               "b70_w8a8: needs K % 32 == 0, N % 16 == 0 and N >= 32");
   if (M == 0) return;
   auto& q = at::xpu::getCurrentXPUStream(xq.device().index()).queue();
 
-  // TN: 64 (default) or 128 (B70_I8D_TN=128); TK 64; TM covers all tokens.
-  const int tn = env_int("B70_I8D_TN", 64) == 128 ? 128 : 64;
-  constexpr int TK = 64;
+  // Tile (TN x TK): B70_I8D_TILE = auto | 64x64 | 128x64 | 32x128 | 64x128.
+  int tn = 64, tk = 64;
+  const char* tv = std::getenv("B70_I8D_TILE");
+  const std::string tile = (tv != nullptr && *tv != '\0') ? std::string(tv) : std::string("auto");
+  if (tile == "128x64") {
+    tn = 128;
+  } else if (tile == "32x128") {
+    tn = 32;
+    tk = 128;
+  } else if (tile == "64x128") {
+    tk = 128;
+  } else if (tile != "64x64") {  // auto
+    if (N >= 2048) {
+      tn = 32;
+      tk = 128;
+    }
+  }
+  if (env_int("B70_I8D_TN", 0) == 128) tn = 128;  // v2 knob, kept
+
   Args a{};
   a.xq = reinterpret_cast<const int8_t*>(xq.data_ptr());
   a.xs = xs.data_ptr<float>();
@@ -305,38 +331,44 @@ void b70_w8a8_dense_xe2(
   a.N = N;
   a.K = K;
   a.n_tiles = (N + tn - 1) / tn;
-  const int k_tiles = (K + TK - 1) / TK;
-  // Split K until the card has ~min_wgs WGs, keeping >= 4 k-tiles per split.
+  const int tm = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64));
+  const int m_tiles = (M + tm - 1) / tm;
+  const int k_tiles = (K + tk - 1) / tk;
+  // Split K until the card has ~min_wgs WGs, keeping >= 4 k-tiles per split. The output does not
+  // depend on the split (exact int32), so this may follow M freely.
   const int min_wgs = env_int("B70_I8D_MIN_WGS", 64);
   int ks = env_int("B70_I8D_KSPLIT", 0);
   if (ks <= 0) {
     ks = 1;
-    while (a.n_tiles * ks < min_wgs && k_tiles / (ks * 2) >= 4 && ks < 16) ks *= 2;
+    while (m_tiles * a.n_tiles * ks < min_wgs && k_tiles / (ks * 2) >= 4 && ks < 16) ks *= 2;
   }
   ks = std::max(1, std::min(ks, k_tiles));
-  const int m_tiles_max = (M + 7) / 8;
-  if (static_cast<int64_t>(M) * N > kWsFloats || a.n_tiles * m_tiles_max > kWsTiles) ks = 1;
+  if (static_cast<int64_t>(M) * N > kWsFloats || static_cast<int64_t>(a.n_tiles) * m_tiles > kWsTiles) ks = 1;
   a.kt_per = (k_tiles + ks - 1) / ks;
   a.ksplit = (k_tiles + a.kt_per - 1) / a.kt_per;  // no empty splits
   if (a.ksplit > 1) {
     auto& wsp = workspace(xq.device());
-    a.wsp = wsp.data_ptr<float>();
-    a.cnt = reinterpret_cast<int*>(a.wsp + kWsFloats);
+    a.wsp = wsp.data_ptr<int>();
+    a.cnt = a.wsp + kWsFloats;
   }
 
-#define W8A8_TN(TM, SGM, SGN64, SGN128)                                           \
-  if (tn == 64)                                                                   \
-    launch<policy<TM, 64, TK, SGM, SGN64>, 4>(q, a);                              \
-  else                                                                            \
-    launch<policy<TM, 128, TK, SGM, SGN128>, 4>(q, a);
-  if (M <= 8) {
-    W8A8_TN(8, 1, 4, 8)
-  } else if (M <= 16) {
-    W8A8_TN(16, 1, 4, 8)
-  } else if (M <= 32) {
-    W8A8_TN(32, 1, 4, 8)
+#define W8A8_TM(TM, SGM)                                                         \
+  if (tn == 64 && tk == 64)                                                      \
+    launch<policy<TM, 64, 64, SGM, 4>, 4>(q, a);                                 \
+  else if (tn == 128)                                                            \
+    launch<policy<TM, 128, 64, SGM, 8>, 4>(q, a);                                \
+  else if (tn == 32)                                                             \
+    launch<policy<TM, 32, 128, SGM, 2>, 4>(q, a);                                \
+  else                                                                           \
+    launch<policy<TM, 64, 128, SGM, 4>, 4>(q, a);
+  if (tm == 8) {
+    W8A8_TM(8, 1)
+  } else if (tm == 16) {
+    W8A8_TM(16, 1)
+  } else if (tm == 32) {
+    W8A8_TM(32, 1)
   } else {
-    W8A8_TN(64, 2, 4, 8)
+    W8A8_TM(64, 2)
   }
-#undef W8A8_TN
+#undef W8A8_TM
 }

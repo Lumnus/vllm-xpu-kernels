@@ -12,7 +12,7 @@
 //   reuses each activation vector across the NR rows; M is tiled by MC rows in
 //   registers. Reduction: sub-group, then SLM over the KS slices.
 //
-// b70_w8a8_fused_gemm (M <= 64): a per-token quant kernel (the scaled_int8_quant
+// b70_w8a8_fused_gemm (any M; tuned for M <= 64): a per-token quant kernel (the scaled_int8_quant
 //   rule), then the cutlass s8 x s8 streaming GEMM in
 //   xe_2_w4a8/w8a8_dense_xe2.cpp, whose WG tile spans all tokens so the weights
 //   stream from memory once; narrow N splits K over WGs. b70_w8a8_gemm is the
@@ -359,7 +359,6 @@ torch::Tensor b70_w8a8_fused_gemm(
   const int M = static_cast<int>(x.size(0));
   const int K = static_cast<int>(x.size(1));
   const int N = static_cast<int>(w.size(0));
-  TORCH_CHECK(M <= 64, "b70_w8a8_fused_gemm: M must be <= 64");
   TORCH_CHECK(
       x.scalar_type() == at::kBFloat16, "b70_w8a8_fused_gemm: x must be bf16");
   TORCH_CHECK(

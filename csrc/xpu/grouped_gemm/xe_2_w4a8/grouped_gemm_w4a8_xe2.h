@@ -33,9 +33,10 @@ void cutlass_grouped_gemm_w4a8_silu_quant_xe2(
     int64_t K,
     int64_t num_experts);
 
-// B70 K1 v2 dense W8A8 for small M (<= 64): int8 xq [M, K] with fp32 xs [M] x int8 W [N, K] with fp32
-// ws [N] -> bf16 y [M, N] (+ bias [N]). Weights stream once (the WG tile spans all tokens); narrow N
-// splits K over WGs with a self-cleaning workspace. Needs K % 32 == 0, N % 16 == 0, N >= 32.
+// B70 K1 dense W8A8, tuned for small M (any M runs): int8 xq [M, K] with fp32 xs [M] x int8 W [N, K]
+// with fp32 ws [N] -> bf16 y [M, N] (+ bias [N]). Weights stream once (the WG tile spans all tokens up
+// to 64); narrow N splits K over WGs with exact int32 partials, so a row's output depends only on that
+// row (deterministic, batch-invariant). Needs K % 32 == 0, N % 16 == 0, N >= 32.
 void b70_w8a8_dense_xe2(
     const at::Tensor& xq,
     const at::Tensor& xs,
