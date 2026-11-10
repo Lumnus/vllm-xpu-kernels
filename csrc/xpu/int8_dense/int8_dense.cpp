@@ -21,8 +21,7 @@
 // Both are graph-capturable (no host sync; outputs and the int8 staging
 // buffer are the only allocations).
 //
-// Knobs (per call): B70_W8A16_NR, B70_W8A16_KS override the w8a16 heuristic;
-// B70_I8D_TN (64|128), B70_I8D_KSPLIT, B70_I8D_MIN_WGS the W8A8 GEMM's.
+// Tiling follows N and K (no run-time knobs).
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -42,11 +41,6 @@ constexpr int kSG = 16;
 namespace jm = sycl::ext::oneapi::experimental::matrix;
 namespace syclex = sycl::ext::oneapi::experimental;
 namespace intelex = sycl::ext::intel::experimental;
-
-static int env_int(const char* name, int dflt) {
-  const char* v = std::getenv(name);
-  return (v != nullptr && *v != '\0') ? std::atoi(v) : dflt;
-}
 
 static int pow2_floor(int v) {
   int p = 1;
@@ -178,15 +172,11 @@ void w8a16_dispatch(
     int M,
     int N,
     int K) {
-  int nr = env_int("B70_W8A16_NR", 0);
-  if (nr != 1 && nr != 2 && nr != 4) nr = N >= 1024 ? 4 : (N >= 256 ? 2 : 1);
-  int ks = env_int("B70_W8A16_KS", 0);
-  if (ks != 1 && ks != 2 && ks != 4 && ks != 8) {
-    // Enough sub-groups to fill the card (~1024+), at least one chunk/lane.
-    const int n_wg = (N + nr - 1) / nr;
-    ks = pow2_floor(std::max(1, std::min(8, (1024 + n_wg - 1) / n_wg)));
-    while (ks > 1 && (K / 16) / ks < kSG) ks /= 2;
-  }
+  const int nr = N >= 1024 ? 4 : (N >= 256 ? 2 : 1);
+  // Enough sub-groups to fill the card (~1024+), at least one chunk/lane.
+  const int n_wg = (N + nr - 1) / nr;
+  int ks = pow2_floor(std::max(1, std::min(8, (1024 + n_wg - 1) / n_wg)));
+  while (ks > 1 && (K / 16) / ks < kSG) ks /= 2;
   const int mc = M <= 1 ? 1 : (M <= 2 ? 2 : (M <= 4 ? 4 : 8));
 #define W8A16_NR(NR)                                                        \
   if (nr == NR) {                                                           \

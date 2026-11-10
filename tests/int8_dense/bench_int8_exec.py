@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
-"""B70 K1 (d8-perf) GPU test + microbench for the v7 kernels, one card.
+"""GPU test + microbench of the int8 dense GEMMs and the W4A8 MoE grouped GEMMs, one card.
 
-Needs a venv with vllm_xpu_kernels 0.1.16.3+b70.v7sup installed (its _xpu_C carries the new ops).
-vLLM on PYTHONPATH is optional: with it the dense bench also times W1's live path
-(vllm b70_dense_int8._b70_int8_dense_mm: scaled_int8_quant + Triton/oneDNN).
+Needs a vllm_xpu_kernels build whose _xpu_C registers the int8_dense_* and
+cutlass_grouped_gemm_w4a8* ops.
 
 Modes (comma list, default all):
-  dense    exactness of int8_dense_w8a16_gemm and int8_dense_w8a8_fused_gemm at the D8 per-rank shapes, M 1..64:
+  dense    exactness of int8_dense_w8a16_gemm and int8_dense_w8a8_fused_gemm per rank shape, M 1..64:
            vs an fp64 reference over the same int8 weights (W8A16: bf16 x; W8A8: x quantized per token
-           exactly as scaled_int8_quant does), vs BF16 F.linear on the unquantized weights, and vs W1.
+           exactly as scaled_int8_quant does) and vs BF16 F.linear on the unquantized weights.
   dbench   us per call per shape and M, eager and XPU-graph, rotating R weight copies (defeats L2):
-           bf16 F.linear | W1 (if vLLM importable) | oneDNN int8_scaled_mm + quant | w8a16 | w8a8_fused.
-  moe      W4A8 MoE (D8: 512 experts / EP4 = 128 local, top-10, hidden 2560, inter 640):
+           bf16 F.linear | oneDNN int8_scaled_mm + quant (if present) | w8a16 | w8a8_fused | w8a8 GEMM only.
+  moe      W4A8 MoE (512 experts / EP4 = 128 local, top-10, hidden 2560, inter 640):
            gemm-level check of the fused gemm1 (silu*up -> int8 + per-128-col scales) and of gemm2 with
            those scales vs fp64; then the full MoE: fused-act vs unfused W4A8 vs stock W4A16 vs fp32.
-  mbench   ms of the full MoE (graph replay and eager) for stock W4A16, W4A8 unfused, W4A8 fused-act, over
-           the knob grid B70_W4A8_PREFETCH {4,6} x B70_W4A8_SMALL_TILE {0,1,2} x B70_W4A8_TILE_K {64,32};
+  mbench   ms of the full MoE (graph replay and eager) for stock W4A16, W4A8 unfused, W4A8 fused-act;
            plus GEMM-only gemm1 / gemm2 ms and TOPS at 4096 tokens (prefill).
-
-  hcdet    determinism + batch invariance of int8_dense_w8a8_fused_gemm (the int8 HC down path): for each shape, a
-           256-row pool; every row's output must be bit-identical across 2 runs, across batch compositions
-           (sub-batches of 1..256 rows in shuffled order, so M crosses the 8/16/32/64 tiles and the split-K
-           choice), across B70_I8D_KSPLIT 1/2/4/16 and across B70_I8D_TILE variants.
+  hcdet    determinism + batch invariance of int8_dense_w8a8_fused_gemm (the int8 HC down path): for each
+           shape, a 256-row pool; every row's output must be bit-identical across 2 runs and across batch
+           compositions (sub-batches of 1..256 rows in shuffled order, so M crosses the 8/16/32/64 tiles
+           and the split-K choice).
 
 Prints one JSON line per case (DENSE / DBENCH / GLU / MOE / MBENCH / HCDET) and writes --out.
 """
 import argparse
 import json
-import os
 import statistics
 import time
 
@@ -109,17 +105,8 @@ def q_act(x):
     return torch.round(xf * inv).clamp(-127, 127).to(torch.int8), amax / 127.0
 
 
-def w1_path():
-    try:
-        from vllm.model_executor.layers import b70_dense_int8 as D  # noqa
-        return D
-    except Exception as e:  # noqa
-        print("W1 path not importable (no vLLM on PYTHONPATH):", repr(e)[:160], flush=True)
-        return None
-
-
 # --------------------------------------------------------------------------- dense
-def run_dense(ms, D):
+def run_dense(ms):
     res = []
     g = torch.Generator(device="cpu").manual_seed(7)
     for name, (K, N) in DENSE_SHAPES.items():
@@ -149,12 +136,6 @@ def run_dense(ms, D):
                     r["w8a8f_rel_vs_ref"] = rel(o88.cpu(), ref88)
                     r["w8a8f_rel_vs_bf16w"] = rel(o88.cpu(), refbf)
                     r["w8a8f_nan"] = bool(torch.isnan(o88).any())
-                if D is not None:
-                    ow1 = D._b70_int8_dense_mm(xd, wqd, wsd, bias.to(DEV), 64)
-                    sync()
-                    r["w1_rel_vs_bf16w"] = rel(ow1.cpu(), refbf)
-                    if o88 is not None:
-                        r["w8a8f_rel_vs_w1"] = rel(o88.cpu(), ow1.cpu())
                 # bf16 output rounding is ~2e-3 relative; integer math is exact.
                 r["ok"] = (not r["w8a16_nan"]) and r["w8a16_rel_vs_ref"] < 5e-3 and (
                     o88 is None or ((not r["w8a8f_nan"]) and r["w8a8f_rel_vs_ref"] < 5e-3))
@@ -163,7 +144,7 @@ def run_dense(ms, D):
     return res
 
 
-def run_dbench(ms, D, rot):
+def run_dbench(ms, rot):
     res = []
     for name, (K, N) in DENSE_SHAPES.items():
         ws_ = [(torch.randn(N, K, device=DEV) * 0.02).to(torch.bfloat16) for _ in range(rot)]
@@ -180,14 +161,6 @@ def run_dbench(ms, D, rot):
                 xq8, xs8 = q_act(x)
                 xq8, xs8 = xq8.contiguous(), xs8.reshape(-1).contiguous()
                 arms["w8a8_gemm_only"] = lambda i: torch.ops._xpu_C.int8_dense_w8a8_gemm(xq8, xs8, qs[i][0], qs[i][1], None)
-                for tile in ("64x64", "128x64", "32x128", "64x128"):
-                    def tiled(i, tile=tile):
-                        os.environ["B70_I8D_TILE"] = tile  # read per call on the host, fixed in the graph
-                        try:
-                            return torch.ops._xpu_C.int8_dense_w8a8_gemm(xq8, xs8, qs[i][0], qs[i][1], None)
-                        finally:
-                            os.environ.pop("B70_I8D_TILE", None)
-                    arms[f"w8a8_gemm_{tile}"] = tiled
             if hasattr(torch.ops._xpu_C, "int8_scaled_mm") and hasattr(torch.ops._C, "dynamic_per_token_scaled_int8_quant"):
                 def onednn(i):
                     xq = torch.empty((M, K), dtype=torch.int8, device=DEV)
@@ -196,8 +169,6 @@ def run_dbench(ms, D, rot):
                     return torch.ops._xpu_C.int8_scaled_mm(xq, xs.reshape(-1), qs[i][0].t(), qs[i][1].reshape(-1),
                                                            x.dtype, None)
                 arms["onednn_i8"] = onednn
-            if D is not None:
-                arms["w1"] = lambda i: D._b70_int8_dense_mm(x, qs[i][0], qs[i][1], None, 64)
             for a, f in arms.items():
                 try:
                     r[f"{a}_graph_us"] = round(gbench(lambda: [f(i) for i in range(rot)], calls=rot), 2)
@@ -233,9 +204,8 @@ def run_glu_gemm(seed):
     op = torch.ops._xpu_C.cutlass_grouped_gemm_w4a8
     res = []
     cases = [[1, 2, 3, 4, 0, 6], [5, 7, 9, 0, 11, 6], [33, 0, 64, 127, 17, 130], [300, 0, 129, 513, 7, 257]]
-    for tk in (64, 32):
-        for pf in (4, 6):
-            os.environ["B70_W4A8_TILE_K"], os.environ["B70_W4A8_PREFETCH"] = str(tk), str(pf)
+    for tk in (64,):
+        for pf in (4,):
             for i, rows in enumerate(cases):
                 g = torch.Generator(device="cpu").manual_seed(seed + i)
                 E, M, K = len(rows), sum(rows), H
@@ -278,7 +248,6 @@ def run_glu_gemm(seed):
                     and r["g2_ag_rel_vs_f64"] < 5e-3
                 print("GLU", json.dumps(r), flush=True)
                 res.append(r)
-    os.environ.pop("B70_W4A8_TILE_K"), os.environ.pop("B70_W4A8_PREFETCH")
     return res
 
 
@@ -319,8 +288,7 @@ def moe_ref(fm, x, tw, ids):
 
 
 def w4a8_apply(w4, fm, o, x, tw, ids, fused):
-    os.environ["B70_W4A8_FUSED_ACT"] = "1" if fused else "0"
-    w4.apply(fm, o, x, tw, ids)
+    w4.apply(fm, o, x, tw, ids, fused_act=fused)
 
 
 def run_moe(fm, w4, tokens, seed):
@@ -357,7 +325,6 @@ def run_mbench(fm, w4, tokens, seed, grid):
         bench = gbench if T <= 1024 else (lambda f, **k: ebench(f, iters=10))
         r["w4a16_us"] = round(bench(lambda: fm.apply(o, x, tw, ids)), 1)
         for pf, st, tk in grid:
-            os.environ.update(B70_W4A8_PREFETCH=str(pf), B70_W4A8_SMALL_TILE=str(st), B70_W4A8_TILE_K=str(tk))
             tag = f"pf{pf}_st{st}_tk{tk}"
             for fused in (False, True):
                 key = f"w4a8{'_fused' if fused else ''}_{tag}_us"
@@ -367,12 +334,9 @@ def run_mbench(fm, w4, tokens, seed, grid):
                     r[key] = "ERR " + repr(e)[:160]
         if T <= 64:
             r["w4a16_eager_us"] = round(ebench(lambda: fm.apply(o, x, tw, ids)), 1)
-            os.environ.update(B70_W4A8_PREFETCH="4", B70_W4A8_SMALL_TILE="0", B70_W4A8_TILE_K="64")
             r["w4a8_fused_eager_us"] = round(ebench(lambda: w4a8_apply(w4, fm, o, x, tw, ids, True)), 1)
         print("MBENCH", json.dumps(r), flush=True)
         res.append(r)
-    for k in ("B70_W4A8_PREFETCH", "B70_W4A8_SMALL_TILE", "B70_W4A8_TILE_K", "B70_W4A8_FUSED_ACT"):
-        os.environ.pop(k, None)
     return res
 
 
@@ -409,7 +373,6 @@ def run_gemm_prefill(fm, w4, T, seed, grid):
         if (pf, tk) in seen:
             continue
         seen.add((pf, tk))
-        os.environ.update(B70_W4A8_PREFETCH=str(pf), B70_W4A8_TILE_K=str(tk))
         tag = f"pf{pf}_tk{tk}"
         t1 = ebench(lambda: op(a8, as8, fm.w13, fm.gemm1_wei_scales, None, d1, rpe, 2 * INTER, H, E), iters=10)
         tg = ebench(lambda: glu(a8, as8, fm.w13, fm.gemm1_wei_scales, None, q, qs, rpe, INTER, H, E), iters=10)
@@ -419,8 +382,6 @@ def run_gemm_prefill(fm, w4, T, seed, grid):
         r[f"g1glu_{tag}_tops"] = round(f1 / tg / 1e6, 1)
         r[f"g2_{tag}_tops"] = round(f2 / t2 / 1e6, 1)
         r[f"g2ag_{tag}_tops"] = round(f2 / t2g / 1e6, 1)
-    os.environ.pop("B70_W4A8_PREFETCH", None)
-    os.environ.pop("B70_W4A8_TILE_K", None)
     print("PREFILL", json.dumps(r), flush=True)
     return r
 
@@ -450,24 +411,6 @@ def run_hcdet(seed):
             sync()
             if not torch.equal(out, ref.index_select(0, idx)):
                 bad.append(f"M{m}")
-        for ks in ("1", "2", "4", "16"):
-            os.environ["B70_I8D_KSPLIT"] = ks
-            for m in (8, 64):
-                idx = perm[:m].to(DEV)
-                out = op(pool.index_select(0, idx))
-                sync()
-                if not torch.equal(out, ref.index_select(0, idx)):
-                    bad.append(f"ks{ks}_M{m}")
-        os.environ.pop("B70_I8D_KSPLIT", None)
-        for tile in ("64x64", "128x64", "32x128", "64x128"):
-            os.environ["B70_I8D_TILE"] = tile
-            for m in (8, 64):
-                idx = perm[:m].to(DEV)
-                out = op(pool.index_select(0, idx))
-                sync()
-                if not torch.equal(out, ref.index_select(0, idx)):
-                    bad.append(f"tile{tile}_M{m}")
-        os.environ.pop("B70_I8D_TILE", None)
         r["mismatches"] = bad
         r["ok"] = r["run_to_run_equal"] and not bad
         print("HCDET", json.dumps(r), flush=True)
@@ -484,10 +427,9 @@ def main():
     ap.add_argument("--ep", type=int, default=4)
     ap.add_argument("--moe-tokens", default="1,8,16,64,256,1024")
     ap.add_argument("--bench-tokens", default="1,2,4,8,16,32,64,96,256,1024")
-    ap.add_argument("--grid", default="full", help="full | default (pf4 st0 tk64 only)")
     ap.add_argument("--prefill-tokens", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--out", default="result-k1.json")
+    ap.add_argument("--out", default="result-int8-exec.json")
     args = ap.parse_args()
 
     import vllm_xpu_kernels  # noqa
@@ -497,20 +439,18 @@ def main():
           flush=True)
     for o in ("int8_dense_w8a16_gemm", "int8_dense_w8a8_fused_gemm", "int8_dense_w8a8_gemm", "cutlass_grouped_gemm_w4a8_silu_quant"):
         assert hasattr(torch.ops._xpu_C, o), f"_xpu_C has no {o}: wrong wheel?"
-    grid = [(4, 0, 64)] if args.grid == "default" else [
-        (pf, st, tk) for pf in (4, 6) for st in (0, 1, 2) for tk in (64, 32)]
+    grid = [(4, 0, 64)]  # the fixed tuning: prefetch 4, 64-wide small tiles, tile K 64
     modes = args.mode.split(",")
     ms = [int(m) for m in args.dense_m.split(",")]
     out = {"args": vars(args)}
-    D = w1_path() if ("dense" in modes or "dbench" in modes) else None
     if "hcdet" in modes:
         out["hcdet"] = run_hcdet(args.seed)
         print("HCDET_ALL_OK", all(r["ok"] for r in out["hcdet"]), flush=True)
     if "dense" in modes:
-        out["dense"] = run_dense(ms, D)
+        out["dense"] = run_dense(ms)
         print("DENSE_ALL_OK", all(r["ok"] for r in out["dense"]), flush=True)
     if "dbench" in modes:
-        out["dbench"] = run_dbench(ms, D, args.rot)
+        out["dbench"] = run_dbench(ms, args.rot)
     if "moe" in modes or "mbench" in modes:
         if "moe" in modes:
             out["glu"] = run_glu_gemm(args.seed)

@@ -43,7 +43,7 @@ template <int TK>
 using w4a8_policy_m_16 = w4a8_policy<16, 64, TK, 1, 4>;
 template <int TK>
 using w4a8_policy_m_8 = w4a8_policy<8, 64, TK, 1, 4>;
-// Small-M variants (B70_W4A8_SMALL_TILE): 1 = N 128 over 8 SGs (same work
+// Small-M variants (small_tile): 1 = N 128 over 8 SGs (same work
 // per SG, half the WGs); 2 = N 128 over 4 SGs (two columns per lane).
 template <int TM, int TK>
 using w4a8_policy_s1 = w4a8_policy<TM, 128, TK, 1, 8>;

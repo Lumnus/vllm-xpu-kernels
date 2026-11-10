@@ -11,7 +11,7 @@ mixed-precision DPAS s8 x s4 -> s32 reads the nibbles directly (no unpack),
 the int32 partial of each 128-wide K group is scaled by w_scale[n, g] into
 fp32, and the token scale is applied once at the end.
 
-With ``B70_W4A8_FUSED_ACT=1`` (default off) gemm1 runs
+With ``fused_act=True`` (default off) gemm1 runs
 ``cutlass_grouped_gemm_w4a8_silu_quant`` instead: its epilogue computes
 silu(gate) * up in fp32 and writes it as int8 with one fp32 scale per (row,
 128 columns), which gemm2 consumes directly (A_scale [rows, inter/128]); the
@@ -20,7 +20,6 @@ bf16 gemm1 output, the silu_and_mul kernel and the second quant_rows go away.
 Both ops are registered in ``_xpu_C``.
 """
 
-import os
 from typing import Optional
 
 import torch
@@ -49,10 +48,6 @@ def load_glu_op():
         except (AttributeError, RuntimeError):
             return None
     return _GLU
-
-
-def fused_act_enabled() -> bool:
-    return os.environ.get("B70_W4A8_FUSED_ACT", "0") == "1"
 
 
 def quant_rows(x: torch.Tensor):
@@ -97,7 +92,8 @@ def apply(impl,
           hidden_states: torch.Tensor,
           topk_weights: torch.Tensor,
           topk_ids: torch.Tensor,
-          expert_map: Optional[torch.Tensor] = None) -> None:
+          expert_map: Optional[torch.Tensor] = None,
+          fused_act: bool = False) -> None:
     """Drop-in for XpuFusedMoe._apply_kernel with the W4A8 grouped GEMMs."""
     op = load_op()
     num_rows, hidden = hidden_states.shape
@@ -132,7 +128,7 @@ def apply(impl,
         total_experts_num=impl.total_experts_num,
         local_experts_num=impl.local_experts_num)
 
-    glu = load_glu_op() if fused_act_enabled() and inter % 128 == 0 else None
+    glu = load_glu_op() if fused_act and inter % 128 == 0 else None
     if glu is not None:
         global _LOGGED_FUSED
         if not _LOGGED_FUSED:

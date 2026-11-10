@@ -5,16 +5,12 @@
 // expert, rows_per_expert[E], persistent work-groups with an atomic tile
 // counter). The kernels live in w4a8_inst_*.cpp (one slice per TU).
 //
-// Run-time knobs (read per call; no rebuild):
-//   B70_W4A8_TILE_K      64 (default) | 32
-//   B70_W4A8_PREFETCH    4 (default, the IP-L kernel) | 6 (stock W4A16)
-//   B70_W4A8_SMALL_TILE  0 (default: TM x 64, 1 x 4 SGs) | 1 (TM x 128, 1 x 8)
-//                        | 2 (TM x 128, 1 x 4) for the small-M tiles
-//   B70_W4A8_M8 / _M16 / _M32  avg-rows-per-expert upper bounds of the
-//                        8 / 16 / 32-row tiles (default 4 / 8 / 128)
+// Tuning (fixed): tile K 64, prefetch 4, 64-wide small-M tiles (1 x 4 SGs),
+// average-rows-per-expert bounds 4 / 8 / 128 for the 8 / 16 / 32-row tiles.
+// The other instantiated variants (tile K 32, prefetch 6, 128-wide small
+// tiles) stay compiled and are not selected.
 #include <torch/all.h>
 #include <c10/xpu/XPUStream.h>
-#include <cstdlib>
 
 #include "w4a8_launch.hpp"
 #include "grouped_gemm_w4a8_xe2.h"
@@ -22,19 +18,21 @@
 namespace MoEW4A8 {
 W4A8_EXTERN_SLICES(extern)
 
-static int env_int(const char* name, int dflt) {
-  const char* v = std::getenv(name);
-  return (v != nullptr && *v != '\0') ? std::atoi(v) : dflt;
-}
+static constexpr int kTileK = 64;
+static constexpr int kPrefetch = 4;
+static constexpr int kRowsM8 = 4;
+static constexpr int kRowsM16 = 8;
+static constexpr int kRowsM32 = 128;
+static constexpr int kSmallTile = 0;
 
-static int tile_k() { return env_int("B70_W4A8_TILE_K", 64) == 32 ? 32 : 64; }
-static int prefetch() { return env_int("B70_W4A8_PREFETCH", 4) == 6 ? 6 : 4; }
+static int tile_k() { return kTileK; }
+static int prefetch() { return kPrefetch; }
 
 static void run_plain(PlainArgs& p, bool ag) {
-  p.t8 = env_int("B70_W4A8_M8", 4);
-  p.t16 = env_int("B70_W4A8_M16", 8);
-  p.t32 = env_int("B70_W4A8_M32", 128);
-  p.small_tile = env_int("B70_W4A8_SMALL_TILE", 0);
+  p.t8 = kRowsM8;
+  p.t16 = kRowsM16;
+  p.t32 = kRowsM32;
+  p.small_tile = kSmallTile;
   const int tk = tile_k(), pf = prefetch();
 #define W4A8_PLAIN(PF, TK)                                         \
   if (pf == PF && tk == TK) {                                      \
@@ -52,9 +50,9 @@ static void run_plain(PlainArgs& p, bool ag) {
 }
 
 static void run_glu(GluArgs& p) {
-  p.t8 = env_int("B70_W4A8_M8", 4);
-  p.t16 = env_int("B70_W4A8_M16", 8);
-  p.t32 = env_int("B70_W4A8_M32", 128);
+  p.t8 = kRowsM8;
+  p.t16 = kRowsM16;
+  p.t32 = kRowsM32;
   const int tk = tile_k(), pf = prefetch();
   if (pf == 4 && tk == 64) return dispatch_glu<4, 64>(p);
   if (pf == 4 && tk == 32) return dispatch_glu<4, 32>(p);

@@ -10,7 +10,7 @@
 // The int32 partial is never flushed inside K (per-row weight scale, per-token act scale): one convert
 // and 2 multiplies per value at the end.
 //
-// Tiles (B70_I8D_TILE): 64x64 (TN x TK), 128x64, 32x128, 64x128. "auto" takes 32x128 for N >= 2048 (the
+// Tiles (TN x TK): 64x64, 128x64, 32x128, 64x128 are instantiated; the rule takes 32x128 for N >= 2048 (the
 // shape vLLM's Triton scaled_mm uses on XPU for M <= 64: BLOCK_M = M, BLOCK_N 32, BLOCK_K 128, no split)
 // and 64x64 with split-K otherwise.
 //
@@ -262,11 +262,6 @@ void launch(sycl::queue& q, const Args& a) {
   });
 }
 
-static int env_int(const char* name, int dflt) {
-  const char* v = std::getenv(name);
-  return (v != nullptr && *v != '\0') ? std::atoi(v) : dflt;
-}
-
 // Self-cleaning split-K workspace per device: int32 [kWsFloats] then int counters [kWsTiles].
 static constexpr int64_t kWsFloats = 64LL * 16384;
 static constexpr int64_t kWsTiles = 4096;
@@ -301,24 +296,12 @@ void w8a8_dense_xe2(
   if (M == 0) return;
   auto& q = at::xpu::getCurrentXPUStream(xq.device().index()).queue();
 
-  // Tile (TN x TK): B70_I8D_TILE = auto | 64x64 | 128x64 | 32x128 | 64x128.
+  // Tile (TN x TK): 32x128 for N >= 2048, else 64x64 (split K below).
   int tn = 64, tk = 64;
-  const char* tv = std::getenv("B70_I8D_TILE");
-  const std::string tile = (tv != nullptr && *tv != '\0') ? std::string(tv) : std::string("auto");
-  if (tile == "128x64") {
-    tn = 128;
-  } else if (tile == "32x128") {
+  if (N >= 2048) {
     tn = 32;
     tk = 128;
-  } else if (tile == "64x128") {
-    tk = 128;
-  } else if (tile != "64x64") {  // auto
-    if (N >= 2048) {
-      tn = 32;
-      tk = 128;
-    }
   }
-  if (env_int("B70_I8D_TN", 0) == 128) tn = 128;  // v2 knob, kept
 
   Args a{};
   a.xq = reinterpret_cast<const int8_t*>(xq.data_ptr());
@@ -336,12 +319,9 @@ void w8a8_dense_xe2(
   const int k_tiles = (K + tk - 1) / tk;
   // Split K until the card has ~min_wgs WGs, keeping >= 4 k-tiles per split. The output does not
   // depend on the split (exact int32), so this may follow M freely.
-  const int min_wgs = env_int("B70_I8D_MIN_WGS", 64);
-  int ks = env_int("B70_I8D_KSPLIT", 0);
-  if (ks <= 0) {
-    ks = 1;
-    while (m_tiles * a.n_tiles * ks < min_wgs && k_tiles / (ks * 2) >= 4 && ks < 16) ks *= 2;
-  }
+  const int min_wgs = 64;
+  int ks = 1;
+  while (m_tiles * a.n_tiles * ks < min_wgs && k_tiles / (ks * 2) >= 4 && ks < 16) ks *= 2;
   ks = std::max(1, std::min(ks, k_tiles));
   if (static_cast<int64_t>(M) * N > kWsFloats || static_cast<int64_t>(a.n_tiles) * m_tiles > kWsTiles) ks = 1;
   a.kt_per = (k_tiles + ks - 1) / ks;
