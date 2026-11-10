@@ -200,11 +200,6 @@ class cmake_build_ext(build_ext):
             cmake_args.append('-D{}={}'.format(
                 opt, "ON" if _is_enabled(opt) else "OFF"))
 
-        # The standalone W4A8 module is opt-in (default OFF).
-        cmake_args.append('-DB70_W4A8_STANDALONE={}'.format(
-            "ON" if _is_enabled("B70_W4A8_STANDALONE", default="OFF")
-            else "OFF"))
-
         # XE3 (CRI/Xe3p) kernels are enabled by default, like XE2. Forward the
         # toggle so users can still disable them explicitly.
         cmake_args.append('-DVLLM_XPU_ENABLE_XE3P={}'.format(
@@ -594,10 +589,6 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._moe_C"))
     if _is_enabled("XPU_SPECIFIC_KERNELS_ENABLED"):
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._xpu_C"))
-    if _is_enabled("B70_W4A8_STANDALONE", default="OFF") and _is_enabled(
-            "MOE_KERNELS_ENABLED"):
-        ext_modules.append(
-            CMakeExtension(name="vllm_xpu_kernels._b70_w4a8_C"))
     if _is_enabled("XPUMEM_ALLOCATOR_ENABLED"):
         ext_modules.append(
             CMakeExtension(name="vllm_xpu_kernels.xpumem_allocator"))

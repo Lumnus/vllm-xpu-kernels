@@ -77,8 +77,6 @@ option(MHC_KERNELS_ENABLED
 option(XPU_SPECIFIC_KERNELS_ENABLED
        "Build XPU-specific kernels (_xpu_C extension)" ON)
 option(XPUMEM_ALLOCATOR_ENABLED "Build xpumem_allocator extension" ON)
-option(B70_W4A8_STANDALONE
-       "Build the standalone _b70_w4a8_C module (W4A8 grouped GEMM only)" OFF)
 option(VLLM_XPU_ENABLE_ONEDNN
        "Build oneDNN-backed kernels (GEMM ops in _xpu_C extension)" ON)
 
@@ -785,38 +783,6 @@ if(MOE_KERNELS_ENABLED)
     ${VLLM_GPU_ARCHES}
     INCLUDE_DIRECTORIES
     ${VLLM_XPU_INCLUDE_DIR}
-    USE_SABI
-    3
-    WITH_SOABI)
-endif()
-
-#
-# _b70_w4a8_C: the W4A8 grouped GEMM alone, loadable next to an installed
-# wheel (torch.ops._b70_w4a8_C.cutlass_grouped_gemm_w4a8).
-#
-if(B70_W4A8_STANDALONE
-   AND MOE_KERNELS_ENABLED
-   AND BUILD_SYCL_TLA_KERNELS
-   AND VLLM_XPU_ENABLE_XE2)
-  message(STATUS "Enabling _b70_w4a8_C extension.")
-  define_gpu_extension_target(
-    _b70_w4a8_C
-    DESTINATION
-    vllm_xpu_kernels
-    LANGUAGE
-    ${VLLM_GPU_LANG}
-    SOURCES
-    "csrc/xpu/grouped_gemm/b70_w4a8_bindings.cpp"
-    COMPILE_FLAGS
-    ${VLLM_GPU_COMPILE_FLAGS}
-    LINK_FLAGS
-    ${VLLM_GPU_LINK_FLAGS}
-    ARCHITECTURES
-    ${VLLM_GPU_ARCHES}
-    INCLUDE_DIRECTORIES
-    ${VLLM_XPU_INCLUDE_DIR}
-    LIBRARIES
-    grouped_gemm_w4a8_xe_2
     USE_SABI
     3
     WITH_SOABI)

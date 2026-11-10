@@ -17,13 +17,9 @@ silu(gate) * up in fp32 and writes it as int8 with one fp32 scale per (row,
 128 columns), which gemm2 consumes directly (A_scale [rows, inter/128]); the
 bf16 gemm1 output, the silu_and_mul kernel and the second quant_rows go away.
 
-The op is taken from ``_xpu_C`` when the installed wheel has it, else from the
-standalone ``_b70_w4a8_C`` module in ``B70_W4A8_LIB_DIR`` (loaded next to the
-installed wheel, nothing replaced).
+Both ops are registered in ``_xpu_C``.
 """
 
-import ctypes
-import glob
 import os
 from typing import Optional
 
@@ -36,46 +32,23 @@ _GLU = None
 _LOGGED_FUSED = False
 
 
-def load_op(lib_dir: Optional[str] = None):
-    """The W4A8 grouped GEMM op (``_xpu_C`` first, then the standalone)."""
+def load_op():
+    """The W4A8 grouped GEMM op from ``_xpu_C``."""
     global _OP
-    if _OP is not None:
-        return _OP
-    try:
+    if _OP is None:
         _OP = torch.ops._xpu_C.cutlass_grouped_gemm_w4a8
-        return _OP
-    except (AttributeError, RuntimeError):
-        pass
-    lib_dir = lib_dir or os.environ.get("B70_W4A8_LIB_DIR", "")
-    if not lib_dir:
-        raise RuntimeError(
-            "cutlass_grouped_gemm_w4a8 is not in _xpu_C; set B70_W4A8_LIB_DIR "
-            "to the directory holding _b70_w4a8_C*.so")
-    dep = os.path.join(lib_dir, "libgrouped_gemm_w4a8_xe_2.so")
-    if os.path.exists(dep):
-        ctypes.CDLL(dep, mode=ctypes.RTLD_GLOBAL)
-    mods = sorted(glob.glob(os.path.join(lib_dir, "_b70_w4a8_C*.so")))
-    if not mods:
-        raise RuntimeError(f"no _b70_w4a8_C*.so in {lib_dir}")
-    torch.ops.load_library(mods[0])
-    _OP = torch.ops._b70_w4a8_C.cutlass_grouped_gemm_w4a8
     return _OP
 
 
 def load_glu_op():
-    """The fused gemm1 op (same source as load_op), or None if absent."""
+    """The fused gemm1 op from ``_xpu_C``, or None if absent."""
     global _GLU
-    if _GLU is not None:
-        return _GLU
-    load_op()
-    for ns in ("_xpu_C", "_b70_w4a8_C"):
+    if _GLU is None:
         try:
-            _GLU = getattr(getattr(torch.ops, ns),
-                           "cutlass_grouped_gemm_w4a8_silu_quant")
-            return _GLU
+            _GLU = torch.ops._xpu_C.cutlass_grouped_gemm_w4a8_silu_quant
         except (AttributeError, RuntimeError):
-            continue
-    return None
+            return None
+    return _GLU
 
 
 def fused_act_enabled() -> bool:
