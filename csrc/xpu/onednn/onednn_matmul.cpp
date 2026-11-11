@@ -327,6 +327,44 @@ torch::Tensor int8_gemm_w8a8(
       per_token_A || per_tensor_A,
       "int8_gemm_w8a8: A_scale and A_zp must be per-token [m,1] or per-tensor "
       "[1]");
+  // A per-token scale must have exactly one row per activation row (a [m',1]
+  // scale with m' != m would otherwise be taken as per-tensor), and a zero
+  // point must match its scale's shape.
+  const int64_t m_rows = A_.numel() / A_.size(-1);
+  TORCH_CHECK(
+      A_scale.numel() == 1 || A_scale.numel() == m_rows,
+      "int8_gemm_w8a8: A_scale must have 1 or m=",
+      m_rows,
+      " elements, got ",
+      A_scale.sizes());
+  TORCH_CHECK(
+      !A_zp.has_value() || A_zp->sizes() == A_scale.sizes(),
+      "int8_gemm_w8a8: A_zp must have A_scale's shape ",
+      A_scale.sizes());
+  TORCH_CHECK(
+      !B_zp.has_value() || B_zp->sizes() == B_scale.sizes(),
+      "int8_gemm_w8a8: B_zp must have B_scale's shape ",
+      B_scale.sizes());
+  TORCH_CHECK(
+      A_.scalar_type() == at::ScalarType::Char || A_zp.has_value(),
+      "int8_gemm_w8a8: uint8 activations need A_zp");
+  for (const torch::Tensor* t : {&A_scale, &B, &B_scale}) {
+    TORCH_CHECK(
+        t->device() == A_.device(),
+        "int8_gemm_w8a8: all inputs must be on ",
+        A_.device());
+  }
+  for (const auto* t : {&A_zp, &B_zp, &bias}) {
+    TORCH_CHECK(
+        !t->has_value() || (*t)->device() == A_.device(),
+        "int8_gemm_w8a8: all inputs must be on ",
+        A_.device());
+  }
+  TORCH_CHECK(
+      A_scale.is_contiguous() && B_scale.is_contiguous() &&
+          (!A_zp.has_value() || A_zp->is_contiguous()) &&
+          (!B_zp.has_value() || B_zp->is_contiguous()),
+      "int8_gemm_w8a8: scales and zero points must be contiguous");
 
   const c10::ScalarType dst_dtype = out_dtype.value_or(torch::kHalf);
   TORCH_CHECK(

@@ -202,3 +202,22 @@ def test_int8_gemm_w8a8_scale_dtype_switch():
                              torch.bfloat16)
         torch.testing.assert_close(out.cpu().float(), out_ref, atol=5e-1,
                                    rtol=2e-2)
+
+
+def test_int8_gemm_w8a8_rejects_bad_scale_and_zero_point_shapes():
+    m, n, k = 8, 256, 512
+    act = torch.randint(-128, 127, (m, k), dtype=torch.int8, device="xpu")
+    weight_quant = _make_int8_weight(n, k)
+    w_scale = _per_channel_scale(n, torch.float32).t().contiguous()
+    good = torch.rand(m, 1, device="xpu").clamp(min=1e-3)
+    with pytest.raises(RuntimeError, match="A_scale must have 1 or m"):
+        int8_gemm_w8a8(act, good[:4], None, weight_quant.t(), w_scale, None,
+                       -1, None, torch.bfloat16)
+    with pytest.raises(RuntimeError, match="A_zp must have A_scale"):
+        int8_gemm_w8a8(act, good,
+                       torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
+                       weight_quant.t(), w_scale, None, -1, None,
+                       torch.bfloat16)
+    with pytest.raises(RuntimeError, match="all inputs must be on"):
+        int8_gemm_w8a8(act, good.cpu(), None, weight_quant.t(), w_scale, None,
+                       -1, None, torch.bfloat16)
