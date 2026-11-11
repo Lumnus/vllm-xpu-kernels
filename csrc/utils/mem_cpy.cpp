@@ -166,12 +166,17 @@ void xpuAsyncMemcpy(
 // and races the copy against the still-live cache write (nondeterministic
 // corruption).  Use get_pointer_device(), which returns the actual owning
 // device, and map it back to the c10 device index.
+//
+// Compare devices, not queues: vllmGetQueue(i) is getCurrentXPUStream(i),
+// which creates device i's whole reserved stream pool on first use.  Walking
+// the queues from 0 made every process create the pool of each device below
+// the one it works on, and hold that device memory for its lifetime.
 static at::DeviceIndex infer_xpu_device_from_ptr(const void* device_ptr) {
   const int n_devs = c10::xpu::device_count();
-  auto ctx = vllm::xpu::vllmGetQueue(0).get_context();
-  sycl::device owner = sycl::get_pointer_device(device_ptr, ctx);
+  sycl::device owner =
+      sycl::get_pointer_device(device_ptr, c10::xpu::get_device_context());
   for (int i = 0; i < n_devs; i++) {
-    if (vllm::xpu::vllmGetQueue(i).get_device() == owner) {
+    if (c10::xpu::get_raw_device(static_cast<at::DeviceIndex>(i)) == owner) {
       return static_cast<at::DeviceIndex>(i);
     }
   }
@@ -197,12 +202,12 @@ void xpuAsyncMemcpyBatch(
     const void* first_src = reinterpret_cast<const void*>(src_ptrs[i]);
     const void* first_dst = reinterpret_cast<const void*>(dst_ptrs[i]);
 
-    // Use device 0's context as a probe: we only need pointer *type* here,
+    // Use the shared context as a probe: we only need pointer *type* here,
     // and USM pointer types are consistent across all devices on the same
     // platform (host/unknown are always host; device is always device on its
     // own platform).  The actual device index is resolved below via
     // infer_xpu_device_from_ptr().
-    auto probe_ctx = vllm::xpu::vllmGetQueue(0).get_context();
+    auto probe_ctx = c10::xpu::get_device_context();
     auto src_type = sycl::get_pointer_type(first_src, probe_ctx);
     auto dst_type = sycl::get_pointer_type(first_dst, probe_ctx);
     bool src_is_host =
@@ -235,7 +240,7 @@ void xpuAsyncMemcpyBatch(
   // Without a snapshot, pinned sources (USM host, or registered with
   // xpu_host_register) are copied directly.
   if (needs_staging && !snapshot_src) {
-    auto ctx = vllm::xpu::vllmGetQueue(0).get_context();
+    auto ctx = c10::xpu::get_device_context();
     bool all_pinned = true;
     for (int64_t i = 0; i < n && all_pinned; i++) {
       if (sizes[i] == 0) continue;
