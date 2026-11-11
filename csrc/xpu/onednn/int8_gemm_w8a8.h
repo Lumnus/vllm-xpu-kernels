@@ -20,7 +20,7 @@ static inline void dnnl_matmul_w8a8_int8(
     const torch::Tensor& mat2,   // quantized weight, [k, n] NT format int8
     const torch::Tensor& m2_sc,  // per-channel [1, n]
     const std::optional<torch::Tensor>& m2_zp,  // as m2_sc; none: symmetric
-    int64_t group_size,          // -1 for per-channel
+    int64_t group_size,                         // -1 for per-channel
     const std::optional<torch::Tensor>& bias) {
   auto src_sz = mat1.sizes();
   auto o_sz = result.sizes();
@@ -101,22 +101,24 @@ static inline void dnnl_matmul_w8a8_int8(
           /* mask */ (1 << 0) + (1 << 1),
           {1, k},
           get_onednn_dtype(m1_sc));
-      if (m1_zp.has_value()) pattr.set_zero_points(
-          DNNL_ARG_SRC,
-          /* mask */ (1 << 0) + (1 << 1),
-          {1, k},
-          memory::data_type::s32);
+      if (m1_zp.has_value())
+        pattr.set_zero_points(
+            DNNL_ARG_SRC,
+            /* mask */ (1 << 0) + (1 << 1),
+            {1, k},
+            memory::data_type::s32);
     } else {
       pattr.set_scales(
           DNNL_ARG_SRC,
           /* mask */ 0,
           {},
           get_onednn_dtype(m1_sc));
-      if (m1_zp.has_value()) pattr.set_zero_points(
-          DNNL_ARG_SRC,
-          /* mask */ 0,
-          {},
-          memory::data_type::s32);
+      if (m1_zp.has_value())
+        pattr.set_zero_points(
+            DNNL_ARG_SRC,
+            /* mask */ 0,
+            {},
+            memory::data_type::s32);
     }
 
     if (m2_sc.numel() == 1) {
@@ -125,33 +127,36 @@ static inline void dnnl_matmul_w8a8_int8(
           /* mask */ 0,
           {},
           get_onednn_dtype(m2_sc));
-      if (m2_zp.has_value()) pattr.set_zero_points(
-          DNNL_ARG_WEIGHTS,
-          /* mask */ 0,
-          {},
-          memory::data_type::s32);
+      if (m2_zp.has_value())
+        pattr.set_zero_points(
+            DNNL_ARG_WEIGHTS,
+            /* mask */ 0,
+            {},
+            memory::data_type::s32);
     } else if (group_size == -1 || m2_sc.numel() == n) {
       pattr.set_scales(
           DNNL_ARG_WEIGHTS,
           /* mask */ (1 << 1),
           {},
           get_onednn_dtype(m2_sc));
-      if (m2_zp.has_value()) pattr.set_zero_points(
-          DNNL_ARG_WEIGHTS,
-          /* mask */ (1 << 1),
-          {},
-          memory::data_type::s32);
+      if (m2_zp.has_value())
+        pattr.set_zero_points(
+            DNNL_ARG_WEIGHTS,
+            /* mask */ (1 << 1),
+            {},
+            memory::data_type::s32);
     } else {
       pattr.set_scales(
           DNNL_ARG_WEIGHTS,
           /* mask */ (1 << 0) + (1 << 1),
           {group_size, 1},
           get_onednn_dtype(m2_sc));
-      if (m2_zp.has_value()) pattr.set_zero_points(
-          DNNL_ARG_WEIGHTS,
-          /* mask */ (1 << 0) + (1 << 1),
-          {group_size, 1},
-          memory::data_type::s32);
+      if (m2_zp.has_value())
+        pattr.set_zero_points(
+            DNNL_ARG_WEIGHTS,
+            /* mask */ (1 << 0) + (1 << 1),
+            {group_size, 1},
+            memory::data_type::s32);
     }
   };
 
@@ -165,6 +170,10 @@ static inline void dnnl_matmul_w8a8_int8(
   int64_t sc_group_size = (static_cast<int64_t>(m1_sc.numel()) << 32) |
                           static_cast<int64_t>(m2_sc.numel());
   int64_t zp_group_size = (zp_numel(m1_zp) << 32) | zp_numel(m2_zp);
+  // The scale data types (float32, float16 or bfloat16) are baked into the
+  // primitive's attributes, so they are part of the key too.
+  int64_t scale_dtypes = (static_cast<int64_t>(m1_sc.scalar_type()) << 8) |
+                         static_cast<int64_t>(m2_sc.scalar_type());
 
   auto& matmul_ext = matmul_primitive_create_and_cache(
       jd,
@@ -179,7 +188,9 @@ static inline void dnnl_matmul_w8a8_int8(
       dev_id,
       f_attr,
       sc_group_size,
-      zp_group_size);
+      zp_group_size,
+      /* batch_dim */ -1,
+      scale_dtypes);
 
   int arg_off = 0;
   // set m1_sc and zero point for matmul args

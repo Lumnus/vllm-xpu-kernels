@@ -179,3 +179,26 @@ def test_int8_gemm_w8a8_scale_shapes_do_not_share_a_primitive():
                              torch.bfloat16)
         torch.testing.assert_close(out.cpu().float(), out_ref, atol=5e-1,
                                    rtol=2e-2)
+
+
+def test_int8_gemm_w8a8_scale_dtype_switch():
+    """Same shapes, activation scales first float32 then bfloat16: the second
+    call must not reuse the float32 primitive (the scale dtype is part of the
+    cache key)."""
+    torch.manual_seed(1234)
+    m, n, k = 8, 256, 512
+    act = torch.randint(-128, 127, (m, k), dtype=torch.int8, device="xpu")
+    weight_quant = _make_int8_weight(n, k)
+    weight_scale = _per_channel_scale(n, torch.float32)
+    base = torch.rand(m, 1, device="xpu").clamp(min=1e-3)
+    for sdt in (torch.float32, torch.bfloat16, torch.float32):
+        act_scale = base.to(sdt)
+        out_ref = _w8a8_ref(act, act_scale.float(),
+                            torch.zeros((m, 1), dtype=torch.int32),
+                            weight_quant, weight_scale,
+                            torch.zeros((n, 1), dtype=torch.int32))
+        out = int8_gemm_w8a8(act, act_scale, None, weight_quant.t(),
+                             weight_scale.t().contiguous(), None, -1, None,
+                             torch.bfloat16)
+        torch.testing.assert_close(out.cpu().float(), out_ref, atol=5e-1,
+                                   rtol=2e-2)
