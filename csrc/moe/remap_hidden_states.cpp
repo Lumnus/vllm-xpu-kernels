@@ -6,13 +6,22 @@
 namespace vllm {
 namespace moe {
 
-static inline int
-to_local_expert_id(int global_expert_id, const int* expert_map) {
-  if (global_expert_id < 0) {
+// Local index of a routed expert, or -1 when the slot is not computed on this
+// rank: a negative id, an id outside [0, total_experts_num) (never used to
+// index expert_map), or an expert_map entry outside [0, local_experts_num).
+// The kernel has no notion of a sentinel: an id this rank owns is a real
+// expert, so an expert-parallel caller's sentinel must map to -1 here.
+static inline int to_local_expert_id(
+    int global_expert_id,
+    const int* expert_map,
+    int total_experts_num,
+    int local_experts_num) {
+  if (global_expert_id < 0 || global_expert_id >= total_experts_num) {
     return -1;
   }
-  return expert_map == nullptr ? global_expert_id
-                               : expert_map[global_expert_id];
+  int local_expert_id =
+      expert_map == nullptr ? global_expert_id : expert_map[global_expert_id];
+  return local_expert_id < local_experts_num ? local_expert_id : -1;
 }
 
 class RowsPerExpertCount {
@@ -25,6 +34,7 @@ class RowsPerExpertCount {
       int* unpermuted_row_to_permuted_row,
       const int num_rows,
       const int TopK,
+      const int total_experts_num,
       const int local_experts_num,
       sycl::local_accessor<int32_t, 1> local_counts)
       : expert_map(expert_map),
@@ -34,6 +44,7 @@ class RowsPerExpertCount {
         unpermuted_row_to_permuted_row(unpermuted_row_to_permuted_row),
         num_rows(num_rows),
         TopK(TopK),
+        total_experts_num(total_experts_num),
         local_experts_num(local_experts_num),
         local_counts(local_counts) {}
 
@@ -65,7 +76,8 @@ class RowsPerExpertCount {
       int global_expert_id =
           is_topk_ids_int32 ? reinterpret_cast<int32_t*>(topk_ids)[global_id]
                             : reinterpret_cast<int64_t*>(topk_ids)[global_id];
-      int local_expert_id = to_local_expert_id(global_expert_id, expert_map);
+      int local_expert_id = to_local_expert_id(
+          global_expert_id, expert_map, total_experts_num, local_experts_num);
 
       if (local_expert_id == -1) {
         unpermuted_row_to_permuted_row[global_id] = -1;
@@ -105,7 +117,8 @@ class RowsPerExpertCount {
       int global_expert_id =
           is_topk_ids_int32 ? reinterpret_cast<int32_t*>(topk_ids)[global_id]
                             : reinterpret_cast<int64_t*>(topk_ids)[global_id];
-      int local_expert_id = to_local_expert_id(global_expert_id, expert_map);
+      int local_expert_id = to_local_expert_id(
+          global_expert_id, expert_map, total_experts_num, local_experts_num);
 
       if (local_expert_id != -1) {
         // local_old + base_offset = global_offset
@@ -123,6 +136,7 @@ class RowsPerExpertCount {
   int* unpermuted_row_to_permuted_row;
   const int num_rows;
   const int TopK;
+  const int total_experts_num;
   const int local_experts_num;
   sycl::local_accessor<int32_t, 1> local_counts;
 };
@@ -261,7 +275,11 @@ class RemapHiddenStates {
 
 #pragma unroll
     for (int i = 0; i < TopK; ++i) {
-      local_expert_id[i] = to_local_expert_id(global_expert_id[i], expert_map);
+      local_expert_id[i] = to_local_expert_id(
+          global_expert_id[i],
+          expert_map,
+          total_experts_num,
+          local_experts_num);
     }
 
     int rows_offset[TopK];
@@ -439,6 +457,15 @@ void RemapHiddenStatesLauncher(
       (hidden_size % RemapHiddenStates<TA, TS, TopK>::ElemsPerItem == 0),
       "hidden_size must be divisible by ElemsPerItem");
 
+  // The count kernel accumulates into rows_per_expert and takes the old value
+  // as each expert's row base, so the op clears it first: a reused or
+  // uninitialised caller buffer cannot shift rows past the remapped buffer.
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(local_experts_num), [=](sycl::id<1> i) {
+      rows_per_expert[i] = 0;
+    });
+  });
+
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<int32_t, 1> local_counts(
         sycl::range<1>(local_experts_num), cgh);
@@ -452,6 +479,7 @@ void RemapHiddenStatesLauncher(
             unpermuted_row_to_permuted_row,
             num_rows,
             TopK,
+            total_experts_num,
             local_experts_num,
             local_counts});
   });

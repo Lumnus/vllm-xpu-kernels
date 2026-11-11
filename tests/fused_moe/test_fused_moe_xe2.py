@@ -553,6 +553,23 @@ def test_fused_moe_int4_ids_valid(m, ep_rank):
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
     assert int(rpe.sum()) == int((expert_map[ids.long()] >= 0).sum())
 
+    # A reused buffer holding stale counts: the op clears it itself.
+    rpe.fill_(7)
+    out2 = torch.empty_like(a)
+    impl.apply(output=out2, hidden_states=a, topk_weights=weights,
+               topk_ids=ids, ids_valid=True, rows_per_expert=rpe)
+    torch.testing.assert_close(out2, ref, rtol=0, atol=0)
+    assert int(rpe.sum()) == int((expert_map[ids.long()] >= 0).sum())
+
+    # Ids outside [0, e) are skipped like a non-local expert, never used to
+    # index the expert map.
+    ids_oob = ids.clone()
+    ids_oob[::3, 1] = e + 5
+    out3 = torch.empty_like(a)
+    impl.apply(output=out3, hidden_states=a, topk_weights=weights,
+               topk_ids=ids_oob, ids_valid=True)
+    torch.testing.assert_close(out3, ref, rtol=0, atol=0)
+
 
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)

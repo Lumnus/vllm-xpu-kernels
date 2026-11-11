@@ -440,11 +440,19 @@ class XpuFusedMoe:
                 negative (for example, expert-parallel callers that already
                 rewrote unrouted ids to an expert this rank does not own).
                 The kernel path then skips zeroing the padding rows, whose
-                mask would be False on every row.
-            rows_per_expert: Optional zeroed int32 ``[num_experts]`` tensor
-                for the kernel path to fill, so a caller that already
-                launches a kernel over the ids can clear it there instead of
-                in a separate fill.
+                mask would be False on every row. Ids outside
+                ``[0, total_experts)`` are never used to index the expert
+                map; their slots are skipped like non-local ones. A sentinel
+                only works if this rank does not own it: with expert
+                parallelism off, or an expert map that moved ownership (for
+                example under EPLB), a sentinel the rank owns is computed as
+                a real expert and gathered with its ``topk_weights`` entry,
+                so the caller must then also zero that weight.
+            rows_per_expert: Optional int32 ``[num_experts]`` tensor on the
+                device of ``hidden_states`` (kernel path only). The op clears
+                it, then fills it with the rows each local expert received;
+                it must stay untouched until the MoE's kernels have run on
+                the current queue.
         """
         if expert_map is None:
             expert_map = self.expert_map
@@ -607,7 +615,8 @@ class XpuFusedMoe:
                 0).view(hidden_states.dtype)
 
         if rows_per_expert is None:
-            rows_per_expert = torch.zeros((self.num_experts),
+            # remap_hidden_states clears it before counting.
+            rows_per_expert = torch.empty((self.num_experts),
                                           dtype=torch.int32,
                                           device=hidden_states.device)
         unpermuted_row_to_permuted_row = torch.empty(
