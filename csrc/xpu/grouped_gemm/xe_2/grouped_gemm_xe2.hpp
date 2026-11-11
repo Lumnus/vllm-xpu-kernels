@@ -67,6 +67,7 @@ template <
     char LayoutKindA,
     char LayoutKindB,
     char LayoutKindD,
+    bool ClampN,
     class TiledMMA,
     typename ElementA,
     typename ElementB,
@@ -187,7 +188,8 @@ CUTE_DEVICE void MoEGEMM(
       GmemTiledCopyB,                   \
       GmemTiledCopyD,                   \
       TENSOR_B_DTYPE,                   \
-      GroupSize>(                       \
+      GroupSize,                        \
+      ClampN>(                          \
       A_tensor,                         \
       B_tensor,                         \
       ptr_Scales_curr_batch,            \

@@ -37,6 +37,7 @@
 #include "csrc/utils.h"
 
 #include <cctype>
+#include <type_traits>
 #include <string>
 
 #include <cute/tensor.hpp>
@@ -151,7 +152,8 @@ template <
     char,
     class,
     A_DTYPE,
-    B_DTYPE>
+    B_DTYPE,
+    bool>
 class GemmCuteName;
 
 template <
@@ -213,43 +215,61 @@ void MoEGEMMLauncher(
   using GmemTiledCopyB = typename policy::GmemTiledCopyB;
   using GmemTiledCopyD = typename policy::GmemTiledCopyD;
 
-  stream.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), cgh);
-    cgh.parallel_for<GemmCuteName<
-        ElementA,
-        ElementB,
-        ElementS,
-        ElementD,
-        layoutA,
-        layoutB,
-        policy,
-        TENSOR_A_DTYPE,
-        TENSOR_B_DTYPE>>(
-        sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
-          MoE::MoEGEMM<
-              TENSOR_A_DTYPE,
-              TENSOR_B_DTYPE,
-              GmemTiledCopyA,
-              GmemTiledCopyB,
-              GmemTiledCopyD,
-              layoutA,
-              layoutB,
-              'R'>(
-              activations,
-              weights,
-              scales,
-              bias,
-              outputs,
-              mma,
-              rows_per_expert,
-              num_experts,
-              group_size,
-              gemm_n,
-              gemm_k,
-              atomic_buffer,
-              local_mem);
-        });
-  });
+  // A kernel whose work-group N tile can overhang N (N not a multiple of the
+  // tile's N) clamps its scale and bias rows to N - 1; every other shape runs
+  // the kernel without the clamp.
+  auto launch = [&](auto clamp_n) {
+    constexpr bool ClampN = decltype(clamp_n)::value;
+    stream.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), cgh);
+      cgh.parallel_for<GemmCuteName<
+          ElementA,
+          ElementB,
+          ElementS,
+          ElementD,
+          layoutA,
+          layoutB,
+          policy,
+          TENSOR_A_DTYPE,
+          TENSOR_B_DTYPE,
+          ClampN>>(
+          sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
+            MoE::MoEGEMM<
+                TENSOR_A_DTYPE,
+                TENSOR_B_DTYPE,
+                GmemTiledCopyA,
+                GmemTiledCopyB,
+                GmemTiledCopyD,
+                layoutA,
+                layoutB,
+                'R',
+                ClampN>(
+                activations,
+                weights,
+                scales,
+                bias,
+                outputs,
+                mma,
+                rows_per_expert,
+                num_experts,
+                group_size,
+                gemm_n,
+                gemm_k,
+                atomic_buffer,
+                local_mem);
+          });
+    });
+  };
+  constexpr bool kRowScaledB = TENSOR_B_DTYPE == B_DTYPE::INT4 ||
+                               TENSOR_B_DTYPE == B_DTYPE::MXFP4 ||
+                               TENSOR_B_DTYPE == B_DTYPE::MXFP8;
+  if constexpr (kRowScaledB) {
+    if (gemm_n % static_cast<int>(cute::size<1>(WGTile{})) != 0) {
+      launch(std::true_type{});
+      return;
+    }
+  }
+  launch(std::false_type{});
 }
 
 at::Tensor cutlass_grouped_gemm_xe2_impl(
