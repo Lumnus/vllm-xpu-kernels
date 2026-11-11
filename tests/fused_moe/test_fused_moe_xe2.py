@@ -1478,3 +1478,48 @@ def test_fused_moe_clamp_limit(m, n, k, e, topk, dtype, gemm1_clamp_limit):
     assert not torch.allclose(output, ref_out_no_clamp, rtol=rtol,
                               atol=atol), \
         f"clamp_limit={gemm1_clamp_limit} should produce different results"
+
+
+def test_fused_moe_int4_padding_rows_need_no_mask():
+    """Rows whose ids are all negative (DP padding) hold NaN activations: the
+    kernel path never computes them, every other row equals the result
+    without the padding rows, and the padding rows come out as zeros."""
+    seed_everything(7)
+    hidden_size, intermediate_size, e, topk = 512, 256, 16, 4
+    group_size, dtype = 128, torch.bfloat16
+
+    def make_w(*shape):
+        return torch.randint(0, 0xff, shape, device=DEVICE).to(torch.uint8)
+
+    def make_s(*shape):
+        return torch.pow(
+            2.0,
+            torch.randint(-5, -4, shape, device=DEVICE).float()).to(dtype)
+
+    impl = XpuFusedMoe(
+        w13=make_w(e, 2 * intermediate_size, hidden_size // 2),
+        w13_scales=make_s(e, 2 * intermediate_size, hidden_size // group_size),
+        w13_bias=None, w2=make_w(e, hidden_size, intermediate_size // 2),
+        w2_scales=make_s(e, hidden_size, intermediate_size // group_size),
+        w2_bias=None, n_experts_per_token=topk, activation="silu",
+        num_experts=e)
+    m, pad = 24, 5
+    a = torch.randn((m, hidden_size), device=DEVICE, dtype=dtype) / 16
+    weights, ids = torch.topk(
+        torch.randn((m, e), device=DEVICE, dtype=torch.float32), k=topk,
+        dim=-1)
+    ids = ids.to(torch.int32)
+    ref = torch.empty_like(a)
+    impl.apply(output=ref, hidden_states=a, topk_weights=weights,
+               topk_ids=ids)
+    a_pad = torch.cat([a, torch.full((pad, hidden_size), float("nan"),
+                                     device=DEVICE, dtype=dtype)])
+    ids_pad = torch.cat([ids, torch.full((pad, topk), -1, device=DEVICE,
+                                         dtype=torch.int32)])
+    w_pad = torch.cat([weights, torch.ones((pad, topk), device=DEVICE)])
+    for ids_valid in (False, True):
+        out = torch.empty_like(a_pad)
+        impl.apply(output=out, hidden_states=a_pad, topk_weights=w_pad,
+                   topk_ids=ids_pad, ids_valid=ids_valid)
+        torch.testing.assert_close(out[:m], ref, rtol=0, atol=0)
+        assert not out[m:].any()

@@ -445,13 +445,10 @@ class XpuFusedMoe:
         a non-local or invalid expert. Hooks require the kernel path and
         unquantized activations.
 
-            ids_valid: The caller guarantees that no ``topk_ids`` entry is
-                negative (for example, expert-parallel callers that already
-                rewrote unrouted ids to an expert this rank does not own).
-                The kernel path then skips zeroing the padding rows, whose
-                mask would be False on every row. Ids outside
-                ``[0, total_experts)`` are never used to index the expert
-                map; their slots are skipped like non-local ones. A sentinel
+            ids_valid: Accepted for compatibility; no effect. Negative ids,
+                ids outside ``[0, total_experts)`` and ids this rank does
+                not own are skipped by the kernel path (never used to index
+                the expert map), so padding rows need no mask. A sentinel
                 only works if this rank does not own it: with expert
                 parallelism off, or an expert map that moved ownership (for
                 example under EPLB), a sentinel the rank owns is computed as
@@ -459,9 +456,10 @@ class XpuFusedMoe:
                 so the caller must then also zero that weight.
             rows_per_expert: Optional int32 ``[num_experts]`` tensor on the
                 device of ``hidden_states`` (kernel path only). The op clears
-                it, then fills it with the rows each local expert received;
-                it must stay untouched until the MoE's kernels have run on
-                the current queue.
+                it, then fills it with the rows each local expert received
+                (on every path: kernel, reference and W4A8); it must stay
+                untouched until the MoE's kernels have run on the current
+                queue.
         """
         if expert_map is None:
             expert_map = self.expert_map
@@ -483,18 +481,37 @@ class XpuFusedMoe:
             if self._w4a8_why is None:
                 moe_w4a8.apply(self, output, hidden_states, topk_weights,
                                    topk_ids, expert_map)
+                self._fill_rows_per_expert(rows_per_expert, topk_ids,
+                                           expert_map)
                 return
         if self._use_ref:
             self._apply_ref(output, hidden_states,
                             topk_weights, topk_ids,
                             expert_map, a1q_scale,
                             a2_scale)
+            self._fill_rows_per_expert(rows_per_expert, topk_ids, expert_map)
         else:
             self._apply_kernel(output, hidden_states,
                                topk_weights, topk_ids,
                                expert_map, a1q_scale,
                                a2_scale, activation_hook, output_hook,
                                ids_valid, rows_per_expert)
+
+    def _fill_rows_per_expert(self, rows_per_expert, topk_ids, expert_map):
+        """Rows per local expert, as the kernel path's remap counts them,
+        for the paths that do not run it (reference, W4A8)."""
+        if rows_per_expert is None:
+            return
+        ids = topk_ids.reshape(-1).long()
+        ok = (ids >= 0) & (ids < self.total_experts_num)
+        ids = torch.where(ok, ids, torch.zeros_like(ids))
+        local = expert_map[ids].long() if expert_map is not None else ids
+        ok &= (local >= 0) & (local < self.num_experts)
+        counts = torch.zeros(self.num_experts + 1, dtype=torch.int64,
+                             device=ids.device)
+        counts.index_add_(0, torch.where(ok, local, self.num_experts),
+                          torch.ones_like(local))
+        rows_per_expert.copy_(counts[:self.num_experts])
 
     def _apply_ref(
         self,
@@ -607,21 +624,11 @@ class XpuFusedMoe:
             dtype=hidden_states.dtype,
             device=hidden_states.device)
 
-        # DP padding rows carry an all-negative top-k route. The native
-        # remap_hidden_states kernel maps those to expert 0, so the garbage
-        # activations in padding rows reach a real expert and produce NaNs that
-        # poison the whole MoE output. Zero them before the native remap.
-        # masked_fill has no XPU kernel for the fp8 / packed-fp4 activation
-        # dtypes, so 1-byte activations are cleared through a uint8 view (an
-        # all-zero bit pattern is +0 in every one of those formats).
-        # Callers that pass ids_valid have no such rows.
-        if not ids_valid:
-            invalid_padding_rows = (topk_ids < 0).all(dim=1)
-            fill_view = hidden_states.view(torch.uint8) \
-                if hidden_states.element_size() == 1 else hidden_states
-            hidden_states = fill_view.masked_fill(
-                invalid_padding_rows.unsqueeze(1),
-                0).view(hidden_states.dtype)
+        # DP padding rows carry an all-negative top-k route.
+        # remap_hidden_states skips every negative, out-of-range or non-local
+        # id, so their activations are never copied or computed, and
+        # moe_gather writes zeros for a row with no computed slot: no mask is
+        # needed (ids_valid is accepted for compatibility and has no effect).
 
         if rows_per_expert is None:
             # remap_hidden_states clears it before counting.
