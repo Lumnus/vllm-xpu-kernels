@@ -36,6 +36,9 @@
 #include <torch/all.h>
 #include "csrc/utils.h"
 
+#include <cctype>
+#include <string>
+
 #include <cute/tensor.hpp>
 #include <random>
 
@@ -63,38 +66,79 @@
 namespace MoE {
 using namespace cute;
 
-// Work-group tiles of the W4A16 / MXFP4 grouped GEMM, as M x N.
-enum class W4A16Tile { M8, M16, M32, M32N128, M64N128, M64N256, M128N256 };
+// Work-group tiles of the W4A16 / MXFP4 grouped GEMM, as M x N. Every tile
+// computes each output element from the same dequantized B values in the
+// same k order, so the choice changes speed, never bits.
+enum class W4A16Tile { M8, M16, M32, M32N128, M128N256 };
 
-// The tile for an expected `avg_rows` rows per expert. A tile pads every
-// expert's rows to a multiple of its M, so it is chosen on the rows an expert
-// actually gets, not on the size of the activation buffer. Measured on BMG
-// (int4 g128, 128 experts, N/K 1280/2560 and 2560/640, uniform and skewed
-// routing): 8x64 is fastest up to ~4 rows per expert; from ~10 to ~160 rows
-// the 32x128 tile beats 32x64 and 128x256 (skewed routing pads far less at
-// 32-row granularity than at 128).
-inline W4A16Tile select_w4a16_tile(int64_t avg_rows) {
+// Without total_experts (or with expert parallelism off): the tile from the
+// activation buffer's rows per local expert, as before.
+inline W4A16Tile select_w4a16_tile_buffer(int64_t avg_rows) {
   if (avg_rows <= 4) return W4A16Tile::M8;
   if (avg_rows <= 8) return W4A16Tile::M16;
-  if (avg_rows <= 256) return W4A16Tile::M32N128;
+  if (avg_rows <= 128) return W4A16Tile::M32;
   return W4A16Tile::M128N256;
 }
 
-// VLLM_XPU_XE2_W4A16_TILE=<M>x<N> (8x64, 16x64, 32x64, 32x128, 64x128,
-// 64x256, 128x256) forces a tile, for tuning and tests.
-inline W4A16Tile w4a16_tile_or_override(W4A16Tile chosen) {
-  auto env = vllm::xpu::getEnv("VLLM_XPU_XE2_W4A16_TILE");
-  if (!env.has_value() || env->empty()) return chosen;
-  const std::string& v = env.value();
-  if (v == "8x64") return W4A16Tile::M8;
-  if (v == "16x64") return W4A16Tile::M16;
-  if (v == "32x64") return W4A16Tile::M32;
-  if (v == "32x128") return W4A16Tile::M32N128;
-  if (v == "64x128") return W4A16Tile::M64N128;
-  if (v == "64x256") return W4A16Tile::M64N256;
-  if (v == "128x256") return W4A16Tile::M128N256;
-  TORCH_CHECK(false, "VLLM_XPU_XE2_W4A16_TILE: unknown tile ", v);
-  return chosen;
+// With total_experts > num_experts (expert parallelism): ptr_A holds every
+// routed row but only this rank's experts are computed, so the tile is chosen
+// on the rows each expert can expect (buffer rows / total_experts). Measured
+// on BMG-G31 (int4 g128, 128 local of 512 experts, N/K 1280/2560 and
+// 2560/640, uniform and skewed routing, 10 to 160 rows per expert): 8x64 up
+// to ~4 rows, then the 32x128 tile, which pads skewed experts to 32 rows
+// rather than 128.
+inline W4A16Tile select_w4a16_tile_routed(int64_t avg_rows) {
+  if (avg_rows <= 4) return W4A16Tile::M8;
+  if (avg_rows <= 8) return W4A16Tile::M16;
+  if (avg_rows <= 160) return W4A16Tile::M32N128;
+  return W4A16Tile::M128N256;
+}
+
+inline const char* w4a16_tile_name(W4A16Tile t) {
+  switch (t) {
+    case W4A16Tile::M8:
+      return "8x64";
+    case W4A16Tile::M16:
+      return "16x64";
+    case W4A16Tile::M32:
+      return "32x64";
+    case W4A16Tile::M32N128:
+      return "32x128";
+    case W4A16Tile::M128N256:
+      return "128x256";
+  }
+  return "?";
+}
+
+// An explicit tile ("<M>x<N>", case and blanks ignored), for tuning and tests.
+inline W4A16Tile parse_w4a16_tile(const std::string& value) {
+  std::string v;
+  for (char c : value) {
+    if (c != ' ' && c != '\t') {
+      v.push_back(
+          static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+  }
+  for (auto t :
+       {W4A16Tile::M8,
+        W4A16Tile::M16,
+        W4A16Tile::M32,
+        W4A16Tile::M32N128,
+        W4A16Tile::M128N256}) {
+    if (v == w4a16_tile_name(t)) return t;
+  }
+  TORCH_CHECK(
+      false,
+      "cutlass_grouped_gemm: unknown W4A16 tile '",
+      value,
+      "' (8x64, 16x64, 32x64, 32x128, 128x256)");
+  return W4A16Tile::M8;
+}
+
+// The tile of this thread's last W4A16 / MXFP4 dispatch (for tests).
+inline W4A16Tile& last_w4a16_tile() {
+  static thread_local W4A16Tile tile = W4A16Tile::M8;
+  return tile;
 }
 
 // type tag to define a unique sycl kernel name
@@ -218,7 +262,8 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     int64_t N,
     int64_t K,
     int64_t num_experts,
-    int64_t total_experts) {
+    int64_t total_experts,
+    const c10::optional<std::string>& tile) {
   auto& dpcpp_queue =
       at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
   auto A_dtype = ptr_A.dtype();
@@ -390,13 +435,16 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
   }
 
     // ptr_A holds every routed row, but under expert parallelism only the
-    // rows routed to this rank's experts are computed: spread the buffer over
-    // all experts (total_experts, when given) to get the rows each expert
-    // can expect.
-    const int64_t routed_experts =
-        total_experts > num_experts ? total_experts : num_experts;
-    switch (
-        w4a16_tile_or_override(select_w4a16_tile(A_total_M / routed_experts))) {
+    // rows routed to this rank's experts are computed. A caller that passes
+    // total_experts > num_experts gets the tile for the rows each expert can
+    // expect; every other caller keeps the buffer-based choice. total_experts
+    // is used by this W4A16 / MXFP4 branch only.
+    W4A16Tile chosen = total_experts > num_experts
+                           ? select_w4a16_tile_routed(A_total_M / total_experts)
+                           : select_w4a16_tile_buffer(A_avg_M);
+    if (tile.has_value() && !tile->empty()) chosen = parse_w4a16_tile(*tile);
+    last_w4a16_tile() = chosen;
+    switch (chosen) {
       case W4A16Tile::M8: {
         using policy = w4a16_policy_m_8;
         W4A16LauncherCallER(policy);
@@ -414,16 +462,6 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
       }
       case W4A16Tile::M32N128: {
         using policy = w4a16_policy_m_32_n_128;
-        W4A16LauncherCallER(policy);
-        break;
-      }
-      case W4A16Tile::M64N128: {
-        using policy = w4a16_policy_m_64_n_128;
-        W4A16LauncherCallER(policy);
-        break;
-      }
-      case W4A16Tile::M64N256: {
-        using policy = w4a16_policy_m_64_n_256;
         W4A16LauncherCallER(policy);
         break;
       }

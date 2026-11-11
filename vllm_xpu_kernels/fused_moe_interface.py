@@ -173,10 +173,14 @@ def cutlass_grouped_gemm_xe2(input_A,
                              n,
                              k,
                              num_experts,
-                             total_experts=-1):
+                             total_experts=-1,
+                             tile=None):
     # total_experts: experts across all expert-parallel ranks when input_A
     # holds every routed row but only num_experts of them are local; the
-    # kernel picks its tile from the rows each expert can expect.
+    # W4A16 / MXFP4 kernel then picks its tile from the rows each expert can
+    # expect (other weight formats ignore it). tile: "<M>x<N>" forces a
+    # W4A16 / MXFP4 tile (8x64, 16x64, 32x64, 32x128, 128x256) for tuning and
+    # tests; cutlass_grouped_gemm_last_w4a16_tile() reports the one used.
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=input_A,
         ptr_A_scale=None,
@@ -188,7 +192,12 @@ def cutlass_grouped_gemm_xe2(input_A,
         N=n,
         K=k,
         num_experts=num_experts,
-        total_experts=total_experts)
+        total_experts=total_experts,
+        tile=tile)
+
+
+def cutlass_grouped_gemm_last_w4a16_tile():
+    return torch.ops._xpu_C.cutlass_grouped_gemm_last_w4a16_tile()
 
 
 def ceilDiv(a, b):

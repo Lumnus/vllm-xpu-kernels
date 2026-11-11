@@ -11,7 +11,10 @@ torch::Tensor cutlass_grouped_gemm_interface(
     int64_t N,
     int64_t K,
     int64_t num_experts,
-    int64_t total_experts);
+    int64_t total_experts,
+    const c10::optional<std::string>& tile);
+
+std::string cutlass_grouped_gemm_last_w4a16_tile();
 
 // W4A8: int8 A [M, K] with fp32 per-row scales x packed int4 B
 // [E, N, K/2] with bf16 g128 scales -> bf16 D [M, N] (s8 x s4 DPAS).

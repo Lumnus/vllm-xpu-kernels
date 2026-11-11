@@ -67,13 +67,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   // w8a8_fused: per-token activation quant inside the GEMM, s8 x s8 DPAS
   // (M <= 64).
   xpu_ops.def(
-      "int8_dense_w8a16_gemm(Tensor x, Tensor w, Tensor w_scale, Tensor? bias) -> "
+      "int8_dense_w8a16_gemm(Tensor x, Tensor w, Tensor w_scale, Tensor? bias) "
+      "-> "
       "Tensor");
   xpu_ops.impl("int8_dense_w8a16_gemm", torch::kXPU, &int8_dense_w8a16_gemm);
   xpu_ops.def(
-      "int8_dense_w8a8_fused_gemm(Tensor x, Tensor w, Tensor w_scale, Tensor? bias) "
+      "int8_dense_w8a8_fused_gemm(Tensor x, Tensor w, Tensor w_scale, Tensor? "
+      "bias) "
       "-> Tensor");
-  xpu_ops.impl("int8_dense_w8a8_fused_gemm", torch::kXPU, &int8_dense_w8a8_fused_gemm);
+  xpu_ops.impl(
+      "int8_dense_w8a8_fused_gemm", torch::kXPU, &int8_dense_w8a8_fused_gemm);
   xpu_ops.def(
       "int8_dense_w8a8_gemm(Tensor xq, Tensor xs, Tensor w, Tensor w_scale, "
       "Tensor? bias) -> Tensor");
@@ -84,11 +87,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor? ptr_A_scale, "
       "Tensor ptr_B, Tensor? ptr_B_scale, Tensor? ptr_bias, Tensor ptr_D, "
       "Tensor rows_per_expert, int N, int K, int num_experts, "
-      "int total_experts=-1) -> Tensor");
+      "int total_experts=-1, str? tile=None) -> Tensor");
   xpu_ops.impl(
       "cutlass_grouped_gemm_interface",
       torch::kXPU,
       &cutlass_grouped_gemm_interface);
+  // The W4A16 / MXFP4 tile of this thread's last grouped GEMM (tests).
+  xpu_ops.def(
+      "cutlass_grouped_gemm_last_w4a16_tile() -> str",
+      &cutlass_grouped_gemm_last_w4a16_tile);
 
   #ifdef VLLM_XPU_ENABLE_XE2
   // Fused routed + shared-expert MoE for small-M decode (fp16/bf16 activations,

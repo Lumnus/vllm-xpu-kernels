@@ -12,7 +12,8 @@ torch::Tensor cutlass_grouped_gemm_xe2(
     int64_t N,
     int64_t K,
     int64_t num_experts,
-    int64_t total_experts) {
+    int64_t total_experts,
+    const c10::optional<std::string>& tile) {
   return MoE::cutlass_grouped_gemm_xe2_impl(
       ptr_A,
       ptr_B,
@@ -23,5 +24,10 @@ torch::Tensor cutlass_grouped_gemm_xe2(
       N,
       K,
       num_experts,
-      total_experts);
+      total_experts,
+      tile);
+}
+
+std::string cutlass_grouped_gemm_xe2_last_tile() {
+  return MoE::w4a16_tile_name(MoE::last_w4a16_tile());
 }
