@@ -124,3 +124,58 @@ def test_int8_gemm_w8a8(dtype, mnk_factors, act_qmode: QuantMode,
         atol=5e-1,
         rtol=5e-1,
     )
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_int8_gemm_w8a8_symmetric_out_dtype(out_dtype, mnk_factors,
+                                            with_bias: bool):
+    """Symmetric W8A8 without zero-point tensors, output in the model dtype
+    (bfloat16 models need no float16 round trip)."""
+    torch.manual_seed(1234)
+    m, n, k = mnk_factors
+    input_fp = torch.randn(m, k, device="xpu", dtype=out_dtype)
+    bias = torch.randn(n, dtype=out_dtype, device="xpu") if with_bias else None
+    input_quant, act_scales, _ = dynamic_per_token_quant_ref(
+        input_fp, use_sym_quant=True, bits=8)
+    weight_quant = _make_int8_weight(n, k)
+    weight_scale = _per_channel_scale(n, torch.float32)
+    out_ref = _w8a8_ref(input_quant, act_scales,
+                        torch.zeros((m, 1), dtype=torch.int32), weight_quant,
+                        weight_scale, torch.zeros((n, 1), dtype=torch.int32))
+    if bias is not None:
+        out_ref = out_ref + bias.float().cpu()
+
+    out = int8_gemm_w8a8(input_quant, act_scales, None, weight_quant.t(),
+                         weight_scale.t().contiguous(), None, -1, bias,
+                         out_dtype)
+
+    assert out.dtype == out_dtype
+    torch.testing.assert_close(out.cpu().float(), out_ref, atol=5e-1,
+                               rtol=2e-2)
+
+
+def test_int8_gemm_w8a8_scale_shapes_do_not_share_a_primitive():
+    """A per-token and a per-tensor activation scale at the same m, n, k
+    need different oneDNN primitives; the cache key must tell them apart."""
+    torch.manual_seed(1234)
+    m, n, k = 8, 256, 512
+    act = torch.randint(-128, 127, (m, k), dtype=torch.int8, device="xpu")
+    weight_quant = _make_int8_weight(n, k)
+    weight_scale = _per_channel_scale(n, torch.float32)
+    scales = (
+        torch.rand(m, 1, device="xpu").clamp(min=1e-3),
+        torch.full((1, ), 0.02, device="xpu"),
+        torch.rand(m, 1, device="xpu").clamp(min=1e-3),
+    )
+    for act_scale in scales:
+        out_ref = _w8a8_ref(act, act_scale,
+                            torch.zeros((m, 1), dtype=torch.int32),
+                            weight_quant, weight_scale,
+                            torch.zeros((n, 1), dtype=torch.int32))
+        out = int8_gemm_w8a8(act, act_scale, None, weight_quant.t(),
+                             weight_scale.t().contiguous(), None, -1, None,
+                             torch.bfloat16)
+        torch.testing.assert_close(out.cpu().float(), out_ref, atol=5e-1,
+                                   rtol=2e-2)

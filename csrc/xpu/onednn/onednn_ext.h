@@ -56,6 +56,7 @@ enum class joint_dtypes_t {
   f8_e4m3_bf16,
   mxfp4_bf16,
   mxfp4_f16,
+  int8_bf16,
 };
 
 template <joint_dtypes_t Ts>
@@ -68,6 +69,16 @@ struct onednn_types_mapper<joint_dtypes_t::int8> {
       get() {
     return std::make_tuple(
         memory::data_type::s8, memory::data_type::s8, memory::data_type::f16);
+  }
+};
+
+template <>
+struct onednn_types_mapper<joint_dtypes_t::int8_bf16> {
+  static inline std::
+      tuple<memory::data_type, memory::data_type, memory::data_type>
+      get() {
+    return std::make_tuple(
+        memory::data_type::s8, memory::data_type::s8, memory::data_type::bf16);
   }
 };
 
@@ -806,6 +817,15 @@ T concat(const T& t1, int b) {
 }
 
 template <typename T>
+T concat(const T& t1, int64_t b) {
+  T t;
+  t.insert(t.end(), t1.begin(), t1.end());
+  t.push_back(b);
+
+  return t;
+}
+
+template <typename T>
 T concat(const T& t1, const T& t2) {
   T t;
   t.insert(t.end(), t1.begin(), t1.end());
@@ -834,8 +854,8 @@ struct matmul_primitive_cache_t {
           b_type,  // for shapeless bias, not put it into template parameter
       const int device_id,
       F f_attr,
-      const int scale_group_size,
-      const int zp_group_size,
+      const int64_t scale_group_size,
+      const int64_t zp_group_size,
       const int batch_dim) {
     auto& cached = get_cache(device_id);
     memory::dims src_strides, wei_strides, dst_strides;
@@ -947,8 +967,8 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
     const int64_t ldc,
     const int device_id,
     F attr,
-    const int scale_group_size,
-    const int zp_group_size,
+    const int64_t scale_group_size,
+    const int64_t zp_group_size,
     const int batch_dim = -1) {
   switch (Tt) {
     case trans_type_t::nt:
@@ -997,12 +1017,27 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
     const int64_t ldc,
     const int device_id,
     F attr,
-    const int scale_group_size = 1,
-    const int zp_group_size = 1,
+    const int64_t scale_group_size = 1,
+    const int64_t zp_group_size = 1,
     const int batch_dim = -1) {
   switch (Ts) {
     case joint_dtypes_t::int8:
       return matmul_primitive_create_and_cache<joint_dtypes_t::int8, F>(
+          Tt,
+          b_type,
+          m,
+          n,
+          k,
+          lda,
+          ldb,
+          ldc,
+          device_id,
+          attr,
+          scale_group_size,
+          zp_group_size,
+          batch_dim);
+    case joint_dtypes_t::int8_bf16:
+      return matmul_primitive_create_and_cache<joint_dtypes_t::int8_bf16, F>(
           Tt,
           b_type,
           m,

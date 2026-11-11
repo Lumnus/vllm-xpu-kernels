@@ -475,16 +475,19 @@ def int4_gemm_w4a8(input: torch.Tensor,
 
 def int8_gemm_w8a8(input: torch.Tensor,
                    input_scales: torch.Tensor,
-                   input_zero_points: torch.Tensor,
+                   input_zero_points: Optional[torch.Tensor],
                    weight: torch.Tensor,
                    wei_scales: torch.Tensor,
-                   wei_zero_points: torch.Tensor,
+                   wei_zero_points: Optional[torch.Tensor],
                    group_size: int,
-                   bias: Optional[torch.Tensor] = None):
+                   bias: Optional[torch.Tensor] = None,
+                   out_dtype: Optional[torch.dtype] = None):
+    """W8A8 int8 GEMM. Zero points are optional (None: symmetric);
+    out_dtype is float16 (default) or bfloat16 (int8 x int8 only)."""
     return torch.ops._xpu_C.int8_gemm_w8a8(input, input_scales,
                                            input_zero_points, weight,
                                            wei_scales, wei_zero_points,
-                                           group_size, bias)
+                                           group_size, bias, out_dtype)
 
 
 def fp8_gemm(input: torch.Tensor, weight: torch.Tensor,
