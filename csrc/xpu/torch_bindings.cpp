@@ -92,10 +92,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "cutlass_grouped_gemm_interface",
       torch::kXPU,
       &cutlass_grouped_gemm_interface);
-  // The W4A16 / MXFP4 tile of this thread's last grouped GEMM (tests).
+  // Private: the W4A16 / MXFP4 tile of this thread's last grouped GEMM, so
+  // tests can tell an ignored tile argument from a used one.
   xpu_ops.def(
-      "cutlass_grouped_gemm_last_w4a16_tile() -> str",
-      &cutlass_grouped_gemm_last_w4a16_tile);
+      "_cutlass_grouped_gemm_last_w4a16_tile() -> str",
+      &_cutlass_grouped_gemm_last_w4a16_tile);
 
   #ifdef VLLM_XPU_ENABLE_XE2
   // Fused routed + shared-expert MoE for small-M decode (fp16/bf16 activations,

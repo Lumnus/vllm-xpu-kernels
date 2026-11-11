@@ -7,9 +7,12 @@ import torch
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 from tests.ops.fp8_quant_op import scaled_fp8_quant
 from tests.utils import format_tc, run_with_xpu_graph, seed_everything
-from vllm_xpu_kernels.fused_moe_interface import (
-    cutlass_grouped_gemm, cutlass_grouped_gemm_last_w4a16_tile,
-    cutlass_grouped_gemm_xe2)
+from vllm_xpu_kernels.fused_moe_interface import (cutlass_grouped_gemm,
+                                                  cutlass_grouped_gemm_xe2)
+
+
+def cutlass_grouped_gemm_last_w4a16_tile():
+    return torch.ops._xpu_C._cutlass_grouped_gemm_last_w4a16_tile()
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available() or

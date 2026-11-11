@@ -180,7 +180,7 @@ def cutlass_grouped_gemm_xe2(input_A,
     # W4A16 / MXFP4 kernel then picks its tile from the rows each expert can
     # expect (other weight formats ignore it). tile: "<M>x<N>" forces a
     # W4A16 / MXFP4 tile (8x64, 16x64, 32x64, 32x128, 128x256) for tuning and
-    # tests; cutlass_grouped_gemm_last_w4a16_tile() reports the one used.
+    # tests (XpuFusedMoe passes its w4a16_tile attribute).
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=input_A,
         ptr_A_scale=None,
@@ -195,9 +195,6 @@ def cutlass_grouped_gemm_xe2(input_A,
         total_experts=total_experts,
         tile=tile)
 
-
-def cutlass_grouped_gemm_last_w4a16_tile():
-    return torch.ops._xpu_C.cutlass_grouped_gemm_last_w4a16_tile()
 
 
 def ceilDiv(a, b):
@@ -263,6 +260,16 @@ def _repack_int4_in_place(weight, experts_per_step=16):
     weight.data = data.view(torch.int8)
 
 class XpuFusedMoe:
+    # Capabilities a caller can key on (feature detection across wheels):
+    # apply() skips negative, out-of-range and non-owned topk ids itself, so
+    # a caller needs no sentinel rewrite; and it clears rows_per_expert
+    # itself, so a caller needs no clear of its own.
+    HANDLES_UNOWNED_IDS = True
+    CLEARS_ROWS_PER_EXPERT = True
+    # Forces the W4A16 / MXFP4 grouped-GEMM tile ("<M>x<N>", for tuning);
+    # None keeps the op's choice.
+    w4a16_tile = None
+
     def __init__(
         self,
         w13,
@@ -566,7 +573,8 @@ class XpuFusedMoe:
             N=N,
             K=K,
             num_experts=self.num_experts,
-            total_experts=self.total_experts_num)
+            total_experts=self.total_experts_num,
+            tile=self.w4a16_tile)
 
     def _apply_kernel(
         self,

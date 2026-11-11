@@ -540,6 +540,7 @@ def test_fused_moe_int4_ids_valid(m, ep_rank):
         dim=-1)
     ids = ids.to(torch.int32)
     ids[::3, 1] = -1  # unrouted slots
+    raw_ids = ids.clone()
     sentinel = e - 1 if ep_rank == 0 else 0
     ids = torch.where(ids < 0, sentinel, ids)
 
@@ -560,6 +561,24 @@ def test_fused_moe_int4_ids_valid(m, ep_rank):
                topk_ids=ids, ids_valid=True, rows_per_expert=rpe)
     torch.testing.assert_close(out2, ref, rtol=0, atol=0)
     assert int(rpe.sum()) == int((expert_map[ids.long()] >= 0).sum())
+
+    # Raw ids (no sentinel rewrite) and a caller buffer holding garbage, as
+    # a caller keyed on the capability markers passes them.
+    assert XpuFusedMoe.HANDLES_UNOWNED_IDS
+    assert XpuFusedMoe.CLEARS_ROWS_PER_EXPERT
+    rpe.fill_(-3)
+    out4 = torch.empty_like(a)
+    impl.apply(output=out4, hidden_states=a, topk_weights=weights,
+               topk_ids=raw_ids, rows_per_expert=rpe)
+    torch.testing.assert_close(out4, ref, rtol=0, atol=0)
+
+    # A malformed expert map entry (below -1) is skipped like -1.
+    bad_map = expert_map.clone()
+    bad_map[expert_map < 0] = -5
+    out5 = torch.empty_like(a)
+    impl.apply(output=out5, hidden_states=a, topk_weights=weights,
+               topk_ids=raw_ids, expert_map=bad_map)
+    torch.testing.assert_close(out5, ref, rtol=0, atol=0)
 
     # Ids outside [0, e) are skipped like a non-local expert, never used to
     # index the expert map.

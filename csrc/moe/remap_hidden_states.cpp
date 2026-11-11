@@ -21,7 +21,9 @@ static inline int to_local_expert_id(
   }
   int local_expert_id =
       expert_map == nullptr ? global_expert_id : expert_map[global_expert_id];
-  return local_expert_id < local_experts_num ? local_expert_id : -1;
+  return (local_expert_id >= 0 && local_expert_id < local_experts_num)
+             ? local_expert_id
+             : -1;
 }
 
 class RowsPerExpertCount {

@@ -117,7 +117,7 @@ torch::Tensor cutlass_grouped_gemm_interface(
     int64_t total_experts,
     const c10::optional<std::string>& tile);
 
-std::string cutlass_grouped_gemm_last_w4a16_tile();
+std::string _cutlass_grouped_gemm_last_w4a16_tile();
 
 void moe_shared_fused_decode_interface(
     torch::Tensor& output,

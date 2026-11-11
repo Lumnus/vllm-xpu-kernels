@@ -70,7 +70,7 @@ torch::Tensor cutlass_grouped_gemm_interface(
 #endif
 }
 
-std::string cutlass_grouped_gemm_last_w4a16_tile() {
+std::string _cutlass_grouped_gemm_last_w4a16_tile() {
 #ifdef VLLM_XPU_ENABLE_XE2
   return cutlass_grouped_gemm_xe2_last_tile();
 #else
