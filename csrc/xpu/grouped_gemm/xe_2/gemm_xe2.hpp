@@ -235,7 +235,10 @@ CUTE_DEVICE void xe_gemm(
     CUTLASS_PRAGMA_UNROLL
     for (int sn = 0; sn < SG_N / sg_local_range; ++sn) {
       int sg_local_n = sn * sg_local_range + sg_local_id;
-      float b_float = Bias[n_tile_start + n_sg_start + sg_local_n];
+      // A partial N tile reads no bias past N (its columns are not stored).
+      float b_float = Bias[cute::min(
+          n_tile_start + n_sg_start + sg_local_n,
+          static_cast<int>(get<0>(B.shape())) - 1)];
       CUTLASS_PRAGMA_UNROLL
       for (int sm = 0; sm < SG_M; ++sm) {
         tCrC(sn * SG_M + sm) += b_float;
@@ -355,6 +358,10 @@ CUTE_DEVICE void xe_gemm_4bits(
   int sg_local_id = cutlass::get_sub_group_local_id();
   int n_sg_start = sg_local_n_coord * SG_N;
   int group_num = get<1>(A.shape()) / group_size;
+  // Scale and bias rows are clamped to N - 1: a work-group tile wider than
+  // the last N block would otherwise read past the expert's scales (past
+  // the tensor for the last expert). Those columns are never stored.
+  const int n_last = static_cast<int>(get<0>(B.shape())) - 1;
   int x_idx = sg_local_id / channel_num;
 
   // Scales are not block-2D prefetched: each row of an [N, K/gs] scale
@@ -385,8 +392,8 @@ CUTE_DEVICE void xe_gemm_4bits(
     // untyped per-lane prefetches: no 2D block surface, so no width, pitch or
     // alignment restriction, and only lines the loop will load.
     int s_row0 = n_tile_start + n_sg_start;
-    int s_rows = cute::min(static_cast<int>(SG_N),
-                           static_cast<int>(get<0>(B.shape())) - s_row0);
+    int s_rows = cute::min(
+        static_cast<int>(SG_N), static_cast<int>(get<0>(B.shape())) - s_row0);
     if (s_rows > 0) {
       auto s_base = reinterpret_cast<uintptr_t>(Scales + s_row0 * group_num);
       auto s_end = s_base + s_rows * group_num * sizeof(ElementS);
@@ -435,21 +442,17 @@ CUTE_DEVICE void xe_gemm_4bits(
           for (int c = 0; c < channel_num; ++c) {
             int real_idx = x_idx + c * (sg_local_range / channel_num);
             int sg_local_n = n * sg_local_range + real_idx;
+            int s_row =
+                cute::min(n_tile_start + n_sg_start + sg_local_n, n_last);
             scaleStoreType scale;
             if constexpr (std::is_same_v<TB, int4_t>) {
-              scale = Scales
-                  [(n_tile_start + n_sg_start + sg_local_n) * group_num +
-                   group_idx];
+              scale = Scales[s_row * group_num + group_idx];
             } else if constexpr (
                 std::is_same_v<TB, float_e2m1_t> ||
                 std::is_same_v<TB, float_e4m3_t> ||
                 std::is_same_v<TB, float_e5m2_t>) {
               // MXFP4 / MXFP8: uint8 E8M0 bits -> float via (bits << 23).
-              uint32_t scale_u32 =
-                  Scales
-                      [(n_tile_start + n_sg_start + sg_local_n) * group_num +
-                       group_idx]
-                  << 23;
+              uint32_t scale_u32 = Scales[s_row * group_num + group_idx] << 23;
               scale = static_cast<scaleStoreType>(
                   reinterpret_cast<float&>(scale_u32));
             }
@@ -503,7 +506,10 @@ CUTE_DEVICE void xe_gemm_4bits(
     CUTLASS_PRAGMA_UNROLL
     for (int sn = 0; sn < SG_N / sg_local_range; ++sn) {
       int sg_local_n = sn * sg_local_range + sg_local_id;
-      float b_float = Bias[n_tile_start + n_sg_start + sg_local_n];
+      // A partial N tile reads no bias past N (its columns are not stored).
+      float b_float = Bias[cute::min(
+          n_tile_start + n_sg_start + sg_local_n,
+          static_cast<int>(get<0>(B.shape())) - 1)];
       CUTLASS_PRAGMA_UNROLL
       for (int sm = 0; sm < SG_M; ++sm) {
         tCrC(sn * SG_M + sm) += b_float;

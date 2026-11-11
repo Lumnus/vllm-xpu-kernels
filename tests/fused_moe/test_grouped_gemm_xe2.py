@@ -904,3 +904,62 @@ def test_xe_grouped_gemm_int4_tiles_bitwise(monkeypatch, m, ep, n, k):
         start += rows
     torch.testing.assert_close(base, torch.cat(ref).to(dtype), rtol=2e-2,
                                atol=2e-2)
+
+
+@pytest.mark.parametrize("n,k", [(1344, 256), (704, 512)])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_xe_grouped_gemm_int4_partial_n_tile(monkeypatch, n, k, has_bias):
+    """N not a multiple of the tile's N (1344 = 10.5 x 128, 704 = 5.5 x 128):
+    every tile gives the same bits, matches the dequantized reference, and
+    leaves the rows past the local ones untouched (scale and bias rows are
+    clamped to N - 1 in the partial tile)."""
+    seed_everything(7)
+    local_experts, group_size, dtype = 8, 128, torch.bfloat16
+    rows_per_expert = torch.tensor([0, 16, 3, 40, 0, 16, 9, 17],
+                                   dtype=torch.int32, device=DEVICE)
+    local_rows = int(rows_per_expert.sum())
+    total_rows = 4 * local_rows
+    a = torch.zeros((total_rows, k), dtype=dtype, device=DEVICE)
+    a[:local_rows] = torch.randn((local_rows, k), dtype=dtype,
+                                 device=DEVICE) / 8
+    packed = torch.randint(0, 0xFF, (local_experts, n, k // 2),
+                           dtype=torch.uint8, device=DEVICE)
+    weight = implement_zp(packed).to(torch.int8)
+    scales = torch.pow(
+        2.0,
+        torch.randint(-6, -3, (local_experts, n, k // group_size),
+                      device=DEVICE).float()).to(dtype)
+    bias = torch.randn((local_experts, n), dtype=dtype,
+                       device=DEVICE) if has_bias else None
+
+    def run(tile):
+        if tile is None:
+            monkeypatch.delenv("VLLM_XPU_XE2_W4A16_TILE", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_XPU_XE2_W4A16_TILE", tile)
+        out = torch.zeros((total_rows, n), dtype=dtype, device=DEVICE)
+        cutlass_grouped_gemm_xe2(a, weight, scales, bias, out,
+                                 rows_per_expert, n, k, local_experts,
+                                 local_experts * 4)
+        torch.xpu.synchronize()
+        assert not out[local_rows:].any(), tile
+        return out[:local_rows].clone()
+
+    base = run(None)
+    for tile in W4A16_TILES:
+        assert torch.equal(run(tile), base), tile
+
+    deq = torch.stack([
+        dequantize_uint4(packed[i], scales[i], group_size)
+        for i in range(local_experts)
+    ]).to(torch.float32)
+    ref, start = [], 0
+    for i in range(local_experts):
+        rows = int(rows_per_expert[i])
+        r = a[start:start + rows].to(torch.float32) @ deq[i].T
+        if has_bias:
+            r = r + bias[i].to(torch.float32)
+        ref.append(r)
+        start += rows
+    torch.testing.assert_close(base, torch.cat(ref).to(dtype), rtol=2e-2,
+                               atol=2e-2)
