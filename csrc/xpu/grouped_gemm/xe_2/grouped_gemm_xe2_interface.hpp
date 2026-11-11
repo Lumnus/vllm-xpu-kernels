@@ -68,12 +68,15 @@ enum class W4A16Tile { M8, M16, M32, M32N128, M64N128, M64N256, M128N256 };
 
 // The tile for an expected `avg_rows` rows per expert. A tile pads every
 // expert's rows to a multiple of its M, so it is chosen on the rows an expert
-// actually gets, not on the size of the activation buffer.
+// actually gets, not on the size of the activation buffer. Measured on BMG
+// (int4 g128, 128 experts, N/K 1280/2560 and 2560/640, uniform and skewed
+// routing): 8x64 is fastest up to ~4 rows per expert; from ~10 to ~160 rows
+// the 32x128 tile beats 32x64 and 128x256 (skewed routing pads far less at
+// 32-row granularity than at 128).
 inline W4A16Tile select_w4a16_tile(int64_t avg_rows) {
   if (avg_rows <= 4) return W4A16Tile::M8;
   if (avg_rows <= 8) return W4A16Tile::M16;
-  if (avg_rows <= 24) return W4A16Tile::M32;
-  if (avg_rows <= 128) return W4A16Tile::M32N128;
+  if (avg_rows <= 256) return W4A16Tile::M32N128;
   return W4A16Tile::M128N256;
 }
 
