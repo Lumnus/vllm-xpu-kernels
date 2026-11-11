@@ -363,6 +363,20 @@ CUTE_DEVICE void xe_gemm_4bits(
   // the tensor for the last expert). Those columns are never stored.
   const int n_last = static_cast<int>(get<0>(B.shape())) - 1;
   int x_idx = sg_local_id / channel_num;
+  // A lane reads the same thr_N * channel_num scale rows in every K group:
+  // their offsets (rows clamped to N - 1) are computed once, outside the k
+  // loop, which then adds only the group index.
+  int scale_row_off[thr_N * channel_num];
+  CUTLASS_PRAGMA_UNROLL
+  for (int n = 0; n < thr_N; ++n) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int c = 0; c < channel_num; ++c) {
+      int sg_local_n =
+          n * sg_local_range + x_idx + c * (sg_local_range / channel_num);
+      scale_row_off[n * channel_num + c] =
+          cute::min(n_tile_start + n_sg_start + sg_local_n, n_last) * group_num;
+    }
+  }
 
   // Scales are not block-2D prefetched: each row of an [N, K/gs] scale
   // prefetch is a single element, below the 64-byte minimum surface width
@@ -440,19 +454,16 @@ CUTE_DEVICE void xe_gemm_4bits(
         for (int n = 0; n < thr_N; ++n) {
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < channel_num; ++c) {
-            int real_idx = x_idx + c * (sg_local_range / channel_num);
-            int sg_local_n = n * sg_local_range + real_idx;
-            int s_row =
-                cute::min(n_tile_start + n_sg_start + sg_local_n, n_last);
+            const int s_off = scale_row_off[n * channel_num + c] + group_idx;
             scaleStoreType scale;
             if constexpr (std::is_same_v<TB, int4_t>) {
-              scale = Scales[s_row * group_num + group_idx];
+              scale = Scales[s_off];
             } else if constexpr (
                 std::is_same_v<TB, float_e2m1_t> ||
                 std::is_same_v<TB, float_e4m3_t> ||
                 std::is_same_v<TB, float_e5m2_t>) {
               // MXFP4 / MXFP8: uint8 E8M0 bits -> float via (bits << 23).
-              uint32_t scale_u32 = Scales[s_row * group_num + group_idx] << 23;
+              uint32_t scale_u32 = Scales[s_off] << 23;
               scale = static_cast<scaleStoreType>(
                   reinterpret_cast<float&>(scale_u32));
             }
