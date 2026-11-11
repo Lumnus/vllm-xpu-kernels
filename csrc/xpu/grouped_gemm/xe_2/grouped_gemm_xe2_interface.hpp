@@ -63,6 +63,37 @@
 namespace MoE {
 using namespace cute;
 
+// Work-group tiles of the W4A16 / MXFP4 grouped GEMM, as M x N.
+enum class W4A16Tile { M8, M16, M32, M32N128, M64N128, M64N256, M128N256 };
+
+// The tile for an expected `avg_rows` rows per expert. A tile pads every
+// expert's rows to a multiple of its M, so it is chosen on the rows an expert
+// actually gets, not on the size of the activation buffer.
+inline W4A16Tile select_w4a16_tile(int64_t avg_rows) {
+  if (avg_rows <= 4) return W4A16Tile::M8;
+  if (avg_rows <= 8) return W4A16Tile::M16;
+  if (avg_rows <= 24) return W4A16Tile::M32;
+  if (avg_rows <= 128) return W4A16Tile::M32N128;
+  return W4A16Tile::M128N256;
+}
+
+// VLLM_XPU_XE2_W4A16_TILE=<M>x<N> (8x64, 16x64, 32x64, 32x128, 64x128,
+// 64x256, 128x256) forces a tile, for tuning and tests.
+inline W4A16Tile w4a16_tile_or_override(W4A16Tile chosen) {
+  auto env = vllm::xpu::getEnv("VLLM_XPU_XE2_W4A16_TILE");
+  if (!env.has_value() || env->empty()) return chosen;
+  const std::string& v = env.value();
+  if (v == "8x64") return W4A16Tile::M8;
+  if (v == "16x64") return W4A16Tile::M16;
+  if (v == "32x64") return W4A16Tile::M32;
+  if (v == "32x128") return W4A16Tile::M32N128;
+  if (v == "64x128") return W4A16Tile::M64N128;
+  if (v == "64x256") return W4A16Tile::M64N256;
+  if (v == "128x256") return W4A16Tile::M128N256;
+  TORCH_CHECK(false, "VLLM_XPU_XE2_W4A16_TILE: unknown tile ", v);
+  return chosen;
+}
+
 // type tag to define a unique sycl kernel name
 template <
     typename,
@@ -183,7 +214,8 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     at::Tensor& rows_per_expert,
     int64_t N,
     int64_t K,
-    int64_t num_experts) {
+    int64_t num_experts,
+    int64_t total_experts) {
   auto& dpcpp_queue =
       at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
   auto A_dtype = ptr_A.dtype();
@@ -354,18 +386,49 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     }                                  \
   }
 
-    if (A_avg_M <= 4) {
-      using policy = w4a16_policy_m_8;
-      W4A16LauncherCallER(policy);
-    } else if (A_avg_M <= 8) {
-      using policy = w4a16_policy_m_16;
-      W4A16LauncherCallER(policy);
-    } else if (A_avg_M <= 128) {
-      using policy = w4a16_policy_m_32;
-      W4A16LauncherCallER(policy);
-    } else {
-      using policy = w4a16_policy;
-      W4A16LauncherCallER(policy);
+    // ptr_A holds every routed row, but under expert parallelism only the
+    // rows routed to this rank's experts are computed: spread the buffer over
+    // all experts (total_experts, when given) to get the rows each expert
+    // can expect.
+    const int64_t routed_experts =
+        total_experts > num_experts ? total_experts : num_experts;
+    switch (
+        w4a16_tile_or_override(select_w4a16_tile(A_total_M / routed_experts))) {
+      case W4A16Tile::M8: {
+        using policy = w4a16_policy_m_8;
+        W4A16LauncherCallER(policy);
+        break;
+      }
+      case W4A16Tile::M16: {
+        using policy = w4a16_policy_m_16;
+        W4A16LauncherCallER(policy);
+        break;
+      }
+      case W4A16Tile::M32: {
+        using policy = w4a16_policy_m_32;
+        W4A16LauncherCallER(policy);
+        break;
+      }
+      case W4A16Tile::M32N128: {
+        using policy = w4a16_policy_m_32_n_128;
+        W4A16LauncherCallER(policy);
+        break;
+      }
+      case W4A16Tile::M64N128: {
+        using policy = w4a16_policy_m_64_n_128;
+        W4A16LauncherCallER(policy);
+        break;
+      }
+      case W4A16Tile::M64N256: {
+        using policy = w4a16_policy_m_64_n_256;
+        W4A16LauncherCallER(policy);
+        break;
+      }
+      case W4A16Tile::M128N256: {
+        using policy = w4a16_policy;
+        W4A16LauncherCallER(policy);
+        break;
+      }
     }
 #undef W4A16LauncherCallER
   } else if (is_B_mxfp8) {

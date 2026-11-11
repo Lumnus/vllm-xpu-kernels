@@ -20,7 +20,8 @@ torch::Tensor cutlass_grouped_gemm_interface(
     torch::Tensor rows_per_expert,
     int64_t N,
     int64_t K,
-    int64_t num_experts) {
+    int64_t num_experts,
+    int64_t total_experts) {
   const bool force_xe3p = vllm::xpu::force_xe3p_kernel();
 #ifdef VLLM_XPU_ENABLE_XE3P
   if (force_xe3p || vllm::xpu::is_xe3p_arch()) {
@@ -57,8 +58,10 @@ torch::Tensor cutlass_grouped_gemm_interface(
       rows_per_expert,
       N,
       K,
-      num_experts);
+      num_experts,
+      total_experts);
 #else
+  (void)total_experts;
   TORCH_CHECK(
       false, "No cutlass grouped GEMM kernel is enabled in this build.");
 #endif

@@ -841,3 +841,66 @@ def test_moe_int4_gemv(m, topk, n, k, e, dtype):
     cutlass_grouped_gemm_xe2(input_A, input_B_int4, scale_B, None, grouped,
                              num_rows_per_expert, n, k, e)
     torch.testing.assert_close(output, grouped, rtol=1e-2, atol=1e-2)
+
+
+W4A16_TILES = ["8x64", "16x64", "32x64", "32x128", "64x128", "64x256",
+               "128x256"]
+
+
+@pytest.mark.parametrize("m,ep", [(3, 4), (40, 4), (256, 4), (512, 1)])
+@pytest.mark.parametrize("n,k", [(1280, 2560), (2560, 640)])
+def test_xe_grouped_gemm_int4_tiles_bitwise(monkeypatch, m, ep, n, k):
+    """Every W4A16 tile gives the same bits, with and without the
+    expert-parallel row hint; the result matches the dequantized reference.
+
+    The activation buffer holds every routed row (m * topk), as in the fused
+    MoE under expert parallelism, while rows_per_expert counts only the rows
+    of the local experts."""
+    seed_everything(7)
+    local_experts, topk, group_size = 8, 4, 128
+    dtype = torch.bfloat16
+    total_rows = m * topk
+    local_rows = max(1, total_rows // ep)
+    weights = torch.rand(local_experts, device=DEVICE) + 0.25
+    counts = torch.multinomial(weights, local_rows, replacement=True)
+    rows_per_expert = torch.bincount(counts, minlength=local_experts).to(
+        torch.int32)
+    a = torch.zeros((total_rows, k), dtype=dtype, device=DEVICE)
+    a[:local_rows] = torch.randn((local_rows, k), dtype=dtype,
+                                 device=DEVICE) / 8
+    packed = torch.randint(0, 0xFF, (local_experts, n, k // 2),
+                           dtype=torch.uint8, device=DEVICE)
+    weight = implement_zp(packed).to(torch.int8)
+    scales = torch.pow(
+        2.0,
+        torch.randint(-6, -3, (local_experts, n, k // group_size),
+                      device=DEVICE).float()).to(dtype)
+
+    def run(tile, total_experts):
+        if tile is None:
+            monkeypatch.delenv("VLLM_XPU_XE2_W4A16_TILE", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_XPU_XE2_W4A16_TILE", tile)
+        out = torch.zeros((total_rows, n), dtype=dtype, device=DEVICE)
+        cutlass_grouped_gemm_xe2(a, weight, scales, None, out,
+                                 rows_per_expert, n, k, local_experts,
+                                 total_experts)
+        torch.xpu.synchronize()
+        return out[:local_rows].clone()
+
+    base = run(None, -1)
+    assert torch.equal(run(None, local_experts * ep), base)
+    for tile in W4A16_TILES:
+        assert torch.equal(run(tile, local_experts * ep), base), tile
+
+    deq = torch.stack([
+        dequantize_uint4(packed[i], scales[i], group_size)
+        for i in range(local_experts)
+    ]).to(torch.float32)
+    ref, start = [], 0
+    for i in range(local_experts):
+        rows = int(rows_per_expert[i])
+        ref.append(a[start:start + rows].to(torch.float32) @ deq[i].T)
+        start += rows
+    torch.testing.assert_close(base, torch.cat(ref).to(dtype), rtol=2e-2,
+                               atol=2e-2)

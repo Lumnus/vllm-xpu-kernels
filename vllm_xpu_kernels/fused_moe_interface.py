@@ -164,8 +164,19 @@ def cutlass_grouped_gemm(input_A, input_A_scale, input_B, input_B_scale, bias,
         num_experts=num_experts)
 
 
-def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
-                             num_rows_per_expert, n, k, num_experts):
+def cutlass_grouped_gemm_xe2(input_A,
+                             input_B,
+                             scales,
+                             bias,
+                             output,
+                             num_rows_per_expert,
+                             n,
+                             k,
+                             num_experts,
+                             total_experts=-1):
+    # total_experts: experts across all expert-parallel ranks when input_A
+    # holds every routed row but only num_experts of them are local; the
+    # kernel picks its tile from the rows each expert can expect.
     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
         ptr_A=input_A,
         ptr_A_scale=None,
@@ -176,7 +187,8 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
         rows_per_expert=num_rows_per_expert,
         N=n,
         K=k,
-        num_experts=num_experts)
+        num_experts=num_experts,
+        total_experts=total_experts)
 
 
 def ceilDiv(a, b):
@@ -519,7 +531,8 @@ class XpuFusedMoe:
             rows_per_expert=rows_per_expert,
             N=N,
             K=K,
-            num_experts=self.num_experts)
+            num_experts=self.num_experts,
+            total_experts=self.total_experts_num)
 
     def _apply_kernel(
         self,

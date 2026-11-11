@@ -104,4 +104,32 @@ class w4a16_policy_m_32 : public xe_gemm_policy_base {
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
 };
 
+// 32x32 subgroup tiles (as in w4a16_policy) at 32- or 64-row work-group
+// granularity: the dequantized B fragment of each k-tile feeds twice the
+// columns of the 32x16 subgroup tile, while an expert with a few dozen rows
+// pads to 32 or 64 rows instead of 128.
+class w4a16_policy_m_32_n_128 : public xe_gemm_policy_base {
+ public:
+  using WGTile = Shape<_32, _128, _32>;
+  using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+
+  using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
+};
+
+class w4a16_policy_m_64_n_128 : public xe_gemm_policy_base {
+ public:
+  using WGTile = Shape<_64, _128, _32>;
+  using SGLayout = Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>;
+
+  using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
+};
+
+class w4a16_policy_m_64_n_256 : public xe_gemm_policy_base {
+ public:
+  using WGTile = Shape<_64, _256, _32>;
+  using SGLayout = Layout<Shape<_2, _8, _1>, Stride<_8, _1, _0>>;
+
+  using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
+};
+
 }  // namespace MoE
