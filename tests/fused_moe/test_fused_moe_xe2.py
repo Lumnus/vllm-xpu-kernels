@@ -503,6 +503,57 @@ def test_fused_moe_int4(m, n, k, e, topk, dtype, has_bias):
     torch.testing.assert_close(output, ref_out, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("m", [1, 7, 64])
+@pytest.mark.parametrize("ep_rank", [0, 3])
+def test_fused_moe_int4_ids_valid(m, ep_rank):
+    """ids_valid with a caller-zeroed rows_per_expert gives the default
+    path's output bit for bit once unrouted ids are mapped to an expert the
+    rank does not own (the expert-parallel caller's sentinel)."""
+    seed_everything(7)
+    hidden_size, intermediate_size, e, ep_size, topk = 512, 256, 16, 4, 4
+    group_size, dtype = 128, torch.bfloat16
+    local = e // ep_size
+
+    def make_w(*shape):
+        return torch.randint(0, 0xff, shape, device=DEVICE).to(torch.uint8)
+
+    def make_s(*shape):
+        return torch.pow(
+            2.0,
+            torch.randint(-5, -4, shape, device=DEVICE).float()).to(dtype)
+
+    w13 = make_w(local, 2 * intermediate_size, hidden_size // 2)
+    w2 = make_w(local, hidden_size, intermediate_size // 2)
+    w13_s = make_s(local, 2 * intermediate_size, hidden_size // group_size)
+    w2_s = make_s(local, hidden_size, intermediate_size // group_size)
+    expert_map = torch.full((e, ), -1, dtype=torch.int32, device=DEVICE)
+    expert_map[ep_rank * local:(ep_rank + 1) * local] = torch.arange(
+        local, dtype=torch.int32, device=DEVICE)
+    impl = XpuFusedMoe(w13=w13, w13_scales=w13_s, w13_bias=None, w2=w2,
+                       w2_scales=w2_s, w2_bias=None, n_experts_per_token=topk,
+                       activation="silu", num_experts=local, ep_rank=ep_rank,
+                       ep_size=ep_size, expert_map=expert_map)
+
+    a = torch.randn((m, hidden_size), device=DEVICE, dtype=dtype) / 16
+    weights, ids = torch.topk(
+        torch.randn((m, e), device=DEVICE, dtype=torch.float32), k=topk,
+        dim=-1)
+    ids = ids.to(torch.int32)
+    ids[::3, 1] = -1  # unrouted slots
+    sentinel = e - 1 if ep_rank == 0 else 0
+    ids = torch.where(ids < 0, sentinel, ids)
+
+    ref = torch.empty_like(a)
+    impl.apply(output=ref, hidden_states=a, topk_weights=weights,
+               topk_ids=ids)
+    out = torch.empty_like(a)
+    rpe = torch.zeros((local, ), dtype=torch.int32, device=DEVICE)
+    impl.apply(output=out, hidden_states=a, topk_weights=weights,
+               topk_ids=ids, ids_valid=True, rows_per_expert=rpe)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    assert int(rpe.sum()) == int((expert_map[ids.long()] >= 0).sum())
+
+
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)

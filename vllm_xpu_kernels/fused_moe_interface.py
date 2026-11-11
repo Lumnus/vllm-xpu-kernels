@@ -406,6 +406,8 @@ class XpuFusedMoe:
         output_hook: Optional[Callable[
             [torch.Tensor, torch.Tensor, torch.Tensor], None]] = None,
         w4a8: bool = False,
+        ids_valid: bool = False,
+        rows_per_expert: Optional[torch.Tensor] = None,
     ):
         """Run the fused MoE, optionally updating grouped intermediates.
 
@@ -421,6 +423,16 @@ class XpuFusedMoe:
         token/top-k pair to its row in the expert-grouped tensors; -1 denotes
         a non-local or invalid expert. Hooks require the kernel path and
         unquantized activations.
+
+            ids_valid: The caller guarantees that no ``topk_ids`` entry is
+                negative (for example, expert-parallel callers that already
+                rewrote unrouted ids to an expert this rank does not own).
+                The kernel path then skips zeroing the padding rows, whose
+                mask would be False on every row.
+            rows_per_expert: Optional zeroed int32 ``[num_experts]`` tensor
+                for the kernel path to fill, so a caller that already
+                launches a kernel over the ids can clear it there instead of
+                in a separate fill.
         """
         if expert_map is None:
             expert_map = self.expert_map
@@ -452,7 +464,8 @@ class XpuFusedMoe:
             self._apply_kernel(output, hidden_states,
                                topk_weights, topk_ids,
                                expert_map, a1q_scale,
-                               a2_scale, activation_hook, output_hook)
+                               a2_scale, activation_hook, output_hook,
+                               ids_valid, rows_per_expert)
 
     def _apply_ref(
         self,
@@ -519,6 +532,8 @@ class XpuFusedMoe:
         a2_scale=None,
         activation_hook=None,
         output_hook=None,
+        ids_valid=False,
+        rows_per_expert=None,
     ):
         num_rows, hidden_size = hidden_states.shape
         num_moe_inputs = self.n_experts_per_token * num_rows
@@ -569,15 +584,19 @@ class XpuFusedMoe:
         # masked_fill has no XPU kernel for the fp8 / packed-fp4 activation
         # dtypes, so 1-byte activations are cleared through a uint8 view (an
         # all-zero bit pattern is +0 in every one of those formats).
-        invalid_padding_rows = (topk_ids < 0).all(dim=1)
-        fill_view = hidden_states.view(torch.uint8) \
-            if hidden_states.element_size() == 1 else hidden_states
-        hidden_states = fill_view.masked_fill(
-            invalid_padding_rows.unsqueeze(1), 0).view(hidden_states.dtype)
+        # Callers that pass ids_valid have no such rows.
+        if not ids_valid:
+            invalid_padding_rows = (topk_ids < 0).all(dim=1)
+            fill_view = hidden_states.view(torch.uint8) \
+                if hidden_states.element_size() == 1 else hidden_states
+            hidden_states = fill_view.masked_fill(
+                invalid_padding_rows.unsqueeze(1),
+                0).view(hidden_states.dtype)
 
-        rows_per_expert = torch.zeros((self.num_experts),
-                                                dtype=torch.int32,
-                                                device=hidden_states.device)
+        if rows_per_expert is None:
+            rows_per_expert = torch.zeros((self.num_experts),
+                                          dtype=torch.int32,
+                                          device=hidden_states.device)
         unpermuted_row_to_permuted_row = torch.empty(
             (num_rows, self.n_experts_per_token),
             dtype=torch.int32,
