@@ -893,7 +893,8 @@ def _routing(kind, e, rows):
 
 @pytest.mark.parametrize("fmt,dtype", [("int4", torch.bfloat16),
                                        ("mxfp4", torch.float16)])
-@pytest.mark.parametrize("n,k", [(1280, 256), (1344, 256), (704, 512)])
+@pytest.mark.parametrize("n,k", [(1280, 2560), (2560, 640), (1344, 256),
+                                 (704, 512)])
 @pytest.mark.parametrize("rows", [12, 160, 700])
 @pytest.mark.parametrize("routing", ["mild", "heavy"])
 def test_xe_grouped_gemm_w4_tiles_bitwise(fmt, dtype, n, k, rows, routing):
@@ -975,3 +976,35 @@ def test_xe_grouped_gemm_w4a16_tile_argument():
     with pytest.raises(RuntimeError, match="unknown W4A16 tile"):
         cutlass_grouped_gemm_xe2(a, w, s, None, out, rpe, n, k, e, -1,
                                  "64x128")
+
+
+@pytest.mark.parametrize("tile", ["32x128", "128x256"])
+def test_xe_grouped_gemm_w4a16_partial_n_scales_end_of_pinned_block(tile):
+    """N = 1344 (not a multiple of the tile's N): the last expert's scales
+    end exactly at the end of a pinned host block, read through a device
+    view (as with host-offloaded MoE scales). Without the clamp to N - 1 the
+    partial tile reads past the block, which faults the device; with it the
+    result matches the device-resident scales bit for bit."""
+    seed_everything(7)
+    import vllm_xpu_kernels._C  # noqa: F401
+    e, n, k, dtype = 8, 1344, 256, torch.bfloat16
+    w, s, _ = _make_w4("int4", e, n, k, dtype)
+    rpe = torch.tensor([3, 0, 9, 1, 0, 5, 2, 7], dtype=torch.int32,
+                       device=DEVICE)
+    rows = int(rpe.sum())
+    a = torch.randn((rows, k), dtype=dtype, device=DEVICE) / 8
+    block = torch.empty(1 << 20, dtype=torch.uint8).pin_memory()
+    nbytes = s.numel() * s.element_size()
+    tail = block[block.numel() - nbytes:].view(dtype).view(s.shape)
+    tail.copy_(s.cpu())
+    s_host = torch.ops._C.get_xpu_view_from_cpu_tensor(tail)
+
+    def run(scales):
+        out = torch.zeros((rows, n), dtype=dtype, device=DEVICE)
+        cutlass_grouped_gemm_xe2(a, w, scales, None, out, rpe, n, k, e, -1,
+                                 tile)
+        torch.xpu.synchronize()
+        assert cutlass_grouped_gemm_last_w4a16_tile() == tile
+        return out
+
+    assert torch.equal(run(s_host), run(s))
