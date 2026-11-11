@@ -13,13 +13,13 @@
 namespace oneDNN {
 
 static inline void dnnl_matmul_w8a8_int8(
-    torch::Tensor& result,       // dst, [m, n] float16
+    torch::Tensor& result,       // dst, [m, n] float16, or bfloat16 (s8 x s8)
     const torch::Tensor& mat1,   // quantized src, [m, k] int8/uint8
     const torch::Tensor& m1_sc,  // per-token [m, 1] or per-tensor [1]
-    const torch::Tensor& m1_zp,  // per-token [m, 1] or per-tensor [1]
+    const std::optional<torch::Tensor>& m1_zp,  // as m1_sc; none: symmetric
     const torch::Tensor& mat2,   // quantized weight, [k, n] NT format int8
     const torch::Tensor& m2_sc,  // per-channel [1, n]
-    const torch::Tensor& m2_zp,  // per-channel [1, n]
+    const std::optional<torch::Tensor>& m2_zp,  // as m2_sc; none: symmetric
     int64_t group_size,          // -1 for per-channel
     const std::optional<torch::Tensor>& bias) {
   auto src_sz = mat1.sizes();
@@ -34,8 +34,16 @@ static inline void dnnl_matmul_w8a8_int8(
   joint_dtypes_t jd;
   auto in_dtype = mat1.scalar_type();
   auto w_dtype = mat2.scalar_type();
+  const bool bf16_out = result.scalar_type() == at::ScalarType::BFloat16;
+  TORCH_CHECK(
+      !bf16_out ||
+          (in_dtype == at::ScalarType::Char && w_dtype == at::ScalarType::Char),
+      "bfloat16 output is supported for int8 x int8 only, got act=",
+      in_dtype,
+      " wei=",
+      w_dtype);
   if (in_dtype == at::ScalarType::Char && w_dtype == at::ScalarType::Char) {
-    jd = joint_dtypes_t::int8;
+    jd = bf16_out ? joint_dtypes_t::int8_bf16 : joint_dtypes_t::int8;
   } else if (
       in_dtype == at::ScalarType::Byte && w_dtype == at::ScalarType::Char) {
     jd = joint_dtypes_t::u8_int8;
@@ -93,7 +101,7 @@ static inline void dnnl_matmul_w8a8_int8(
           /* mask */ (1 << 0) + (1 << 1),
           {1, k},
           get_onednn_dtype(m1_sc));
-      pattr.set_zero_points(
+      if (m1_zp.has_value()) pattr.set_zero_points(
           DNNL_ARG_SRC,
           /* mask */ (1 << 0) + (1 << 1),
           {1, k},
@@ -104,7 +112,7 @@ static inline void dnnl_matmul_w8a8_int8(
           /* mask */ 0,
           {},
           get_onednn_dtype(m1_sc));
-      pattr.set_zero_points(
+      if (m1_zp.has_value()) pattr.set_zero_points(
           DNNL_ARG_SRC,
           /* mask */ 0,
           {},
@@ -117,7 +125,7 @@ static inline void dnnl_matmul_w8a8_int8(
           /* mask */ 0,
           {},
           get_onednn_dtype(m2_sc));
-      pattr.set_zero_points(
+      if (m2_zp.has_value()) pattr.set_zero_points(
           DNNL_ARG_WEIGHTS,
           /* mask */ 0,
           {},
@@ -128,7 +136,7 @@ static inline void dnnl_matmul_w8a8_int8(
           /* mask */ (1 << 1),
           {},
           get_onednn_dtype(m2_sc));
-      pattr.set_zero_points(
+      if (m2_zp.has_value()) pattr.set_zero_points(
           DNNL_ARG_WEIGHTS,
           /* mask */ (1 << 1),
           {},
@@ -139,7 +147,7 @@ static inline void dnnl_matmul_w8a8_int8(
           /* mask */ (1 << 0) + (1 << 1),
           {group_size, 1},
           get_onednn_dtype(m2_sc));
-      pattr.set_zero_points(
+      if (m2_zp.has_value()) pattr.set_zero_points(
           DNNL_ARG_WEIGHTS,
           /* mask */ (1 << 0) + (1 << 1),
           {group_size, 1},
@@ -148,11 +156,15 @@ static inline void dnnl_matmul_w8a8_int8(
   };
 
   // Encode the number of elements of m1_sc and m2_sc into a single int64_t:
-  // upper 32 bits: m1_sc.numel(), lower 32 bits: m2_sc.numel()
+  // upper 32 bits: m1_sc.numel(), lower 32 bits: m2_sc.numel(). The cache key
+  // keeps all 64 bits, so per-token and per-tensor scales at the same m, n, k
+  // get different primitives. A missing zero point counts as 0 elements.
+  auto zp_numel = [](const std::optional<torch::Tensor>& zp) -> int64_t {
+    return zp.has_value() ? zp->numel() : 0;
+  };
   int64_t sc_group_size = (static_cast<int64_t>(m1_sc.numel()) << 32) |
                           static_cast<int64_t>(m2_sc.numel());
-  int64_t zp_group_size = (static_cast<int64_t>(m1_zp.numel()) << 32) |
-                          static_cast<int64_t>(m2_zp.numel());
+  int64_t zp_group_size = (zp_numel(m1_zp) << 32) | zp_numel(m2_zp);
 
   auto& matmul_ext = matmul_primitive_create_and_cache(
       jd,
@@ -176,14 +188,16 @@ static inline void dnnl_matmul_w8a8_int8(
         return make_onednn_memory(
             get_onednn_md(m1_sc), engine, m1_sc.data_ptr());
       });
-  matmul_ext.set_attribute(
-      arg_off++,
-      DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC,
-      m1_zp.data_ptr(),
-      [&]() {
-        return make_onednn_memory(
-            get_onednn_md(m1_zp), engine, m1_zp.data_ptr());
-      });
+  if (m1_zp.has_value()) {
+    matmul_ext.set_attribute(
+        arg_off++,
+        DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC,
+        m1_zp->data_ptr(),
+        [&]() {
+          return make_onednn_memory(
+              get_onednn_md(*m1_zp), engine, m1_zp->data_ptr());
+        });
+  }
   matmul_ext.set_attribute(
       arg_off++,
       DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
@@ -192,14 +206,16 @@ static inline void dnnl_matmul_w8a8_int8(
         return make_onednn_memory(
             get_onednn_md(m2_sc), engine, m2_sc.data_ptr());
       });
-  matmul_ext.set_attribute(
-      arg_off++,
-      DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS,
-      m2_zp.data_ptr(),
-      [&]() {
-        return make_onednn_memory(
-            get_onednn_md(m2_zp), engine, m2_zp.data_ptr());
-      });
+  if (m2_zp.has_value()) {
+    matmul_ext.set_attribute(
+        arg_off++,
+        DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS,
+        m2_zp->data_ptr(),
+        [&]() {
+          return make_onednn_memory(
+              get_onednn_md(*m2_zp), engine, m2_zp->data_ptr());
+        });
+  }
 
   std::vector<std::pair<int, void*>> arg_handles;
   arg_handles.reserve(8);

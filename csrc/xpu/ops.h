@@ -94,12 +94,13 @@ torch::Tensor int4_gemm_w4a8(
 torch::Tensor int8_gemm_w8a8(
     const torch::Tensor& A_,
     const torch::Tensor& A_scale,
-    const torch::Tensor& A_zp,
+    const std::optional<torch::Tensor>& A_zp,
     const torch::Tensor& B,
     const torch::Tensor& B_scale,
-    const torch::Tensor& B_zp,
+    const std::optional<torch::Tensor>& B_zp,
     int64_t group_size,
-    const std::optional<torch::Tensor>& bias);
+    const std::optional<torch::Tensor>& bias,
+    std::optional<c10::ScalarType> out_dtype);
 
 #ifdef VLLM_MOE_ENABLED
 torch::Tensor cutlass_grouped_gemm_interface(

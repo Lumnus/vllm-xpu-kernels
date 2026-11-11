@@ -57,8 +57,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   xpu_ops.impl("int4_gemm_w4a8", torch::kXPU, &int4_gemm_w4a8);
 
   xpu_ops.def(
-      "int8_gemm_w8a8(Tensor A_, Tensor A_scale, Tensor A_zp, Tensor B, "
-      "Tensor B_scale, Tensor B_zp, int group_size, Tensor? bias) -> Tensor");
+      "int8_gemm_w8a8(Tensor A_, Tensor A_scale, Tensor? A_zp, Tensor B, "
+      "Tensor B_scale, Tensor? B_zp, int group_size, Tensor? bias, "
+      "ScalarType? out_dtype=None) -> Tensor");
   xpu_ops.impl("int8_gemm_w8a8", torch::kXPU, &int8_gemm_w8a8);
 
   // small-M int8 dense GEMMs over W1's int8 weights [N, K] with an

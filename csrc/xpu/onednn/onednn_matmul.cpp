@@ -279,12 +279,13 @@ torch::Tensor int4_gemm_w4a16(
 torch::Tensor int8_gemm_w8a8(
     const torch::Tensor& A_,       // quantized activations, [m, k] int8
     const torch::Tensor& A_scale,  // per-token [m, 1] or per-tensor [1]
-    const torch::Tensor& A_zp,     // per-token [m, 1] or per-tensor [1]
+    const std::optional<torch::Tensor>& A_zp,  // as A_scale, int32; or none
     const torch::Tensor& B,        // quantized weight, [k, n] NT format int8
     const torch::Tensor& B_scale,  // per-channel [1, n] or per-group [k/gs, n]
-    const torch::Tensor& B_zp,     // per-channel [1, n] or per-group [k/gs, n]
-    int64_t group_size,            // -1 for per-channel
-    const std::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& B_zp,  // as B_scale, int32; or none
+    int64_t group_size,                        // -1 for per-channel
+    const std::optional<torch::Tensor>& bias,
+    std::optional<c10::ScalarType> out_dtype) {  // float16 (default), bfloat16
   const at::DeviceGuard device_guard(A_.device());
 
   TORCH_CHECK(
@@ -297,18 +298,42 @@ torch::Tensor int8_gemm_w8a8(
           B.scalar_type() == at::ScalarType::Byte,
       "int8_gemm_w8a8: weight must be int8 (Char) or uint8 (Byte), got ",
       B.scalar_type());
+  auto is_scale_dtype = [](at::ScalarType t) {
+    return t == at::ScalarType::Float || t == at::ScalarType::Half ||
+           t == at::ScalarType::BFloat16;
+  };
+  TORCH_CHECK(
+      is_scale_dtype(A_scale.scalar_type()) &&
+          is_scale_dtype(B_scale.scalar_type()),
+      "int8_gemm_w8a8: scales must be float32, float16 or bfloat16, got "
+      "A_scale=",
+      A_scale.scalar_type(),
+      " B_scale=",
+      B_scale.scalar_type());
+  for (const auto* zp : {&A_zp, &B_zp}) {
+    TORCH_CHECK(
+        !zp->has_value() || (*zp)->scalar_type() == at::ScalarType::Int,
+        "int8_gemm_w8a8: zero points must be int32, got ",
+        (*zp)->scalar_type());
+  }
 
   // Validate quantization format for input A
   const bool per_token_A =
-      (A_scale.dim() == 2 && A_scale.size(1) == 1 && A_zp.dim() == 2 &&
-       A_zp.size(1) == 1);
-  const bool per_tensor_A = (A_scale.numel() == 1 && A_zp.numel() == 1);
+      (A_scale.dim() == 2 && A_scale.size(1) == 1 &&
+       (!A_zp.has_value() || (A_zp->dim() == 2 && A_zp->size(1) == 1)));
+  const bool per_tensor_A =
+      (A_scale.numel() == 1 && (!A_zp.has_value() || A_zp->numel() == 1));
   TORCH_CHECK(
       per_token_A || per_tensor_A,
       "int8_gemm_w8a8: A_scale and A_zp must be per-token [m,1] or per-tensor "
       "[1]");
 
-  torch::Tensor result = check_and_create_output_tensor(A_, B, torch::kHalf);
+  const c10::ScalarType dst_dtype = out_dtype.value_or(torch::kHalf);
+  TORCH_CHECK(
+      dst_dtype == torch::kHalf || dst_dtype == torch::kBFloat16,
+      "int8_gemm_w8a8: out_dtype must be float16 or bfloat16, got ",
+      dst_dtype);
+  torch::Tensor result = check_and_create_output_tensor(A_, B, dst_dtype);
 
   oneDNN::dnnl_matmul_w8a8_int8(
       result, A_, A_scale, A_zp, B, B_scale, B_zp, group_size, bias);
