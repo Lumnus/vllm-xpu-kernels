@@ -30,6 +30,7 @@
  *
  **************************************************************************************************/
 
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
 #include <sycl/sycl.hpp>
 #include <cute/util/compat.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -358,7 +359,8 @@ CUTE_DEVICE void xe_gemm_4bits(
 
   // Scales are not block-2D prefetched: each row of an [N, K/gs] scale
   // prefetch is a single element, below the 64-byte minimum surface width
-  // required by the 2D block I/O restrictions (SPV_INTEL_2d_block_io).
+  // required by the 2D block I/O restrictions (SPV_INTEL_2d_block_io). They
+  // are prefetched below with plain per-lane cache prefetches instead.
   using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
   scaleStoreType scales[thr_N * channel_num];
 
@@ -375,6 +377,27 @@ CUTE_DEVICE void xe_gemm_4bits(
   static constexpr bool is_B_fp8_type =
       std::is_same_v<ElementB, cutlass::float_e5m2_t> ||
       std::is_same_v<ElementB, cutlass::float_e4m3_t>;
+
+  if constexpr (TENSOR_B_DTYPE != B_DTYPE::BLOCK_FP8) {
+    // The [N, K/gs] scales of this subgroup's SG_N rows are one contiguous
+    // run of SG_N * group_num elements, and the k loop reads all of them.
+    // Prefetch that run once, one 64-byte line per lane at a time, with
+    // untyped per-lane prefetches: no 2D block surface, so no width, pitch or
+    // alignment restriction, and only lines the loop will load.
+    int s_row0 = n_tile_start + n_sg_start;
+    int s_rows = cute::min(static_cast<int>(SG_N),
+                           static_cast<int>(get<0>(B.shape())) - s_row0);
+    if (s_rows > 0) {
+      auto s_base = reinterpret_cast<uintptr_t>(Scales + s_row0 * group_num);
+      auto s_end = s_base + s_rows * group_num * sizeof(ElementS);
+      for (auto line = (s_base & ~uintptr_t{63}) + sg_local_id * 64;
+           line < s_end;
+           line += sg_local_range * 64) {
+        sycl::ext::oneapi::experimental::prefetch(
+            reinterpret_cast<void*>(line));
+      }
+    }
+  }
 
   CUTE_UNROLL
   for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
