@@ -5,6 +5,7 @@
   #include "xpu/grouped_gemm/moe_shared_fused_interface.h"
 #endif
 #include "xpu/lora/lora_ops.h"
+#include "cpu_experts/int4_moe_cpu.h"
 
 #include <torch/library.h>
 #include <torch/version.h>
@@ -453,6 +454,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "vmm_tensor_from_ptr(int ptr, int num_bytes, int device_index) -> "
       "Tensor");
   xpu_ops.impl("vmm_tensor_from_ptr", &vmm_tensor_from_ptr);
+
+  // Host op: int4 MoE experts computed on the CPU from the layout these
+  // kernels read (an expert that is in no device-readable memory).
+  register_int4_moe_cpu(xpu_ops);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
