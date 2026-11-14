@@ -702,12 +702,13 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
       "csrc/xpu/int8_dense/int8_dense.cpp"
       "csrc/xpu/utils.cpp"
       "csrc/xpu/vmm.cpp"
-      "csrc/cpu_experts/int4_moe_cpu.cpp")
+      "csrc/cpu_experts/int4_moe_cpu.cpp"
+      "csrc/cpu_experts/int4_moe_cpu_a8.cpp")
   # Host code only. Its arithmetic order is part of what it promises (the
   # scalar and the AVX2 paths agree bit for bit): no fast-math for this TU;
   # the file also turns off contraction and reassociation itself.
   set_source_files_properties(
-    "csrc/cpu_experts/int4_moe_cpu.cpp"
+    "csrc/cpu_experts/int4_moe_cpu.cpp" "csrc/cpu_experts/int4_moe_cpu_a8.cpp"
     PROPERTIES COMPILE_OPTIONS "-ffp-model=precise")
   if(MOE_KERNELS_ENABLED)
     list(APPEND VLLM_EXT_XPU_SRC
