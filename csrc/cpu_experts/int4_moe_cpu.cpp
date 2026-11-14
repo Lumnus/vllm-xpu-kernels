@@ -38,7 +38,8 @@ void int4_moe_cpu(
     int64_t group,
     c10::IntArrayRef offsets,
     int64_t num_threads,
-    int64_t isa) {
+    int64_t isa,
+    int64_t arith) {
   check_cpu(out, "out");
   check_cpu(x, "x");
   check_cpu(units, "units");
@@ -70,6 +71,10 @@ void int4_moe_cpu(
       num_threads >= 1 && num_threads <= 1024,
       "int4_moe_cpu: num_threads out of range");
   TORCH_CHECK(isa >= 0 && isa <= 2, "int4_moe_cpu: isa is 0, 1 or 2");
+  TORCH_CHECK(
+      arith >= 0 && arith <= 3,
+      "int4_moe_cpu: arith is 0 to 3 (bit 0: GEMM1, bit 1: GEMM2 take the "
+      "grouped GEMM's bf16 weights instead of the GEMV's chunk-scaled sums)");
   cpu_moe::Layout L;
   L.hidden = static_cast<int>(x.size(1));
   L.inter = static_cast<int>(inter);
@@ -92,7 +97,8 @@ void int4_moe_cpu(
         call_unit.data_ptr<int32_t>(),
         call_token.data_ptr<int32_t>(),
         call_weight.data_ptr<float>(),
-        C);
+        C,
+        static_cast<int>(arith));
   } catch (const std::runtime_error& e) {
     TORCH_CHECK(false, e.what());
   }

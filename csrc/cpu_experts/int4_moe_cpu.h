@@ -19,6 +19,12 @@
 //   inter        I (H is x's width), group: the scales' group size
 //   num_threads  host threads for this call (a pool per count is kept)
 //   isa          0 auto, 1 scalar, 2 AVX2 + FMA
+//   arith        the card kernel whose arithmetic each GEMM takes: bit 0
+//                GEMM1, bit 1 GEMM2; clear: the int4 GEMV (scale per
+//                32-element chunk sum; 0, the default, is the GEMV for
+//                both), set: the grouped GEMM (weights bf16(q * s)). The
+//                card takes the GEMV for a call of at most 8 rows whose K
+//                is a multiple of 512, the grouped GEMM otherwise
 void int4_moe_cpu(
     torch::Tensor& out,
     const torch::Tensor& x,
@@ -30,7 +36,8 @@ void int4_moe_cpu(
     int64_t group,
     c10::IntArrayRef offsets,
     int64_t num_threads,
-    int64_t isa);
+    int64_t isa,
+    int64_t arith);
 
 // The instruction set `isa` (as above) resolves to on this host: 1 scalar,
 // 2 AVX2 + FMA.
@@ -41,7 +48,7 @@ inline void register_int4_moe_cpu(torch::Library& m) {
   m.def(
       "int4_moe_cpu(Tensor(a!) out, Tensor x, Tensor units, Tensor call_unit, "
       "Tensor call_token, Tensor call_weight, int inter, int group, "
-      "int[] offsets, int num_threads, int isa) -> ()");
+      "int[] offsets, int num_threads, int isa, int arith=0) -> ()");
   m.impl("int4_moe_cpu", torch::kCPU, &int4_moe_cpu);
   m.def("int4_moe_cpu_isa(int isa) -> int", &int4_moe_cpu_isa);
 }

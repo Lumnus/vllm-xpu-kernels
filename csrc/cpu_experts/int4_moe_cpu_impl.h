@@ -18,17 +18,31 @@
 //   out[t] = bf16(sum over the token's calls, in call order, of
 //                 float(y) * weight)              as moe_gather
 //
-// Inside a dot product the scale is applied to the partial sum of each
-// 32-element chunk (as the card's int4 GEMV does); a chunk's partial sum is
-// formed in 8 lanes of 4 terms each, with fused multiply-adds, and the lanes
-// are added in a fixed tree. The summation order inside a chunk and across
-// chunks differs from the card's (16 work-items, a sub-group reduction, and
-// a compiler allowed to contract and reassociate), so a result can differ
-// from the card's by the rounding of fp32 sums: at bf16 outputs, a fraction
-// of a bf16 step at the output's scale (measured by the self-test). The
-// scalar code (std::fma) and the AVX2 code (FMA3) take the same steps in the
-// same order, so they agree bit for bit with each other on every host; the
-// scalar one is the fallback for a host without AVX2 and FMA, and slow.
+// The card has two int4 kernels with different arithmetic inside a dot
+// product, and the op computes either (`Arith`):
+//   kChunkScaled  the int4 GEMV (moe_int4_gemv.cpp; the card takes it for a
+//                 call of at most 8 rows): the scale is applied to the fp32
+//                 partial sum of each 32-element chunk of q * x.
+//   kBf16Weights  the grouped GEMM (grouped_gemm/xe_2/gemm_xe2.hpp, every
+//                 larger call, so every call of a model with top-k above 8):
+//                 each weight is dequantised to bf16(q * s) (apply_scale: a
+//                 bf16 times fp32 multiply into bf16), then multiplied with
+//                 the bf16 input and accumulated in fp32 (DPAS).
+// The two differ in most bf16 outputs (the rounding of q * s to bf16 against
+// none), so the op must take the one the card would take for the same call,
+// per GEMM: the GEMV also needs K to be a multiple of 512, so with I = 640 a
+// small call runs GEMM1 on the GEMV and GEMM2 on the grouped GEMM. The op's
+// `arith` argument: bit 0 set, GEMM1 takes kBf16Weights; bit 1, GEMM2.
+// Either way a dot product is formed in 8 lanes with fused multiply-adds and
+// the lanes are added in a fixed tree. The summation order differs from the
+// card's (work-items, a sub-group reduction, DPAS, and a compiler allowed to
+// contract and reassociate), so a result can differ from the card's by the
+// rounding of fp32 sums only: at bf16 outputs, a fraction of a bf16 step at
+// the output's scale on a small share of the values (measured by the
+// self-test). The scalar code (std::fma) and the AVX2 code (FMA3) take the
+// same steps in the same order, so they agree bit for bit with each other on
+// every host; the scalar one is the fallback for a host without AVX2 and
+// FMA, and slow.
 
 #pragma once
 
@@ -84,6 +98,9 @@ inline uint16_t f32_to_bf16(float f) {
 
 inline float round_bf16(float f) { return bf16_to_f32(f32_to_bf16(f)); }
 
+// The arithmetic inside a dot product (see the top of this file).
+enum class Arith : int { kChunkScaled = 0, kBf16Weights = 1 };
+
 // --------------------------------------------------------------------------
 // One block of output rows of a W4A16 product, for up to kTB tokens.
 //
@@ -112,6 +129,7 @@ inline int nibble(uint8_t byte, int high) {
 }
 
 inline void rows_scalar(
+    Arith arith,
     const uint8_t* W,
     const uint16_t* S,
     int K,
@@ -125,6 +143,48 @@ inline void rows_scalar(
     int ldo) {
   const int kb = K / 2;
   const int ng = K / G;
+  if (arith == Arith::kBf16Weights) {
+    // Lane l of a chunk: bytes j0 + l and j0 + 8 + l; per byte the weight
+    // bf16(q * s) of the low nibble times the even element, then the high
+    // nibble's times the odd one, each a fused multiply-add into the lane.
+    for (int n = n0; n < n1; ++n) {
+      const uint8_t* w = W + static_cast<int64_t>(n) * kb;
+      const uint16_t* s = S + static_cast<int64_t>(n) * ng;
+      for (int t0 = 0; t0 < nt; t0 += kTB) {
+        const int tb = nt - t0 < kTB ? nt - t0 : kTB;
+        float acc[kTB][8];
+        for (int t = 0; t < tb; ++t)
+          for (int l = 0; l < 8; ++l)
+            acc[t][l] = 0.f;
+        for (int c = 0; c < K / kChunk; ++c) {
+          const float scale = bf16_to_f32(s[(c * kChunk) / G]);
+          const int j0 = c * (kChunk / 2);
+          float wl[2][8], wh[2][8];
+          for (int h = 0; h < 2; ++h)
+            for (int l = 0; l < 8; ++l) {
+              const int j = j0 + h * 8 + l;
+              wl[h][l] =
+                  round_bf16(static_cast<float>(nibble(w[j], 0)) * scale);
+              wh[h][l] =
+                  round_bf16(static_cast<float>(nibble(w[j], 1)) * scale);
+            }
+          for (int t = 0; t < tb; ++t) {
+            const float* e = xe + static_cast<int64_t>(t0 + t) * kb;
+            const float* o = xo + static_cast<int64_t>(t0 + t) * kb;
+            for (int h = 0; h < 2; ++h)
+              for (int l = 0; l < 8; ++l) {
+                const int j = j0 + h * 8 + l;
+                acc[t][l] = std::fma(wl[h][l], e[j], acc[t][l]);
+                acc[t][l] = std::fma(wh[h][l], o[j], acc[t][l]);
+              }
+          }
+        }
+        for (int t = 0; t < tb; ++t)
+          out[static_cast<int64_t>(t0 + t) * ldo + n] = lane_sum(acc[t]);
+      }
+    }
+    return;
+  }
   for (int n = n0; n < n1; ++n) {
     const uint8_t* w = W + static_cast<int64_t>(n) * kb;
     const uint16_t* s = S + static_cast<int64_t>(n) * ng;
@@ -172,7 +232,29 @@ nibbles_to_ps(__m128i bytes8) {
   return _mm256_cvtepi32_ps(fixed);
 }
 
+// 8 floats rounded to bf16 (to nearest even, as round_bf16), kept as floats.
+// The products q * s it is used on are finite.
+__attribute__((target("avx2,fma"))) inline __m256 round_bf16_ps(__m256 v) {
+  const __m256i b = _mm256_castps_si256(v);
+  const __m256i lsb =
+      _mm256_and_si256(_mm256_srli_epi32(b, 16), _mm256_set1_epi32(1));
+  const __m256i r =
+      _mm256_add_epi32(b, _mm256_add_epi32(lsb, _mm256_set1_epi32(0x7fff)));
+  return _mm256_castsi256_ps(
+      _mm256_and_si256(r, _mm256_set1_epi32(static_cast<int>(0xffff0000u))));
+}
+
+// Per lane, table[idx] for raw nibbles idx 0..15: lo holds 0..7, hi 8..15.
+__attribute__((target("avx2,fma"))) inline __m256
+lut_ps(__m256 lo, __m256 hi, __m256i idx) {
+  const __m256 a = _mm256_permutevar8x32_ps(lo, idx);
+  const __m256 b = _mm256_permutevar8x32_ps(hi, idx);
+  return _mm256_blendv_ps(
+      a, b, _mm256_castsi256_ps(_mm256_slli_epi32(idx, 28)));
+}
+
 __attribute__((target("avx2,fma"))) inline void rows_avx2(
+    Arith arith,
     const uint8_t* W,
     const uint16_t* S,
     int K,
@@ -187,6 +269,8 @@ __attribute__((target("avx2,fma"))) inline void rows_avx2(
   const int kb = K / 2;
   const int ng = K / G;
   const __m128i lo_mask = _mm_set1_epi8(0x0F);
+  const __m256 q_lo = _mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7);
+  const __m256 q_hi = _mm256_setr_ps(-8, -7, -6, -5, -4, -3, -2, -1);
   for (int n = n0; n < n1; ++n) {
     const uint8_t* w = W + static_cast<int64_t>(n) * kb;
     const uint16_t* s = S + static_cast<int64_t>(n) * ng;
@@ -195,6 +279,9 @@ __attribute__((target("avx2,fma"))) inline void rows_avx2(
       __m256 acc[kTB];
       for (int t = 0; t < kTB; ++t)
         acc[t] = _mm256_setzero_ps();
+      // kBf16Weights: bf16(q * s) of the current group for the nibbles 0..7
+      // (q 0..7) and 8..15 (q -8..-1).
+      __m256 lut_lo = _mm256_setzero_ps(), lut_hi = _mm256_setzero_ps();
       for (int c = 0; c < K / kChunk; ++c) {
         const __m256 scale = _mm256_set1_ps(bf16_to_f32(s[(c * kChunk) / G]));
         const int j0 = c * (kChunk / 2);
@@ -202,6 +289,30 @@ __attribute__((target("avx2,fma"))) inline void rows_avx2(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(w + j0));
         const __m128i lo = _mm_and_si128(raw, lo_mask);
         const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lo_mask);
+        if (arith == Arith::kBf16Weights) {
+          // The grouped GEMM's weights bf16(q * s), looked up by nibble in
+          // the group's table, fused into the lanes in the scalar code's
+          // order (low then high nibble, first then second half).
+          if ((c * kChunk) % G == 0) {
+            lut_lo = round_bf16_ps(_mm256_mul_ps(q_lo, scale));
+            lut_hi = round_bf16_ps(_mm256_mul_ps(q_hi, scale));
+          }
+          const __m256 lo0 = lut_ps(lut_lo, lut_hi, _mm256_cvtepu8_epi32(lo));
+          const __m256 hi0 = lut_ps(lut_lo, lut_hi, _mm256_cvtepu8_epi32(hi));
+          const __m256 lo1 = lut_ps(
+              lut_lo, lut_hi, _mm256_cvtepu8_epi32(_mm_srli_si128(lo, 8)));
+          const __m256 hi1 = lut_ps(
+              lut_lo, lut_hi, _mm256_cvtepu8_epi32(_mm_srli_si128(hi, 8)));
+          for (int t = 0; t < tb; ++t) {
+            const float* e = xe + static_cast<int64_t>(t0 + t) * kb + j0;
+            const float* o = xo + static_cast<int64_t>(t0 + t) * kb + j0;
+            acc[t] = _mm256_fmadd_ps(lo0, _mm256_loadu_ps(e), acc[t]);
+            acc[t] = _mm256_fmadd_ps(hi0, _mm256_loadu_ps(o), acc[t]);
+            acc[t] = _mm256_fmadd_ps(lo1, _mm256_loadu_ps(e + 8), acc[t]);
+            acc[t] = _mm256_fmadd_ps(hi1, _mm256_loadu_ps(o + 8), acc[t]);
+          }
+          continue;
+        }
         const __m256 lo0 = nibbles_to_ps(lo);
         const __m256 hi0 = nibbles_to_ps(hi);
         const __m256 lo1 = nibbles_to_ps(_mm_srli_si128(lo, 8));
@@ -247,6 +358,7 @@ inline Isa resolve_isa(Isa want) {
 
 inline void rows(
     Isa isa,
+    Arith arith,
     const uint8_t* W,
     const uint16_t* S,
     int K,
@@ -260,11 +372,11 @@ inline void rows(
     int ldo) {
 #if INT4_MOE_CPU_X86
   if (isa == Isa::kAvx2) {
-    rows_avx2(W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
+    rows_avx2(arith, W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
     return;
   }
 #endif
-  rows_scalar(W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
+  rows_scalar(arith, W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
 }
 
 // --------------------------------------------------------------------------
@@ -429,8 +541,11 @@ inline void run_calls(
     const int32_t* call_unit,
     const int32_t* call_token,
     const float* call_weight,
-    int64_t C) {
+    int64_t C,
+    int arith = 0) {
   check_layout(L);
+  const Arith arith1 = (arith & 1) ? Arith::kBf16Weights : Arith::kChunkScaled;
+  const Arith arith2 = (arith & 2) ? Arith::kBf16Weights : Arith::kChunkScaled;
   isa = resolve_isa(isa);
   const int H = L.hidden, I = L.inter, G = L.group;
   std::memset(out, 0, static_cast<size_t>(T) * H * sizeof(uint16_t));
@@ -514,6 +629,7 @@ inline void run_calls(
     const int nt = static_cast<int>(base[e + 1] - base[e]);
     rows(
         isa,
+        arith1,
         u + L.off_w13,
         reinterpret_cast<const uint16_t*>(u + L.off_s13),
         H,
@@ -553,6 +669,7 @@ inline void run_calls(
     const int nt = static_cast<int>(base[e + 1] - base[e]);
     rows(
         isa,
+        arith2,
         u + L.off_w2,
         reinterpret_cast<const uint16_t*>(u + L.off_s2),
         I,
