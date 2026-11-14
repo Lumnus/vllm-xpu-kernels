@@ -998,7 +998,10 @@ using AlignedFloats = std::vector<float, AlignedAllocator<float, 64>>;
 constexpr int kRows1 = 16;
 constexpr int kRows2 = 16;
 
-// out [T, H] bf16 is overwritten: zero for tokens without calls.
+// out [T, H] bf16 is overwritten: zero for tokens without calls. With
+// call_x_row, call c reads its input from row call_x_row[c] of x [x_rows, H]
+// (call_token then names only its output row): a caller that wants one
+// output row per call needs no gathered copy of the inputs.
 inline void run_calls(
     Pool& pool,
     Isa isa,
@@ -1012,7 +1015,9 @@ inline void run_calls(
     const int32_t* call_token,
     const float* call_weight,
     int64_t C,
-    int arith = 0) {
+    int arith = 0,
+    const int32_t* call_x_row = nullptr,
+    int64_t x_rows = 0) {
   check_layout(L);
   if (arith < 0 || arith > 3)
     throw std::runtime_error("int4_moe_cpu: arith is 0 to 3");
@@ -1035,6 +1040,10 @@ inline void run_calls(
       throw std::runtime_error(
           "int4_moe_cpu: calls must be in token order (call " +
           std::to_string(c) + ")");
+    if (call_x_row && (call_x_row[c] < 0 || call_x_row[c] >= x_rows))
+      throw std::runtime_error(
+          "int4_moe_cpu: call " + std::to_string(c) + " reads input row " +
+          std::to_string(call_x_row[c]) + " of " + std::to_string(x_rows));
   }
   // Group the calls by unit, keeping call order inside a group.
   std::vector<int32_t> units_used;
@@ -1086,7 +1095,8 @@ inline void run_calls(
   auto convert = [&](int64_t c) {
     convert_row(
         isa,
-        x + static_cast<int64_t>(call_token[c]) * H,
+        x + static_cast<int64_t>(call_x_row ? call_x_row[c] : call_token[c]) *
+                H,
         xe.data() + row_of[c] * (H / 2),
         xo.data() + row_of[c] * (H / 2),
         H);

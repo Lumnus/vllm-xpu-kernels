@@ -4,6 +4,7 @@ torch at the same rounding points: the int4 GEMV's (arith 0, scale per
 32-element chunk sum) and the grouped GEMM's (weights rounded to bf16(q * s);
 arith bit 0 for GEMM1, bit 1 for GEMM2). Runs on the CPU only (no device)."""
 
+import numpy as np
 import pytest
 import torch
 
@@ -339,3 +340,127 @@ def test_configure_pins_and_keeps_the_result():
         assert configure([], -1) == 0
     after = _run(x, units, cu, ct, cw, 128, 32, threads=3)
     assert torch.equal(before.view(torch.int16), after.view(torch.int16))
+
+
+def _select_reference(ids, tier, slot, logical_of_slot):
+    """What int4_moe_cpu_select lists, in numpy: the host calls' flat pair
+    index and logical expert, the distinct experts in order of first use,
+    the calls per tier, and the pair map."""
+    flat = ids.reshape(-1)
+    t = tier[flat]
+    pair = np.flatnonzero(t == 2)
+    logical = logical_of_slot[slot[flat[pair]]]
+    experts = list(dict.fromkeys(logical.tolist()))
+    row_map = np.full(flat.size, -1, dtype=np.int32)
+    row_map[pair] = np.arange(pair.size)
+    counts = [int((t == v).sum()) for v in (0, 1, 2)]
+    return pair, logical, experts, counts, row_map.reshape(ids.shape)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("tokens", [1, 8, 2048])
+def test_select_lists_the_host_calls_as_numpy_does(dtype, tokens):
+    select = torch.ops._xpu_C.int4_moe_cpu_select
+    rng = np.random.default_rng(tokens)
+    g, k, slots = 512, 10, 256
+    tier = rng.choice(np.array([-1, 0, 1, 2], dtype=np.int8), size=g)
+    slot = rng.integers(0, slots, size=g).astype(np.int64)
+    logical_of_slot = rng.permutation(400)[:slots].astype(np.int64)
+    ids = torch.from_numpy(rng.integers(0, g, size=(tokens, k))).to(dtype)
+    n = ids.numel()
+    pair = torch.empty(n, dtype=torch.int64)
+    logical = torch.empty(n, dtype=torch.int64)
+    experts = torch.empty(n, dtype=torch.int64)
+    row_map = torch.full((tokens, k), 7, dtype=torch.int32)
+    card, pinned, host, written, distinct, bad = select(
+        ids,
+        torch.from_numpy(tier),
+        torch.from_numpy(slot),
+        torch.from_numpy(logical_of_slot),
+        pair,
+        logical,
+        experts,
+        row_map,
+    )
+    want = _select_reference(ids.numpy(), tier, slot, logical_of_slot)
+    assert bad == -1 and written == host == want[0].size
+    assert [card, pinned, host] == want[3]
+    assert pair[:written].numpy().tolist() == want[0].tolist()
+    assert logical[:written].numpy().tolist() == want[1].tolist()
+    assert experts[:distinct].tolist() == want[2]
+    assert torch.equal(row_map, torch.from_numpy(want[4]))
+    # without the map (an empty tensor): the same lists
+    again = select(
+        ids,
+        torch.from_numpy(tier),
+        torch.from_numpy(slot),
+        torch.from_numpy(logical_of_slot),
+        pair,
+        logical,
+        experts,
+        torch.empty(0, dtype=torch.int32),
+    )
+    assert again == [card, pinned, host, written, distinct, bad]
+    assert experts[:distinct].tolist() == want[2]
+
+
+def test_select_names_the_first_id_out_of_range():
+    select = torch.ops._xpu_C.int4_moe_cpu_select
+    tier = torch.full((8,), 2, dtype=torch.int8)
+    slot = torch.arange(8, dtype=torch.int64)
+    out = [torch.empty(6, dtype=torch.int64) for _ in range(3)]
+    for ids, at in (([[0, 1, 8], [2, 3, 4]], 2), ([[0, 1, 2], [-1, 3, 4]], 3)):
+        res = select(
+            torch.tensor(ids, dtype=torch.int32),
+            tier,
+            slot,
+            slot,
+            *out,
+            torch.empty(0, dtype=torch.int32),
+        )
+        assert res[-1] == at
+
+
+@pytest.mark.parametrize("arith", [0, 3])
+def test_one_row_per_call_reads_the_inputs_in_place(arith):
+    """call_x_row: each call reads x's row it names and writes its own output
+    row; the same bits as the op run over the gathered inputs (one call per
+    row, weight 1), without the gather."""
+    gen = torch.Generator().manual_seed(17)
+    hidden, inter, group = 256, 128, 64
+    offsets, _ = _layout(hidden, inter, group)
+    units = _units(4, hidden, inter, group, gen)
+    x = torch.randn(6, hidden, generator=gen).to(torch.bfloat16)
+    cu, ct, _ = _calls(6, 4, 3, gen)
+    n = cu.numel()
+    rows = torch.arange(n, dtype=torch.int32)
+    ones = torch.ones(n, dtype=torch.float32)
+    gathered = x.index_select(0, ct.long())
+    want = torch.empty_like(gathered)
+    OP(
+        want,
+        gathered,
+        units,
+        cu,
+        rows,
+        ones,
+        inter,
+        group,
+        offsets,
+        3,
+        0,
+        arith,
+    )
+    got = torch.full((n, hidden), 7.0, dtype=torch.bfloat16)
+    OP(
+        got, x, units, cu, rows, ones, inter, group, offsets, 3, 0, arith,
+        call_x_row=ct,
+    )  # fmt: skip
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+    with pytest.raises(RuntimeError, match="reads input row 6 of 6"):
+        bad = ct.clone()
+        bad[-1] = 6
+        OP(
+            got, x, units, cu, rows, ones, inter, group, offsets, 3, 0, arith,
+            call_x_row=bad,
+        )  # fmt: skip

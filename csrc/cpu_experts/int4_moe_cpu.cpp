@@ -2,9 +2,11 @@
 
 #include "cpu_experts/int4_moe_cpu.h"
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "cpu_experts/int4_moe_cpu_impl.h"
@@ -57,7 +59,8 @@ void int4_moe_cpu(
     c10::IntArrayRef offsets,
     int64_t num_threads,
     int64_t isa,
-    int64_t arith) {
+    int64_t arith,
+    const std::optional<torch::Tensor>& call_x_row) {
   check_cpu(out, "out");
   check_cpu(x, "x");
   check_cpu(units, "units");
@@ -67,9 +70,13 @@ void int4_moe_cpu(
   TORCH_CHECK(
       x.dim() == 2 && x.scalar_type() == at::kBFloat16,
       "int4_moe_cpu: x must be [T, H] bfloat16");
+  const bool x_rows = call_x_row.has_value();
   TORCH_CHECK(
-      out.sizes() == x.sizes() && out.scalar_type() == at::kBFloat16,
-      "int4_moe_cpu: out must be bfloat16 shaped like x");
+      out.scalar_type() == at::kBFloat16 &&
+          (x_rows ? out.dim() == 2 && out.size(1) == x.size(1)
+                  : out.sizes() == x.sizes()),
+      "int4_moe_cpu: out must be bfloat16 shaped like x (with call_x_row: "
+      "[rows, H])");
   TORCH_CHECK(
       units.dim() == 2 && units.scalar_type() == at::kByte,
       "int4_moe_cpu: units must be [S, U] uint8");
@@ -82,6 +89,12 @@ void int4_moe_cpu(
   TORCH_CHECK(
       call_token.numel() == C && call_weight.numel() == C,
       "int4_moe_cpu: the call lists differ in length");
+  if (x_rows) {
+    check_cpu(*call_x_row, "call_x_row");
+    TORCH_CHECK(
+        call_x_row->scalar_type() == at::kInt && call_x_row->numel() == C,
+        "int4_moe_cpu: call_x_row is int32, one per call");
+  }
   TORCH_CHECK(
       offsets.size() == 4,
       "int4_moe_cpu: offsets are (w13, w2, w13 scales, w2 scales)");
@@ -109,14 +122,16 @@ void int4_moe_cpu(
         L,
         reinterpret_cast<uint16_t*>(out.data_ptr()),
         reinterpret_cast<const uint16_t*>(x.data_ptr()),
-        x.size(0),
+        out.size(0),
         units.data_ptr<uint8_t>(),
         units.size(0),
         call_unit.data_ptr<int32_t>(),
         call_token.data_ptr<int32_t>(),
         call_weight.data_ptr<float>(),
         C,
-        static_cast<int>(arith));
+        static_cast<int>(arith),
+        x_rows ? call_x_row->data_ptr<int32_t>() : nullptr,
+        x.size(0));
   } catch (const std::runtime_error& e) {
     TORCH_CHECK(false, e.what());
   }
@@ -161,4 +176,104 @@ int64_t int4_moe_cpu_isa(int64_t isa) {
     TORCH_CHECK(false, e.what());
   }
   return 0;
+}
+
+// One pass over a layer call's routing: which calls the host computes, as the
+// caller's Python would list them with numpy (see the header). No allocation
+// beyond a per-thread table of seen experts.
+std::vector<int64_t> int4_moe_cpu_select(
+    const torch::Tensor& ids,
+    const torch::Tensor& tier,
+    const torch::Tensor& slot,
+    const torch::Tensor& logical_of_slot,
+    torch::Tensor& pair,
+    torch::Tensor& logical,
+    torch::Tensor& experts,
+    torch::Tensor& row_map) {
+  check_cpu(ids, "ids");
+  check_cpu(tier, "tier");
+  check_cpu(slot, "slot");
+  check_cpu(logical_of_slot, "logical_of_slot");
+  check_cpu(pair, "pair");
+  check_cpu(logical, "logical");
+  check_cpu(experts, "experts");
+  TORCH_CHECK(
+      ids.scalar_type() == torch::kInt32 || ids.scalar_type() == torch::kInt64,
+      "int4_moe_cpu_select: ids must be int32 or int64");
+  TORCH_CHECK(
+      tier.scalar_type() == torch::kInt8, "int4_moe_cpu_select: tier is int8");
+  TORCH_CHECK(
+      slot.scalar_type() == torch::kInt64 &&
+          logical_of_slot.scalar_type() == torch::kInt64 &&
+          pair.scalar_type() == torch::kInt64 &&
+          logical.scalar_type() == torch::kInt64 &&
+          experts.scalar_type() == torch::kInt64,
+      "int4_moe_cpu_select: slot, logical_of_slot, pair, logical and experts "
+      "are int64");
+  TORCH_CHECK(
+      slot.numel() == tier.numel(),
+      "int4_moe_cpu_select: tier and slot have one entry per physical id");
+  const int64_t n = ids.numel();
+  TORCH_CHECK(
+      pair.numel() >= n && logical.numel() >= n && experts.numel() >= n,
+      "int4_moe_cpu_select: pair, logical and experts need room for every id");
+  const bool with_map = row_map.numel() > 0;
+  if (with_map) {
+    check_cpu(row_map, "row_map");
+    TORCH_CHECK(
+        row_map.scalar_type() == torch::kInt32 && row_map.numel() == n,
+        "int4_moe_cpu_select: row_map is int32 with one entry per id");
+  }
+  const int64_t num_global = tier.numel();
+  const int64_t num_slots = logical_of_slot.numel();
+  const int8_t* tr = tier.data_ptr<int8_t>();
+  const int64_t* sl = slot.data_ptr<int64_t>();
+  const int64_t* lg = logical_of_slot.data_ptr<int64_t>();
+  int64_t* po = pair.data_ptr<int64_t>();
+  int64_t* lo = logical.data_ptr<int64_t>();
+  int64_t* eo = experts.data_ptr<int64_t>();
+  int32_t* mo = with_map ? row_map.data_ptr<int32_t>() : nullptr;
+  // counts[t + 1] for tier t in -1 (another rank's), FAST, POOL, HOST
+  int64_t counts[4] = {0, 0, 0, 0};
+  int64_t calls = 0, distinct = 0, bad = -1;
+  // Seen experts: a stamp per logical expert, this call's number when seen.
+  thread_local std::vector<uint32_t> seen;
+  thread_local uint32_t stamp = 0;
+  if (++stamp == 0) {  // wrapped: clear once
+    std::fill(seen.begin(), seen.end(), 0u);
+    stamp = 1;
+  }
+  auto body = [&](auto* id) {
+    for (int64_t i = 0; i < n; ++i) {
+      const int64_t g = static_cast<int64_t>(id[i]);
+      if (g < 0 || g >= num_global) {
+        bad = i;
+        return;
+      }
+      const int8_t t = tr[g];
+      if (t >= -1 && t <= 2) ++counts[t + 1];
+      if (mo) mo[i] = -1;
+      if (t != 2) continue;  // HOST = 2
+      const int64_t s = sl[g];
+      TORCH_CHECK(
+          s >= 0 && s < num_slots,
+          "int4_moe_cpu_select: a host-tier physical id has no slot");
+      const int64_t e = lg[s];
+      TORCH_CHECK(e >= 0, "int4_moe_cpu_select: a negative logical expert");
+      if (mo) mo[i] = static_cast<int32_t>(calls);
+      po[calls] = i;
+      lo[calls] = e;
+      ++calls;
+      if (static_cast<uint64_t>(e) >= seen.size()) seen.resize(e + 1, 0u);
+      if (seen[e] != stamp) {
+        seen[e] = stamp;
+        eo[distinct++] = e;
+      }
+    }
+  };
+  if (ids.scalar_type() == torch::kInt32)
+    body(ids.data_ptr<int32_t>());
+  else
+    body(ids.data_ptr<int64_t>());
+  return {counts[1], counts[2], counts[3], calls, distinct, bad};
 }
