@@ -19,14 +19,28 @@
 //   out[t] = bf16(sum over the token's calls, in call order, of
 //                 float(y) * weight)              as moe_gather
 //
-// Inside a dot product the scale is applied to the partial sum of each
-// 32-element chunk (as the card's int4 GEMV does); a chunk's partial sum is
-// formed in 8 lanes of 4 terms each, with fused multiply-adds, and the lanes
-// are added in a fixed tree. The summation order inside a chunk and across
-// chunks differs from the card's (16 work-items, a sub-group reduction, and
-// a compiler allowed to contract and reassociate), so a result can differ
-// from the card's by the rounding of fp32 sums: at bf16 outputs, a fraction
-// of a bf16 step at the output's scale (measured by the self-test).
+// The card has two int4 kernels with different arithmetic inside a dot
+// product, and the op computes either (`Arith`):
+//   kChunkScaled  the int4 GEMV (moe_int4_gemv.cpp; the card takes it for a
+//                 call of at most 8 rows): the scale is applied to the fp32
+//                 partial sum of each 32-element chunk of q * x.
+//   kBf16Weights  the grouped GEMM (grouped_gemm/xe_2/gemm_xe2.hpp, every
+//                 larger call, so every call of a model with top-k above 8):
+//                 each weight is dequantised to bf16(q * s) (apply_scale: a
+//                 bf16 times fp32 multiply into bf16), then multiplied with
+//                 the bf16 input and accumulated in fp32 (DPAS).
+// The two differ in most bf16 outputs (the rounding of q * s to bf16 against
+// none), so the op must take the one the card would take for the same call,
+// per GEMM: the GEMV also needs K to be a multiple of 512, so with I = 640 a
+// small call runs GEMM1 on the GEMV and GEMM2 on the grouped GEMM. The op's
+// `arith` argument: bit 0 set, GEMM1 takes kBf16Weights; bit 1, GEMM2.
+// Either way a dot product is formed in 8 lanes with fused multiply-adds and
+// the lanes are added in a fixed tree. The summation order differs from the
+// card's (work-items, a sub-group reduction, DPAS, and a compiler allowed to
+// contract and reassociate), so a result can differ from the card's by the
+// rounding of fp32 sums only: at bf16 outputs, a fraction of a bf16 step at
+// the output's scale on a small share of the values (measured by the
+// self-test).
 //
 // Structure (what can be replaced without touching the rest):
 //   1. rows(): the one inner function, "these output rows of one expert's
@@ -108,6 +122,9 @@ inline uint16_t f32_to_bf16(float f) {
 
 inline float round_bf16(float f) { return bf16_to_f32(f32_to_bf16(f)); }
 
+// The arithmetic inside a dot product (see the top of this file).
+enum class Arith : int { kChunkScaled = 0, kBf16Weights = 1 };
+
 // --------------------------------------------------------------------------
 // The inner function: output rows [n0, n1) of a W4A16 product, for nt tokens.
 //
@@ -116,15 +133,18 @@ inline float round_bf16(float f) { return bf16_to_f32(f32_to_bf16(f)); }
 //   (xe[t * K/2 + j] = x[t][2j], xo[...] = x[t][2j + 1]).
 // out[t * ldo + n] = the fp32 dot product of row n with token t.
 //
-// The steps, per row and token: for each 32-element chunk c (16 bytes,
-// j0 = 16c), lane l (0..7) forms
+// The steps, per row and token (kBf16Weights: below), for each
+// 32-element chunk c (16 bytes, j0 = 16c), lane l (0..7) forms
 //   d_l = lo(j0+l) * xe[j0+l]                       (a product)
 //   d_l = fma(hi(j0+l),   xo[j0+l],   d_l)
 //   d_l = fma(lo(j0+8+l), xe[j0+8+l], d_l)
 //   d_l = fma(hi(j0+8+l), xo[j0+8+l], d_l)
 //   acc_l = fma(d_l, scale(c), acc_l)
-// and the result is lane_sum(acc). An instruction set may vectorise across
-// lanes, rows or tokens, never across this order.
+// and the result is lane_sum(acc). kBf16Weights: with w = bf16(q * s(c)),
+//   acc_l = fma(w(lo(j0+l)), xe[j0+l], acc_l), then hi(j0+l) with xo[j0+l],
+//   lo(j0+8+l) with xe[j0+8+l], hi(j0+8+l) with xo[j0+8+l].
+// An instruction set may vectorise across lanes, rows or tokens, never
+// across this order.
 // --------------------------------------------------------------------------
 
 constexpr int kChunk = 32;  // elements per scaled partial sum (16 bytes)
@@ -146,6 +166,7 @@ inline int nibble(uint8_t byte, int high) {
 }
 
 inline void rows_scalar(
+    Arith arith,
     const uint8_t* W,
     const uint16_t* S,
     int K,
@@ -159,6 +180,48 @@ inline void rows_scalar(
     int ldo) {
   const int kb = K / 2;
   const int ng = K / G;
+  if (arith == Arith::kBf16Weights) {
+    // Lane l of a chunk: bytes j0 + l and j0 + 8 + l; per byte the weight
+    // bf16(q * s) of the low nibble times the even element, then the high
+    // nibble's times the odd one, each a fused multiply-add into the lane.
+    for (int n = n0; n < n1; ++n) {
+      const uint8_t* w = W + static_cast<int64_t>(n) * kb;
+      const uint16_t* s = S + static_cast<int64_t>(n) * ng;
+      for (int t0 = 0; t0 < nt; t0 += kTB) {
+        const int tb = nt - t0 < kTB ? nt - t0 : kTB;
+        float acc[kTB][8];
+        for (int t = 0; t < tb; ++t)
+          for (int l = 0; l < 8; ++l)
+            acc[t][l] = 0.f;
+        for (int c = 0; c < K / kChunk; ++c) {
+          const float scale = bf16_to_f32(s[(c * kChunk) / G]);
+          const int j0 = c * (kChunk / 2);
+          float wl[2][8], wh[2][8];
+          for (int h = 0; h < 2; ++h)
+            for (int l = 0; l < 8; ++l) {
+              const int j = j0 + h * 8 + l;
+              wl[h][l] =
+                  round_bf16(static_cast<float>(nibble(w[j], 0)) * scale);
+              wh[h][l] =
+                  round_bf16(static_cast<float>(nibble(w[j], 1)) * scale);
+            }
+          for (int t = 0; t < tb; ++t) {
+            const float* e = xe + static_cast<int64_t>(t0 + t) * kb;
+            const float* o = xo + static_cast<int64_t>(t0 + t) * kb;
+            for (int h = 0; h < 2; ++h)
+              for (int l = 0; l < 8; ++l) {
+                const int j = j0 + h * 8 + l;
+                acc[t][l] = std::fma(wl[h][l], e[j], acc[t][l]);
+                acc[t][l] = std::fma(wh[h][l], o[j], acc[t][l]);
+              }
+          }
+        }
+        for (int t = 0; t < tb; ++t)
+          out[static_cast<int64_t>(t0 + t) * ldo + n] = lane_sum(acc[t]);
+      }
+    }
+    return;
+  }
   for (int n = n0; n < n1; ++n) {
     const uint8_t* w = W + static_cast<int64_t>(n) * kb;
     const uint16_t* s = S + static_cast<int64_t>(n) * ng;
@@ -258,17 +321,147 @@ __attribute__((target("avx2,fma"), always_inline)) inline void unpack_chunk(
   #endif
 }
 
+// 8 floats rounded to bf16 (to nearest even, as round_bf16), kept as floats.
+// The products q * s it is used on are finite.
+__attribute__((target("avx2,fma"))) inline __m256 round_bf16_ps(__m256 v) {
+  const __m256i b = _mm256_castps_si256(v);
+  const __m256i lsb =
+      _mm256_and_si256(_mm256_srli_epi32(b, 16), _mm256_set1_epi32(1));
+  const __m256i r =
+      _mm256_add_epi32(b, _mm256_add_epi32(lsb, _mm256_set1_epi32(0x7fff)));
+  return _mm256_castsi256_ps(
+      _mm256_and_si256(r, _mm256_set1_epi32(static_cast<int>(0xffff0000u))));
+}
+
+// The grouped GEMM's weights of one group, bf16(q * s) by raw nibble u
+// (0..7: q = u; 8..15: q = u - 16), as two 16-byte tables broadcast to both
+// lanes: tl holds the low byte of each bf16, th the high byte. Looked up
+// with vpshufb (two per 8 weights) rather than vpermps, which costs several
+// micro-ops on Zen 2.
+struct CardTable {
+  __m256i tl, th;
+};
+
+__attribute__((target("avx2,fma"), always_inline)) inline CardTable
+card_table(__m256 scale) {
+  const __m256 lo = round_bf16_ps(
+      _mm256_mul_ps(_mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7), scale));
+  const __m256 hi = round_bf16_ps(
+      _mm256_mul_ps(_mm256_setr_ps(-8, -7, -6, -5, -4, -3, -2, -1), scale));
+  // the 16 bf16 words in u order
+  __m256i w = _mm256_packus_epi32(
+      _mm256_srli_epi32(_mm256_castps_si256(lo), 16),
+      _mm256_srli_epi32(_mm256_castps_si256(hi), 16));
+  w = _mm256_permute4x64_epi64(w, 0xD8);
+  // per lane: the 8 low bytes, then the 8 high bytes
+  const __m256i split = _mm256_setr_epi8(
+      0,
+      2,
+      4,
+      6,
+      8,
+      10,
+      12,
+      14,
+      1,
+      3,
+      5,
+      7,
+      9,
+      11,
+      13,
+      15,
+      0,
+      2,
+      4,
+      6,
+      8,
+      10,
+      12,
+      14,
+      1,
+      3,
+      5,
+      7,
+      9,
+      11,
+      13,
+      15);
+  w = _mm256_shuffle_epi8(w, split);
+  const __m128i a = _mm256_castsi256_si128(w);
+  const __m128i b = _mm256_extracti128_si256(w, 1);
+  return {
+      _mm256_broadcastsi128_si256(_mm_unpacklo_epi64(a, b)),
+      _mm256_broadcastsi128_si256(_mm_unpackhi_epi64(a, b))};
+}
+
+// The 16 bytes of a chunk to the four lane vectors of grouped-GEMM weights
+// (lo0/hi0: bytes 0..7, low/high nibble; lo1/hi1: bytes 8..15). The bytes
+// are widened to 16-bit lanes in the order b0..3 b8..11 | b4..7 b12..15, so
+// that interleaving each lane's words with zeros (the float of a bf16 is the
+// bf16 in the high half) gives b0..7 and b8..15 in lane order. Per 16
+// weights: two vpshufb against the group's tables (low byte, high byte; a
+// control byte of 0x80 gives zero), an or, two unpacks.
+__attribute__((target("avx2,fma"), always_inline)) inline void card_chunk(
+    const CardTable& t,
+    const uint8_t* p,
+    __m256& lo0,
+    __m256& hi0,
+    __m256& lo1,
+    __m256& hi1) {
+  const __m128i order =
+      _mm_setr_epi8(0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15);
+  const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+  const __m256i v = _mm256_cvtepu8_epi16(_mm_shuffle_epi8(raw, order));
+  const __m256i fill_hi = _mm256_set1_epi16(static_cast<short>(0x8000));
+  const __m256i fill_lo = _mm256_set1_epi16(0x0080);
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i lo = _mm256_and_si256(v, _mm256_set1_epi16(0x0F));
+  const __m256i hi = _mm256_srli_epi16(v, 4);
+  const __m256i wl = _mm256_or_si256(
+      _mm256_shuffle_epi8(t.tl, _mm256_or_si256(lo, fill_hi)),
+      _mm256_shuffle_epi8(
+          t.th, _mm256_or_si256(_mm256_slli_epi16(lo, 8), fill_lo)));
+  const __m256i wh = _mm256_or_si256(
+      _mm256_shuffle_epi8(t.tl, _mm256_or_si256(hi, fill_hi)),
+      _mm256_shuffle_epi8(
+          t.th, _mm256_or_si256(_mm256_slli_epi16(hi, 8), fill_lo)));
+  lo0 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero, wl));
+  lo1 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero, wl));
+  hi0 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero, wh));
+  hi1 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero, wh));
+}
+
 // One 32-element chunk of R rows for NT tokens: each row's nibbles are
-// unpacked once and used for every token.
-template <int NT, int R>
+// unpacked once and used for every token. A = kChunkScaled: the GEMV's
+// steps (a chunk sum d, then acc += d * scale); A = kBf16Weights: the grouped
+// GEMM's (each weight bf16(q * s) from the group's table tlo/thi, fused into
+// the lane in the scalar code's order).
+template <int NT, int R, Arith A>
 __attribute__((target("avx2,fma"), always_inline)) inline void chunk_avx2(
     const uint8_t* const* w,
     const __m256* scale,
+    const CardTable* tab,
     int j0,
     int64_t kb,
     const float* xe,
     const float* xo,
     __m256 (*acc)[NT]) {
+  if constexpr (A == Arith::kBf16Weights) {
+    for (int r = 0; r < R; ++r) {
+      __m256 lo0, hi0, lo1, hi1;
+      card_chunk(tab[r], w[r] + j0, lo0, hi0, lo1, hi1);
+      for (int t = 0; t < NT; ++t) {
+        const float* e = xe + t * kb + j0;
+        const float* o = xo + t * kb + j0;
+        __m256 a = _mm256_fmadd_ps(lo0, _mm256_loadu_ps(e), acc[r][t]);
+        a = _mm256_fmadd_ps(hi0, _mm256_loadu_ps(o), a);
+        a = _mm256_fmadd_ps(lo1, _mm256_loadu_ps(e + 8), a);
+        acc[r][t] = _mm256_fmadd_ps(hi1, _mm256_loadu_ps(o + 8), a);
+      }
+    }
+    return;
+  }
   for (int r = 0; r < R; ++r) {
     __m256 lo0, hi0, lo1, hi1;
     unpack_chunk(w[r] + j0, lo0, hi0, lo1, hi1);
@@ -288,7 +481,7 @@ __attribute__((target("avx2,fma"), always_inline)) inline void chunk_avx2(
 // core independent chains to overlap; a decode token has little other work
 // per row), NT tokens per pass; the accumulators come from and go back to
 // acc[(n - n0) * NT + t] (so a row can be continued over the next groups).
-template <int NT, int R>
+template <int NT, int R, Arith A>
 __attribute__((target("avx2,fma"))) inline void panel_avx2(
     const uint8_t* W,
     const uint16_t* S,
@@ -315,8 +508,10 @@ __attribute__((target("avx2,fma"))) inline void panel_avx2(
     }
     for (int g = g0; g < g1; ++g) {
       __m256 scale[R];
+      CardTable tab[R];
       for (int r = 0; r < R; ++r) {
         scale[r] = _mm256_set1_ps(bf16_to_f32(s[r][g]));
+        if constexpr (A == Arith::kBf16Weights) tab[r] = card_table(scale[r]);
         // The same bytes kPrefetchRows rows further on (rows are
         // contiguous): a thread streams its rows from memory at a few GB/s
         // and the hardware prefetchers stop at page boundaries. A prefetch
@@ -328,9 +523,10 @@ __attribute__((target("avx2,fma"))) inline void panel_avx2(
               _MM_HINT_T0);
       }
       for (int cc = 0; cc < chunks_per_group; ++cc)
-        chunk_avx2<NT, R>(
+        chunk_avx2<NT, R, A>(
             w,
             scale,
+            tab,
             (g * chunks_per_group + cc) * (kChunk / 2),
             kb,
             xe,
@@ -342,7 +538,7 @@ __attribute__((target("avx2,fma"))) inline void panel_avx2(
         acc_io[(n + r - n0) * NT + t] = acc[r][t];
   }
   if (n < n1)
-    panel_avx2<NT, 1>(
+    panel_avx2<NT, 1, A>(
         W,
         S,
         kb,
@@ -362,7 +558,7 @@ __attribute__((target("avx2,fma"))) inline void panel_avx2(
 constexpr int kPanelBytes = 16 * 1024;
 constexpr int kRowBlock = 16;  // rows whose accumulators wait between panels
 
-template <int NT, int R>
+template <int NT, int R, Arith A>
 __attribute__((target("avx2,fma"))) inline void rows_avx2_nt(
     const uint8_t* W,
     const uint16_t* S,
@@ -385,7 +581,7 @@ __attribute__((target("avx2,fma"))) inline void rows_avx2_nt(
     for (int i = 0; i < (b1 - b0) * NT; ++i)
       acc[i] = _mm256_setzero_ps();
     for (int g0 = 0; g0 < ng; g0 += per_panel)
-      panel_avx2<NT, R>(
+      panel_avx2<NT, R, A>(
           W,
           S,
           kb,
@@ -417,7 +613,8 @@ constexpr int kTBAvx2 = 8;  // tokens per pass over a row (AVX2 code)
 constexpr int kR1 = INT4_MOE_CPU_R1;  // rows side by side at 1 token
 constexpr int kR2 = INT4_MOE_CPU_R2;  // rows side by side at 2 tokens
 
-__attribute__((target("avx2,fma"))) inline void rows_avx2(
+template <Arith A>
+__attribute__((target("avx2,fma"))) inline void rows_avx2_a(
     const uint8_t* W,
     const uint16_t* S,
     int K,
@@ -437,31 +634,50 @@ __attribute__((target("avx2,fma"))) inline void rows_avx2(
     float* y = out + static_cast<int64_t>(t0) * ldo;
     switch (tb) {
       case 1:
-        rows_avx2_nt<1, kR1>(W, S, K, G, n0, n1, e, o, y, ldo);
+        rows_avx2_nt<1, kR1, A>(W, S, K, G, n0, n1, e, o, y, ldo);
         break;
       case 2:
-        rows_avx2_nt<2, kR2>(W, S, K, G, n0, n1, e, o, y, ldo);
+        rows_avx2_nt<2, kR2, A>(W, S, K, G, n0, n1, e, o, y, ldo);
         break;
       case 3:
-        rows_avx2_nt<3, 1>(W, S, K, G, n0, n1, e, o, y, ldo);
+        rows_avx2_nt<3, 1, A>(W, S, K, G, n0, n1, e, o, y, ldo);
         break;
       case 4:
-        rows_avx2_nt<4, 1>(W, S, K, G, n0, n1, e, o, y, ldo);
+        rows_avx2_nt<4, 1, A>(W, S, K, G, n0, n1, e, o, y, ldo);
         break;
       case 5:
-        rows_avx2_nt<5, 1>(W, S, K, G, n0, n1, e, o, y, ldo);
+        rows_avx2_nt<5, 1, A>(W, S, K, G, n0, n1, e, o, y, ldo);
         break;
       case 6:
-        rows_avx2_nt<6, 1>(W, S, K, G, n0, n1, e, o, y, ldo);
+        rows_avx2_nt<6, 1, A>(W, S, K, G, n0, n1, e, o, y, ldo);
         break;
       case 7:
-        rows_avx2_nt<7, 1>(W, S, K, G, n0, n1, e, o, y, ldo);
+        rows_avx2_nt<7, 1, A>(W, S, K, G, n0, n1, e, o, y, ldo);
         break;
       default:
-        rows_avx2_nt<8, 1>(W, S, K, G, n0, n1, e, o, y, ldo);
+        rows_avx2_nt<8, 1, A>(W, S, K, G, n0, n1, e, o, y, ldo);
         break;
     }
   }
+}
+
+__attribute__((target("avx2,fma"))) inline void rows_avx2(
+    Arith arith,
+    const uint8_t* W,
+    const uint16_t* S,
+    int K,
+    int G,
+    int n0,
+    int n1,
+    const float* xe,
+    const float* xo,
+    int nt,
+    float* out,
+    int ldo) {
+  if (arith == Arith::kBf16Weights)
+    rows_avx2_a<Arith::kBf16Weights>(W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
+  else
+    rows_avx2_a<Arith::kChunkScaled>(W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
 }
 
 inline bool cpu_has_avx2() {
@@ -488,6 +704,7 @@ inline Isa resolve_isa(Isa want) {
 
 inline void rows(
     Isa isa,
+    Arith arith,
     const uint8_t* W,
     const uint16_t* S,
     int K,
@@ -501,11 +718,11 @@ inline void rows(
     int ldo) {
 #if INT4_MOE_CPU_X86
   if (isa == Isa::kAvx2) {
-    rows_avx2(W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
+    rows_avx2(arith, W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
     return;
   }
 #endif
-  rows_scalar(W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
+  rows_scalar(arith, W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
 }
 
 // --------------------------------------------------------------------------
@@ -794,8 +1011,13 @@ inline void run_calls(
     const int32_t* call_unit,
     const int32_t* call_token,
     const float* call_weight,
-    int64_t C) {
+    int64_t C,
+    int arith = 0) {
   check_layout(L);
+  if (arith < 0 || arith > 3)
+    throw std::runtime_error("int4_moe_cpu: arith is 0 to 3");
+  const Arith arith1 = (arith & 1) ? Arith::kBf16Weights : Arith::kChunkScaled;
+  const Arith arith2 = (arith & 2) ? Arith::kBf16Weights : Arith::kChunkScaled;
   isa = resolve_isa(isa);
   const int H = L.hidden, I = L.inter, G = L.group;
   std::memset(out, 0, static_cast<size_t>(T) * H * sizeof(uint16_t));
@@ -891,8 +1113,9 @@ inline void run_calls(
     const float* e_in = xe.data() + base[e] * (H / 2);
     const float* o_in = xo.data() + base[e] * (H / 2);
     float* hb = h.data() + base[e] * 2 * I;
-    rows(isa, w13, s13, H, G, i0, i1, e_in, o_in, nt, hb, 2 * I);
-    rows(isa, w13, s13, H, G, I + i0, I + i1, e_in, o_in, nt, hb, 2 * I);
+    rows(isa, arith1, w13, s13, H, G, i0, i1, e_in, o_in, nt, hb, 2 * I);
+    rows(
+        isa, arith1, w13, s13, H, G, I + i0, I + i1, e_in, o_in, nt, hb, 2 * I);
     for (int64_t r = base[e]; r < base[e + 1]; ++r) {
       const float* hr = h.data() + r * 2 * I;
       float* ea = ae.data() + r * (I / 2);
@@ -921,6 +1144,7 @@ inline void run_calls(
           units + static_cast<int64_t>(units_used[e]) * L.unit_bytes;
       rows(
           isa,
+          arith2,
           u + L.off_w2,
           reinterpret_cast<const uint16_t*>(u + L.off_s2),
           I,

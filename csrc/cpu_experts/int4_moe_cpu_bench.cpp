@@ -10,7 +10,7 @@
 //   ./int4_moe_cpu_bench [--threads 1,2,4,6] [--experts 256] [--reps 60]
 //                        [--gap-us 2000] [--shapes 30x1,30x2,30x8,...]
 //                        [--cores 0,1,2,...] [--spin-us 100]
-//                        [--stream-mib 1024] [--isa 0|1|2]
+//                        [--stream-mib 1024] [--isa 0|1|2] [--arith 0..3]
 // --cores pins pool worker i to cores[i]; the streaming read pins its
 // thread t to cores[t].
 // A shape EXT means E distinct experts per call, each with T tokens (the
@@ -148,6 +148,7 @@ int main(int argc, char** argv) {
   int stream_mib = 1024;
   int isa_arg = 0;
   int spin_us = -1;
+  int arith = 0;
   for (int a = 1; a + 1 < argc; a += 2) {
     const std::string k = argv[a], v = argv[a + 1];
     if (k == "--threads")
@@ -164,6 +165,8 @@ int main(int argc, char** argv) {
       cores = parse_list(v);
     else if (k == "--stream-mib")
       stream_mib = std::atoi(v.c_str());
+    else if (k == "--arith")
+      arith = std::atoi(v.c_str());
     else if (k == "--spin-us")
       spin_us = std::atoi(v.c_str());
     else if (k == "--isa")
@@ -191,7 +194,7 @@ int main(int argc, char** argv) {
   const int64_t payload = w13 + w2 + s13 + s2;
   std::printf(
       "H %d I %d G %d, unit %lld B (payload %lld B), %d experts = %.0f MiB, "
-      "avx2 %d, isa %s, gap %d us, reps %d\n",
+      "avx2 %d, isa %s, arith %d, gap %d us, reps %d\n",
       H,
       I,
       G,
@@ -201,6 +204,7 @@ int main(int argc, char** argv) {
       U * L.unit_bytes / 1048576.0,
       (int)cpu_has_avx2(),
       resolve_isa(static_cast<Isa>(isa_arg)) == Isa::kAvx2 ? "avx2" : "scalar",
+      arith,
       gap_us,
       reps);
   std::printf("pool cores: %s\n", cores.empty() ? "(none)" : "given");
@@ -293,7 +297,8 @@ int main(int argc, char** argv) {
             cu.data(),
             ct.data(),
             cw.data(),
-            static_cast<int64_t>(cu.size()));
+            static_cast<int64_t>(cu.size()),
+            arith);
         const auto t1 = Clock::now();
         if (r >= 5)
           ts.push_back(

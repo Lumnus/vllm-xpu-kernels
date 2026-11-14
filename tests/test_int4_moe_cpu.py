@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The host int4 MoE op against the card's W4A16 arithmetic, emulated in
-torch at the same rounding points. Runs on the CPU only (no device)."""
+torch at the same rounding points: the int4 GEMV's (arith 0, scale per
+32-element chunk sum) and the grouped GEMM's (weights rounded to bf16(q * s);
+arith bit 0 for GEMM1, bit 1 for GEMM2). Runs on the CPU only (no device)."""
 
 import pytest
 import torch
@@ -50,11 +52,26 @@ def _dequant_dot(w: torch.Tensor, s: torch.Tensor, a: torch.Tensor, group: int):
     return (chunks * scale[None]).sum(-1)
 
 
+def _dequant_dot_bf16w(
+    w: torch.Tensor, s: torch.Tensor, a: torch.Tensor, group: int
+):
+    """The grouped GEMM's dot product: each weight bf16(q * s), times the
+    bf16 input, accumulated in fp32 (here in float64, then fp32)."""
+    b = w.to(torch.int16)
+    q = torch.empty(w.shape[0], w.shape[1] * 2, dtype=torch.float32)
+    for half, nib in ((0, b & 0xF), (1, (b >> 4) & 0xF)):
+        q[:, half::2] = torch.where(nib >= 8, nib - 16, nib).float()
+    wq = _bf16(q * s.float().repeat_interleave(group, dim=1))
+    return (a.double() @ wq.double().T).float()
+
+
 def _bf16(t: torch.Tensor) -> torch.Tensor:
     return t.to(torch.bfloat16).float()
 
 
-def _reference(x, units, cu, ct, cw, hidden, inter, group):
+def _reference(x, units, cu, ct, cw, hidden, inter, group, arith=0):
+    dot1 = _dequant_dot_bf16w if arith & 1 else _dequant_dot
+    dot2 = _dequant_dot_bf16w if arith & 2 else _dequant_dot
     offsets, _ = _layout(hidden, inter, group)
     out = torch.zeros(x.shape[0], hidden, dtype=torch.float32)
     for c in range(cu.numel()):
@@ -70,10 +87,10 @@ def _reference(x, units, cu, ct, cw, hidden, inter, group):
             .view(hidden, -1)
         )
         xt = x[int(ct[c]) : int(ct[c]) + 1].float()
-        h = _bf16(_dequant_dot(w13, s13, xt, group))
+        h = _bf16(dot1(w13, s13, xt, group))
         gate, up = h[:, :inter], h[:, inter:]
         act = _bf16(_bf16(gate / (1.0 + torch.exp(-gate))) * up)
-        y = _bf16(_dequant_dot(w2, s2, act, group))
+        y = _bf16(dot2(w2, s2, act, group))
         out[int(ct[c])] += y[0] * float(cw[c])
     return out.to(torch.bfloat16)
 
@@ -93,10 +110,26 @@ def _calls(tokens: int, num_units: int, topk: int, gen):
     )
 
 
-def _run(x, units, cu, ct, cw, inter, group, threads=4, isa=0):
+def _run(x, units, cu, ct, cw, inter, group, threads=4, isa=0, arith=None):
     offsets, _ = _layout(x.shape[1], inter, group)
     out = torch.empty_like(x)
-    OP(out, x, units, cu, ct, cw, inter, group, offsets, threads, isa)
+    if arith is None:  # the schema's default (the GEMV's arithmetic)
+        OP(out, x, units, cu, ct, cw, inter, group, offsets, threads, isa)
+    else:
+        OP(
+            out,
+            x,
+            units,
+            cu,
+            ct,
+            cw,
+            inter,
+            group,
+            offsets,
+            threads,
+            isa,
+            arith,
+        )
     return out
 
 
@@ -125,6 +158,75 @@ def test_matches_card_arithmetic(hidden, inter, group, tokens, num_units, topk):
     got = _run(x, units, cu, ct, cw, inter, group)
     want = _reference(x, units, cu, ct, cw, hidden, inter, group)
     assert _steps(got, want) <= 1.0
+
+
+@pytest.mark.parametrize(
+    "hidden,inter,group,tokens,num_units,topk",
+    [
+        (2560, 640, 128, 1, 4, 1),
+        (2560, 640, 128, 9, 12, 10),
+        (512, 256, 64, 3, 4, 4),
+    ],
+)
+def test_matches_the_grouped_gemm_arithmetic(
+    hidden, inter, group, tokens, num_units, topk
+):
+    """arith 3 is the grouped GEMM's arithmetic in both GEMMs: the same bf16
+    values as its emulation except where an fp32 sum's order rounds the other
+    way (a small share, at most one bf16 step); the GEMV's arithmetic (arith
+    0, the default) differs from it in most values."""
+    gen = torch.Generator().manual_seed(hidden + tokens + 1)
+    units = _units(num_units, hidden, inter, group, gen)
+    x = torch.randn(tokens, hidden, generator=gen).to(torch.bfloat16)
+    cu, ct, cw = _calls(tokens, num_units, topk, gen)
+    got = _run(x, units, cu, ct, cw, inter, group, arith=3)
+    want = _reference(x, units, cu, ct, cw, hidden, inter, group, arith=3)
+    assert _steps(got, want) <= 1.0
+    differ = (got != want).float().mean().item()
+    assert differ < 0.02, differ
+    gemv = _run(x, units, cu, ct, cw, inter, group)
+    assert torch.equal(gemv, _run(x, units, cu, ct, cw, inter, group, arith=0))
+    assert (gemv != want).float().mean().item() > 5 * differ + 0.01
+
+
+@pytest.mark.parametrize("arith", [1, 2])
+def test_each_gemm_takes_its_own_arithmetic(arith):
+    """GEMM1 (bit 0) and GEMM2 (bit 1) switch independently: a small call of
+    a model with I = 640 runs GEMM1 on the card's GEMV and GEMM2 on its
+    grouped GEMM."""
+    gen = torch.Generator().manual_seed(23 + arith)
+    units = _units(4, 2560, 640, 128, gen)
+    x = torch.randn(2, 2560, generator=gen).to(torch.bfloat16)
+    cu, ct, cw = _calls(2, 4, 3, gen)
+    got = _run(x, units, cu, ct, cw, 640, 128, arith=arith)
+    want = _reference(x, units, cu, ct, cw, 2560, 640, 128, arith=arith)
+    assert _steps(got, want) <= 1.0
+    assert (got != want).float().mean().item() < 0.02
+    for other in {0, 1, 2, 3} - {arith}:
+        alt = _reference(x, units, cu, ct, cw, 2560, 640, 128, arith=other)
+        assert (got != alt).float().mean().item() > 0.05
+
+
+def test_refuses_an_unknown_arith():
+    gen = torch.Generator().manual_seed(4)
+    units = _units(1, 256, 128, 32, gen)
+    x = torch.randn(1, 256, generator=gen).to(torch.bfloat16)
+    one = torch.zeros(1, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="arith"):
+        _run(x, units, one, one, torch.ones(1), 128, 32, arith=4)
+
+
+@pytest.mark.parametrize("arith", [0, 1, 2, 3])
+def test_scalar_and_avx2_agree_bit_for_bit_per_arith(arith):
+    if ISA(0) != 2:
+        pytest.skip("no AVX2 + FMA on this host")
+    gen = torch.Generator().manual_seed(17)
+    units = _units(6, 2560, 640, 128, gen)
+    x = torch.randn(7, 2560, generator=gen).to(torch.bfloat16)
+    cu, ct, cw = _calls(7, 6, 3, gen)
+    scalar = _run(x, units, cu, ct, cw, 640, 128, threads=1, isa=1, arith=arith)
+    avx2 = _run(x, units, cu, ct, cw, 640, 128, threads=3, isa=2, arith=arith)
+    assert torch.equal(scalar.view(torch.int16), avx2.view(torch.int16))
 
 
 def test_scalar_and_avx2_agree_bit_for_bit():
@@ -200,17 +302,18 @@ def test_refuses_bad_calls():
         )
 
 
-def test_many_tokens_per_expert_and_avx2_blocks():
-    # 13 and 40 tokens per expert: several passes of 8 tokens and a remainder
-    # (the AVX2 code's blocks), against the scalar code and the reference.
+@pytest.mark.parametrize("arith", [0, 3])
+def test_many_tokens_per_expert_and_avx2_blocks(arith):
+    # 40 tokens per expert: several passes of 8 tokens and a remainder (the
+    # AVX2 code's blocks), against the scalar code and the reference.
     gen = torch.Generator().manual_seed(11)
     units = _units(3, 256, 128, 128, gen)
     x = torch.randn(40, 256, generator=gen).to(torch.bfloat16)
     cu, ct, cw = _calls(40, 3, 3, gen)
-    got = _run(x, units, cu, ct, cw, 128, 128, threads=5)
-    scalar = _run(x, units, cu, ct, cw, 128, 128, threads=2, isa=1)
+    got = _run(x, units, cu, ct, cw, 128, 128, threads=5, arith=arith)
+    scalar = _run(x, units, cu, ct, cw, 128, 128, threads=2, isa=1, arith=arith)
     assert torch.equal(got.view(torch.int16), scalar.view(torch.int16))
-    want = _reference(x, units, cu, ct, cw, 256, 128, 128)
+    want = _reference(x, units, cu, ct, cw, 256, 128, 128, arith=arith)
     assert _steps(got, want) <= 1.0
 
 

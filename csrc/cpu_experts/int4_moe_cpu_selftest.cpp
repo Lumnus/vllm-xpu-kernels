@@ -232,7 +232,8 @@ void print(const char* what, const Diff& d) {
       d.max_ref);
 }
 
-std::vector<uint16_t> run(const Problem& p, Pool& pool, Isa isa) {
+std::vector<uint16_t>
+run(const Problem& p, Pool& pool, Isa isa, int arith = 0) {
   std::vector<uint16_t> out(static_cast<size_t>(p.T) * p.L.hidden);
   run_calls(
       pool,
@@ -246,7 +247,8 @@ std::vector<uint16_t> run(const Problem& p, Pool& pool, Isa isa) {
       p.cu.data(),
       p.ct.data(),
       p.cw.data(),
-      static_cast<int64_t>(p.cu.size()));
+      static_cast<int64_t>(p.cu.size()),
+      arith);
   return out;
 }
 
@@ -297,6 +299,16 @@ int main(int argc, char** argv) {
       } else {
         std::printf(
             "avx2 == scalar, 1 and %d threads: bit-identical\n", threads);
+      }
+      // the grouped GEMM's arithmetic (arith 1, 2, 3): the same promise
+      for (int arith = 1; arith <= 3; ++arith) {
+        const auto g1 = run(p, one, Isa::kScalar, arith);
+        if (run(p, many, Isa::kAvx2, arith) != g1 ||
+            run(p, one, Isa::kAvx2, arith) != g1 ||
+            run(p, many, Isa::kScalar, arith) != g1) {
+          std::printf("FAIL arith %d: avx2 vs scalar or threads\n", arith);
+          ++failures;
+        }
       }
     }
     const auto card = reference<float>(p, true);
