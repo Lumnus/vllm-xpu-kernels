@@ -269,6 +269,8 @@ int main(int argc, char** argv) {
       {2560, 640, 128, 16, 20, 10, 4},
       {256, 128, 32, 5, 3, 2, 5},
       {256, 128, 64, 7, 2, 2, 6},
+      {2560, 640, 128, 13, 2, 2, 7},
+      {256, 128, 128, 40, 3, 3, 8},
   };
   for (const Case& cs : cases) {
     Problem p = make(cs.H, cs.I, cs.G, cs.T, cs.U, cs.topk, cs.seed);

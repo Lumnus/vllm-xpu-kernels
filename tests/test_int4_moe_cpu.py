@@ -198,3 +198,41 @@ def test_refuses_bad_calls():
             128,
             32,
         )
+
+
+def test_many_tokens_per_expert_and_avx2_blocks():
+    # 13 and 40 tokens per expert: several passes of 8 tokens and a remainder
+    # (the AVX2 code's blocks), against the scalar code and the reference.
+    gen = torch.Generator().manual_seed(11)
+    units = _units(3, 256, 128, 128, gen)
+    x = torch.randn(40, 256, generator=gen).to(torch.bfloat16)
+    cu, ct, cw = _calls(40, 3, 3, gen)
+    got = _run(x, units, cu, ct, cw, 128, 128, threads=5)
+    scalar = _run(x, units, cu, ct, cw, 128, 128, threads=2, isa=1)
+    assert torch.equal(got.view(torch.int16), scalar.view(torch.int16))
+    want = _reference(x, units, cu, ct, cw, 256, 128, 128)
+    assert _steps(got, want) <= 1.0
+
+
+def test_configure_pins_and_keeps_the_result():
+    import os
+
+    configure = torch.ops._xpu_C.int4_moe_cpu_configure
+    gen = torch.Generator().manual_seed(13)
+    units = _units(4, 256, 128, 32, gen)
+    x = torch.randn(5, 256, generator=gen).to(torch.bfloat16)
+    cu, ct, cw = _calls(5, 4, 2, gen)
+    before = _run(x, units, cu, ct, cw, 128, 32, threads=3)
+    cores = sorted(os.sched_getaffinity(0))[:3]
+    try:
+        assert configure(cores, 0) == len(cores)
+        pinned = _run(x, units, cu, ct, cw, 128, 32, threads=3)
+        fresh = _run(x, units, cu, ct, cw, 128, 32, threads=6)  # a new pool
+        assert torch.equal(before.view(torch.int16), pinned.view(torch.int16))
+        assert torch.equal(before.view(torch.int16), fresh.view(torch.int16))
+        with pytest.raises(RuntimeError, match="spin_us out of range"):
+            configure(cores, -5)
+    finally:
+        assert configure([], -1) == 0
+    after = _run(x, units, cu, ct, cw, 128, 32, threads=3)
+    assert torch.equal(before.view(torch.int16), after.view(torch.int16))

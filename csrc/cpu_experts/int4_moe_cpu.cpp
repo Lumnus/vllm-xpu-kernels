@@ -5,17 +5,35 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include "cpu_experts/int4_moe_cpu_impl.h"
 
 namespace {
 
+// The process's pools (one per thread count) and the settings every pool
+// takes, now and when made later.
+struct Pools {
+  std::mutex mu;
+  std::map<int64_t, std::unique_ptr<cpu_moe::Pool>> by_threads;
+  std::vector<int> cores;  // empty: not pinned
+  int64_t spin_us = cpu_moe::Pool::kDefaultSpinUs;
+};
+
+Pools& pools() {
+  static Pools p;
+  return p;
+}
+
 cpu_moe::Pool& pool_for(int64_t threads) {
-  static std::mutex mu;
-  static std::map<int64_t, std::unique_ptr<cpu_moe::Pool>> pools;
-  std::lock_guard<std::mutex> g(mu);
-  auto& p = pools[threads];
-  if (!p) p = std::make_unique<cpu_moe::Pool>(static_cast<int>(threads));
+  Pools& ps = pools();
+  std::lock_guard<std::mutex> g(ps.mu);
+  auto& p = ps.by_threads[threads];
+  if (!p) {
+    p = std::make_unique<cpu_moe::Pool>(static_cast<int>(threads));
+    p->set_spin_us(ps.spin_us);
+    if (!ps.cores.empty()) p->set_cores(ps.cores);
+  }
   return *p;
 }
 
@@ -96,6 +114,35 @@ void int4_moe_cpu(
   } catch (const std::runtime_error& e) {
     TORCH_CHECK(false, e.what());
   }
+}
+
+int64_t int4_moe_cpu_configure(c10::IntArrayRef cores, int64_t spin_us) {
+  TORCH_CHECK(
+      spin_us >= -1 && spin_us <= 1000000,
+      "int4_moe_cpu_configure: spin_us out of range");
+  std::vector<int> list;
+  for (int64_t c : cores) {
+    TORCH_CHECK(
+        c >= 0 && c < 65536,
+        "int4_moe_cpu_configure: core ",
+        c,
+        " out of range");
+    list.push_back(static_cast<int>(c));
+  }
+  Pools& ps = pools();
+  std::lock_guard<std::mutex> g(ps.mu);
+  ps.cores = list;
+  ps.spin_us = spin_us < 0 ? cpu_moe::Pool::kDefaultSpinUs : spin_us;
+  bool ok = true;
+  for (auto& [n, p] : ps.by_threads) {
+    p->set_spin_us(ps.spin_us);
+    ok = p->set_cores(ps.cores) && ok;
+  }
+  TORCH_CHECK(
+      ok,
+      "int4_moe_cpu_configure: a worker thread could not be pinned to "
+      "the cores given (outside the process's CPU mask?)");
+  return static_cast<int64_t>(list.size());
 }
 
 int64_t int4_moe_cpu_isa(int64_t isa) {

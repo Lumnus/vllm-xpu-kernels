@@ -36,6 +36,14 @@ void int4_moe_cpu(
 // 2 AVX2 + FMA.
 int64_t int4_moe_cpu_isa(int64_t isa);
 
+// Settings of the process's host pools, now and for pools made later:
+// worker i of a pool of n threads runs on cores[i % len] (i = 1..n-1; the
+// calling thread is not moved, cores[0] is meant for it); an empty list
+// unpins. spin_us: how long a worker spins after a phase before it sleeps
+// (-1: the default, 100). Returns the number of cores. Raises when a worker
+// cannot be pinned (a core outside the process's CPU mask).
+int64_t int4_moe_cpu_configure(c10::IntArrayRef cores, int64_t spin_us);
+
 // The schemas, for the extension's library block (and a test harness).
 inline void register_int4_moe_cpu(torch::Library& m) {
   m.def(
@@ -44,4 +52,7 @@ inline void register_int4_moe_cpu(torch::Library& m) {
       "int[] offsets, int num_threads, int isa) -> ()");
   m.impl("int4_moe_cpu", torch::kCPU, &int4_moe_cpu);
   m.def("int4_moe_cpu_isa(int isa) -> int", &int4_moe_cpu_isa);
+  m.def(
+      "int4_moe_cpu_configure(int[] cores, int spin_us) -> int",
+      &int4_moe_cpu_configure);
 }
