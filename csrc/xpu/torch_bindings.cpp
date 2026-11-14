@@ -6,6 +6,7 @@
 #endif
 #include "xpu/lora/lora_ops.h"
 #include "cpu_experts/int4_moe_cpu.h"
+#include "cpu_experts/int4_moe_cpu_a8.h"
 
 #include <torch/library.h>
 #include <torch/version.h>
@@ -458,6 +459,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   // Host op: int4 MoE experts computed on the CPU from the layout these
   // kernels read (an expert that is in no device-readable memory).
   register_int4_moe_cpu(xpu_ops);
+  // The same with int8 activations (W4A8), the card's W4A8 arithmetic.
+  register_int4_moe_cpu_a8(xpu_ops);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

@@ -51,6 +51,15 @@ int64_t int4_moe_cpu_isa(int64_t isa);
 // cannot be pinned (a core outside the process's CPU mask).
 int64_t int4_moe_cpu_configure(c10::IntArrayRef cores, int64_t spin_us);
 
+namespace cpu_moe {
+class Pool;
+}  // namespace cpu_moe
+
+// The process's host pool of `threads` threads, made on first use with the
+// settings above; every host op of this library (int4_moe_cpu,
+// int4_moe_cpu_a8) runs its phases on it.
+cpu_moe::Pool& int4_moe_cpu_pool(int64_t threads);
+
 // The schemas, for the extension's library block (and a test harness).
 inline void register_int4_moe_cpu(torch::Library& m) {
   m.def(

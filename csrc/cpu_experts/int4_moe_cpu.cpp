@@ -151,6 +151,8 @@ int64_t int4_moe_cpu_configure(c10::IntArrayRef cores, int64_t spin_us) {
   return static_cast<int64_t>(list.size());
 }
 
+cpu_moe::Pool& int4_moe_cpu_pool(int64_t threads) { return pool_for(threads); }
+
 int64_t int4_moe_cpu_isa(int64_t isa) {
   try {
     return static_cast<int64_t>(
