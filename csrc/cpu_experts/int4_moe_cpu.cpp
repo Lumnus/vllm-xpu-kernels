@@ -101,7 +101,8 @@ void int4_moe_cpu(
   TORCH_CHECK(
       num_threads >= 1 && num_threads <= 1024,
       "int4_moe_cpu: num_threads out of range");
-  TORCH_CHECK(isa >= 0 && isa <= 2, "int4_moe_cpu: isa is 0, 1 or 2");
+  TORCH_CHECK(
+      isa >= 0 && isa <= cpu_moe::kIsaMax, "int4_moe_cpu: isa is 0 to 8");
   TORCH_CHECK(
       arith >= 0 && arith <= 3,
       "int4_moe_cpu: arith is 0 to 3 (bit 0: GEMM1, bit 1: GEMM2 take the "
@@ -276,4 +277,10 @@ std::vector<int64_t> int4_moe_cpu_select(
   else
     body(ids.data_ptr<int64_t>());
   return {counts[1], counts[2], counts[3], calls, distinct, bad};
+}
+
+std::string int4_moe_cpu_isa_name(int64_t isa) {
+  TORCH_CHECK(
+      isa >= 1 && isa <= cpu_moe::kIsaMax, "int4_moe_cpu: isa is 1 to 8");
+  return cpu_moe::level_name(static_cast<int>(isa));
 }

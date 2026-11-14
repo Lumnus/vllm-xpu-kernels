@@ -59,7 +59,8 @@ void int4_moe_cpu_a8(
   TORCH_CHECK(
       num_threads >= 1 && num_threads <= 1024,
       "int4_moe_cpu_a8: num_threads out of range");
-  TORCH_CHECK(isa >= 0 && isa <= 2, "int4_moe_cpu_a8: isa is 0, 1 or 2");
+  TORCH_CHECK(
+      isa >= 0 && isa <= cpu_moe::kIsaMax, "int4_moe_cpu_a8: isa is 0 to 8");
   cpu_moe::Layout L;
   L.hidden = static_cast<int>(x.size(1));
   L.inter = static_cast<int>(inter);

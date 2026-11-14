@@ -3,6 +3,7 @@
 #include <torch/all.h>
 
 #include <optional>
+#include <string>
 #include <vector>
 
 // Int4 MoE experts computed on the host (see int4_moe_cpu_impl.h): for each
@@ -19,7 +20,12 @@
 //   call_unit    [C] int32, call_token [C] int32, call_weight [C] float32
 //   inter        I (H is x's width), group: the scales' group size
 //   num_threads  host threads for this call (a pool per count is kept)
-//   isa          0 auto, 1 scalar, 2 AVX2 + FMA
+//   isa          0 auto (the widest of 1..7 the host has), 1 scalar,
+//                2 AVX2 + FMA, 3 + AVX-VNNI, 4 AVX-512, 5 + VNNI, 6 + BF16,
+//                7 AMX; 8 = 7 plus the card-class AMX-BF16 prefill (not
+//                bit-identical to the scalar code, never automatic). Every
+//                other level gives the scalar code's result bit for bit
+//                (int4_moe_cpu_impl.h, Isa)
 //   arith        the card kernel whose arithmetic each GEMM takes: bit 0
 //                GEMM1, bit 1 GEMM2; clear: the int4 GEMV (scale per
 //                32-element chunk sum; 0, the default, is the GEMV for
@@ -46,9 +52,12 @@ void int4_moe_cpu(
     int64_t arith,
     const std::optional<torch::Tensor>& call_x_row);
 
-// The instruction set `isa` (as above) resolves to on this host: 1 scalar,
-// 2 AVX2 + FMA.
+// The level `isa` (as above) resolves to on this host (0: the widest of
+// 1..7); raises when the host lacks the level asked for.
 int64_t int4_moe_cpu_isa(int64_t isa);
+
+// The name of a level (1..8), for logs.
+std::string int4_moe_cpu_isa_name(int64_t isa);
 
 // Settings of the process's host pools, now and for pools made later:
 // worker i of a pool of n threads runs on cores[i % len] (i = 1..n-1; the
@@ -106,6 +115,7 @@ inline void register_int4_moe_cpu(torch::Library& m) {
       "Tensor? call_x_row=None) -> ()");
   m.impl("int4_moe_cpu", torch::kCPU, &int4_moe_cpu);
   m.def("int4_moe_cpu_isa(int isa) -> int", &int4_moe_cpu_isa);
+  m.def("int4_moe_cpu_isa_name(int isa) -> str", &int4_moe_cpu_isa_name);
   m.def(
       "int4_moe_cpu_configure(int[] cores, int spin_us) -> int",
       &int4_moe_cpu_configure);

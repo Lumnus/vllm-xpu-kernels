@@ -46,11 +46,13 @@
 //   1. rows(): the one inner function, "these output rows of one expert's
 //      product for these tokens", dispatched by instruction set. Every
 //      instruction set takes the scalar code's steps in its order, so all
-//      agree bit for bit (the self-test and the op's start check prove it).
-//      Built: scalar (std::fma, any host) and AVX2 + FMA (x86-64). The
-//      dispatch is the place for further paths (AVX-512 holding two rows or
-//      two tokens of 8 lanes per register, NEON/SVE with two 4-lane halves),
-//      each obliged to the same lane order.
+//      agree bit for bit (the self-tests and the op's start check prove it).
+//      Built: scalar (std::fma, any host), AVX2 + FMA (here), AVX-512 with
+//      two rows of 8 lanes per register and AVX-512 BF16 where it is exact
+//      (int4_moe_cpu_avx512.h), the card-class AMX-BF16 prefill of level 8
+//      (int4_moe_cpu_amx.h); one build, chosen per host by CPUID
+//      (int4_moe_cpu_isa.h, Isa below). NEON/SVE (two 4-lane halves) would
+//      take the same slot under the same lane order; not built.
 //   2. Pool: persistent worker threads, one fork/join per phase, optionally
 //      pinned to a core list (set_cores), spinning a bounded time between
 //      phases and sleeping between calls.
@@ -83,6 +85,8 @@
 #else
   #define INT4_MOE_CPU_X86 0
 #endif
+
+#include "int4_moe_cpu_isa.h"
 
 #if defined(__linux__)
   #include <pthread.h>
@@ -680,26 +684,53 @@ __attribute__((target("avx2,fma"))) inline void rows_avx2(
     rows_avx2_a<Arith::kChunkScaled>(W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
 }
 
-inline bool cpu_has_avx2() {
-  return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
-}
+inline bool cpu_has_avx2() { return level_supported(2); }
 #else
 inline bool cpu_has_avx2() { return false; }
 #endif
 
-// The instruction sets of rows(). New paths take the next numbers; auto
-// picks the widest the host has.
-enum class Isa : int { kAuto = 0, kScalar = 1, kAvx2 = 2 };
+}  // namespace cpu_moe
+
+// Wider instruction sets, each in its own file (functions with their own
+// target attributes, chosen at run time).
+#include "int4_moe_cpu_avx512.h"
+#include "int4_moe_cpu_amx.h"
+
+namespace cpu_moe {
+
+// The dispatch levels of rows() (int4_moe_cpu_isa.h names what each needs):
+// auto picks the widest of 1..7 the host has; 8 is asked for explicitly.
+//   W4A16 (rows):  1 scalar; 2, 3 AVX2; 4, 5 AVX-512; 6, 7 AVX-512, with
+//                  vdpbf16ps for the grouped GEMM's arithmetic where it is
+//                  exact (int4_moe_cpu_avx512.h); 8 as 7, plus the AMX-BF16
+//                  card-class prefill (not bit-identical, see below).
+//   W4A8 (int4_moe_cpu_a8_impl.h gemm_rows): 1 scalar; 2 AVX2; 3 AVX-VNNI;
+//                  4 AVX-512 BW; 5, 6 AVX-512 VNNI; 7, 8 AMX-INT8 for 16 or
+//                  more rows per expert, else AVX-512 VNNI.
+// Every level except 8 gives the scalar code's result bit for bit.
+enum class Isa : int {
+  kAuto = 0,
+  kScalar = 1,
+  kAvx2 = 2,
+  kAvxVnni = 3,
+  kAvx512 = 4,
+  kAvx512Vnni = 5,
+  kAvx512Bf16 = 6,
+  kAmx = 7,
+  kAmxBf16Class = 8,
+};
+constexpr int kIsaMax = 8;
 
 inline Isa resolve_isa(Isa want) {
-  if (want == Isa::kScalar) return Isa::kScalar;
-  if (want == Isa::kAvx2) {
-    if (!cpu_has_avx2())
-      throw std::runtime_error(
-          "int4_moe_cpu: AVX2 and FMA asked for, not available");
-    return Isa::kAvx2;
-  }
-  return cpu_has_avx2() ? Isa::kAvx2 : Isa::kScalar;
+  const int w = static_cast<int>(want);
+  if (w < 0 || w > kIsaMax)
+    throw std::runtime_error("int4_moe_cpu: isa is 0 to 8");
+  if (want == Isa::kAuto) return static_cast<Isa>(best_level());
+  if (!level_supported(w))
+    throw std::runtime_error(
+        std::string("int4_moe_cpu: ") + level_name(w) +
+        " asked for, not available on this host");
+  return want;
 }
 
 inline void rows(
@@ -717,9 +748,24 @@ inline void rows(
     float* out,
     int ldo) {
 #if INT4_MOE_CPU_X86
-  if (isa == Isa::kAvx2) {
-    rows_avx2(arith, W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
-    return;
+  switch (isa) {
+    case Isa::kAvx2:
+    case Isa::kAvxVnni:
+      rows_avx2(arith, W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
+      return;
+    case Isa::kAvx512:
+    case Isa::kAvx512Vnni:
+      rows_avx512(arith, W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
+      return;
+    case Isa::kAvx512Bf16:
+    case Isa::kAmx:
+      rows_avx512bf16(arith, W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
+      return;
+    case Isa::kAmxBf16Class:
+      rows_amx_class(arith, W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
+      return;
+    default:
+      break;
   }
 #endif
   rows_scalar(arith, W, S, K, G, n0, n1, xe, xo, nt, out, ldo);
@@ -956,7 +1002,7 @@ convert_row_avx2(const uint16_t* xt, float* e, float* o, int H) {
 inline void
 convert_row(Isa isa, const uint16_t* xt, float* e, float* o, int H) {
 #if INT4_MOE_CPU_X86
-  if (isa == Isa::kAvx2) {  // H is a multiple of 32
+  if (static_cast<int>(isa) >= 2) {  // every level from 2 has AVX2; H % 32 = 0
     convert_row_avx2(xt, e, o, H);
     return;
   }
@@ -1027,6 +1073,9 @@ inline void run_calls(
   const int H = L.hidden, I = L.inter, G = L.group;
   std::memset(out, 0, static_cast<size_t>(T) * H * sizeof(uint16_t));
   if (C == 0) return;
+#if INT4_MOE_CPU_X86
+  rows_input_epoch().fetch_add(1);  // this call rewrites the scratch inputs
+#endif
   for (int64_t c = 0; c < C; ++c) {
     if (call_unit[c] < 0 || call_unit[c] >= num_units)
       throw std::runtime_error(

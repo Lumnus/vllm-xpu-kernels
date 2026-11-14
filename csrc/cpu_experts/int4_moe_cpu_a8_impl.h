@@ -37,16 +37,14 @@
 // an fp32 gemm1 epilogue (silu*up without the bf16 round trips).
 //
 // The instruction set is a dispatch behind one inner function per GEMM
-// phase (quant_row, gemm_rows, act_row, gather). Now: scalar and AVX2
-// (vpmaddubsw / vpmaddwd). The integer dot of a K chunk is the only
-// ISA-specific part; further paths slot in at gemm_rows:
-//   AVX-512 VNNI / AVX-VNNI: vpdpbusd (u8 x s8 -> s32 accumulate) on the
-//     same unsigned weights (w + 8) and the same correction 8 * sum(q);
-//   AMX (TMUL): tdpbusd tiles of 16 rows x 64 bytes of the same operands;
-//   Arm NEON / SVE: sdot (s8 x s8 -> s32) on the nibbles sign-extended to s8,
-//     no correction needed.
-// All of them give the same int32 per chunk, so the outputs stay
-// bit-identical across ISAs.
+// phase (quant_row, gemm_rows, act_row, gather). The integer dot of a K
+// chunk is the only ISA-specific part, at gemm_rows: scalar, AVX2
+// (vpmaddubsw / vpmaddwd), and in int4_moe_cpu_a8_isa.h AVX-VNNI and
+// AVX-512 VNNI (vpdpbusd on the same unsigned weights w + 8 with the same
+// correction 8 * sum(q)) and AMX-INT8 (tdpbusd tiles of the same operands,
+// for 16 or more rows per expert). Not built: Arm NEON / SVE sdot (s8 x s8
+// on the nibbles sign-extended, no correction). All give the same int32 per
+// chunk, so the outputs stay bit-identical across ISAs.
 
 #pragma once
 
@@ -152,6 +150,10 @@ struct QRows {
   std::vector<int8_t> qe, qo;  // per row: even / odd elements, K/2 each
   std::vector<float> as;       // per row: nas scales
   std::vector<int32_t> cs;     // per row: sum of q over each flush chunk
+  // AMX only (int4_moe_cpu_a8_isa.h): the activations transposed into
+  // tdpbusd's B layout, [K/4][cp] dwords, cp = rows + 16; empty otherwise.
+  std::vector<int32_t> qt;
+  int64_t cp = 0;
   void shape(int64_t rows, int k, int fl_, int ag_) {
     K = k;
     fl = fl_;
@@ -162,6 +164,12 @@ struct QRows {
     qo.resize(static_cast<size_t>(rows) * (K / 2));
     as.resize(static_cast<size_t>(rows) * nas);
     cs.resize(static_cast<size_t>(rows) * nfl);
+    qt.clear();
+    cp = 0;
+  }
+  void shape_transposed(int64_t rows) {
+    cp = rows + 16;
+    qt.resize(static_cast<size_t>(K / 4) * cp);
   }
 };
 
@@ -376,6 +384,15 @@ __attribute__((target("avx2,fma"))) inline void gemm_rows_avx2(
 }
 #endif
 
+}  // namespace a8
+}  // namespace cpu_moe
+
+// AVX-VNNI, AVX-512 VNNI and AMX-INT8 code for the integer dot.
+#include "int4_moe_cpu_a8_isa.h"
+
+namespace cpu_moe {
+namespace a8 {
+
 inline void gemm_rows(
     Isa isa,
     const GemmArgs& a,
@@ -386,9 +403,27 @@ inline void gemm_rows(
     float* out,
     int ldo) {
 #if INT4_MOE_CPU_X86
-  if (isa == Isa::kAvx2) {
-    gemm_rows_avx2(a, n0, Q, r0, nt, out, ldo);
-    return;
+  switch (isa) {
+    case Isa::kAvx2:
+    case Isa::kAvx512:  // AVX-512 without VNNI: the AVX2 code
+      gemm_rows_avx2(a, n0, Q, r0, nt, out, ldo);
+      return;
+    case Isa::kAvxVnni:
+      gemm_rows_avxvnni(a, n0, Q, r0, nt, out, ldo);
+      return;
+    case Isa::kAmx:
+    case Isa::kAmxBf16Class:
+      if (!Q.qt.empty() && nt >= kAmxMinTokens) {
+        gemm_rows_amx(a, n0, Q, r0, nt, out, ldo);
+        return;
+      }
+      [[fallthrough]];
+    case Isa::kAvx512Vnni:
+    case Isa::kAvx512Bf16:
+      gemm_rows_avx512vnni(a, n0, Q, r0, nt, out, ldo);
+      return;
+    default:
+      break;
   }
 #endif
   gemm_rows_scalar(a, n0, Q, r0, nt, out, ldo);
@@ -487,6 +522,17 @@ inline void run_calls(
   auto& y = scratch.y;
   q1.shape(C, H, fl1, sc.a1_group);
   q2.shape(C, I, fl2, sc.a2_group);
+  // AMX: the activations also in tdpbusd's layout, when an expert has
+  // enough rows for a tile
+  int64_t most = 0;
+  for (int64_t e = 0; e < E; ++e)
+    most = std::max(most, base[e + 1] - base[e]);
+  const bool amx =
+      (isa == Isa::kAmx || isa == Isa::kAmxBf16Class) && most >= kAmxMinTokens;
+  if (amx) {
+    q1.shape_transposed(C);
+    q2.shape_transposed(C);
+  }
   h.resize(static_cast<size_t>(C) * 2 * I);
   y.resize(static_cast<size_t>(C) * H);
   // Phase 1: each call row's input, quantized (rows by unit group).
@@ -496,6 +542,7 @@ inline void run_calls(
     for (int k = 0; k < H; ++k)
       v[k] = bf16_to_f32(xt[k]);
     quant_row(v.data(), true, sc.a1_rule, q1, row_of[c]);
+    if (amx) transpose_row(q1, row_of[c]);
   });
   // Phase 2: GEMM1 -> h [rows, 2I] (bf16 values, or fp32 for glu_fp32).
   const int64_t blocks1 = 2 * I / kRows;
@@ -526,6 +573,7 @@ inline void run_calls(
     std::vector<float> v(static_cast<size_t>(I));
     act_row(h.data() + r * 2 * I, I, sc.glu_fp32, v.data());
     quant_row(v.data(), !sc.glu_fp32, sc.a2_rule, q2, r);
+    if (amx) transpose_row(q2, r);
   });
   // Phase 4: GEMM2 -> y [rows, H], bf16 values.
   const int64_t blocks2 = H / kRows;

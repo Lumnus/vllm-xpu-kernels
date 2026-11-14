@@ -18,7 +18,8 @@
 //                a2_rule, a2_group, acc, glu_fp32] (int4_moe_cpu_a8_impl.h)
 //   num_threads  host threads for this call: int4_moe_cpu's pool of that
 //                count (pinned and spinning as int4_moe_cpu_configure set)
-//   isa          0 auto, 1 scalar, 2 AVX2 + FMA (int4_moe_cpu_isa resolves)
+//   isa          0 auto, 1 scalar, 2 AVX2 + FMA, 3..8 as int4_moe_cpu.h
+//                (int4_moe_cpu_isa resolves); every level bit-identical
 void int4_moe_cpu_a8(
     torch::Tensor& out,
     const torch::Tensor& x,
