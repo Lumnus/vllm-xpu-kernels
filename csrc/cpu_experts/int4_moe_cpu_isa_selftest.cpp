@@ -10,7 +10,10 @@
 //      are counted and bounded, not required to be zero);
 //   3. the AVX-512 BF16 guard: subnormal and tiny inputs take the AVX-512 F
 //      code (the call still bit-identical, the fallback counted);
-//   4. W4A8, four schemes, every level, 1 and N threads: bit-identical.
+//   4. W4A8, four schemes, every level, 1 and N threads: bit-identical;
+//   5. W4A16 with the inputs read in place (call_x_row, one output row per
+//      call): every level equals its own gathered-input run, and every
+//      level but 8 equals the scalar code's.
 //
 // Build: g++ -O2 -std=c++20 -pthread -ffp-contract=off -I csrc
 //        -I <torch>/include int4_moe_cpu_isa_selftest.cpp
@@ -125,6 +128,44 @@ run16(const Problem& p, Pool& pool, int level, int arith) {
       p.cw.data(),
       static_cast<int64_t>(p.cu.size()),
       arith);
+  return out;
+}
+
+// One output row per call (call_token = 0..C-1), the inputs either read in
+// place from x by call_x_row or gathered into a copy first.
+std::vector<uint16_t>
+run16_rows(const Problem& p, Pool& pool, int level, int arith, bool inplace) {
+  const int64_t C = static_cast<int64_t>(p.cu.size());
+  const int H = p.L.hidden;
+  std::vector<int32_t> iota(C);
+  for (int64_t c = 0; c < C; ++c)
+    iota[c] = static_cast<int32_t>(c);
+  std::vector<uint16_t> xg;
+  if (!inplace) {
+    xg.resize(static_cast<size_t>(C) * H);
+    for (int64_t c = 0; c < C; ++c)
+      std::memcpy(
+          xg.data() + c * H,
+          p.x.data() + static_cast<int64_t>(p.ct[c]) * H,
+          H * sizeof(uint16_t));
+  }
+  std::vector<uint16_t> out(static_cast<size_t>(C) * H);
+  run_calls(
+      pool,
+      static_cast<Isa>(level),
+      p.L,
+      out.data(),
+      inplace ? p.x.data() : xg.data(),
+      C,
+      p.units.data(),
+      p.U,
+      p.cu.data(),
+      iota.data(),
+      p.cw.data(),
+      C,
+      arith,
+      inplace ? p.ct.data() : nullptr,
+      inplace ? p.T : 0);
   return out;
 }
 
@@ -331,6 +372,48 @@ int main(int argc, char** argv) {
     }
   }
 #endif
+  std::printf("-- W4A16, inputs read in place (call_x_row), every level\n");
+  {
+    const Case rc[] = {cases[0], cases[1], cases[4]};
+    for (const Case& cs : rc) {
+      Problem p = make(
+          cs.H, cs.I, cs.G, cs.T, cs.U, cs.topk, cs.shared, cs.seed, cs.xscale);
+      for (int arith = 0; arith <= 3; ++arith) {
+        const auto ref = run16_rows(p, one, 1, arith, false);
+        if (compare(run16_rows(p, one, 1, arith, true), ref).differ) {
+          std::printf(
+              "  FAIL %-26s arith %d scalar: in place != gathered\n",
+              cs.what,
+              arith);
+          ++failures;
+        }
+        for (int l : levels) {
+          const auto g = run16_rows(p, many, l, arith, false);
+          const Diff dp = compare(run16_rows(p, many, l, arith, true), g);
+          const Diff da = compare(run16_rows(p, one, l, arith, true), g);
+          const Diff ds = compare(g, ref);
+          ++checks;
+          if (dp.differ || da.differ || (l != 8 && ds.differ)) {
+            std::printf(
+                "  FAIL %-26s arith %d level %d (%s): in place vs gathered "
+                "%lld / %lld (%d threads), %lld (1 thread); gathered vs "
+                "scalar %lld\n",
+                cs.what,
+                arith,
+                l,
+                level_name(l),
+                (long long)dp.differ,
+                (long long)g.size(),
+                threads,
+                (long long)da.differ,
+                (long long)ds.differ);
+            ++failures;
+          }
+        }
+      }
+      std::printf("  %-26s done\n", cs.what);
+    }
+  }
   std::printf("-- W4A8, every level vs scalar\n");
   struct Case8 {
     int H, I, G, T, U, topk;

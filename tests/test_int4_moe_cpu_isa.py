@@ -195,6 +195,49 @@ def test_w4a8_level_is_bit_identical_to_scalar(level, shape, scheme):
     assert _same(got, scalar)
 
 
+@pytest.mark.parametrize("arith", [0, 3])
+@pytest.mark.parametrize("shape", SHAPES16, ids=["decode", "small", "rows20"])
+@pytest.mark.parametrize("level", LEVELS)
+def test_inputs_read_in_place_at_every_level(level, shape, arith):
+    """call_x_row (one output row per call, its input read from x in place)
+    gives the gathered-input run's bits at every level, and every level but
+    8 the scalar code's."""
+    _need(level)
+    hidden, inter, group, experts, tokens, topk, shared = shape
+    x, units, cu, ct, cw = _problem(
+        hidden, inter, group, experts, tokens, topk, 36, shared
+    )
+    offsets, _ = _layout(hidden, inter, group)
+    rows = torch.arange(cu.numel(), dtype=torch.int32)
+    gathered = x.index_select(0, ct.long())
+
+    def run(isa, inplace, threads=3):
+        out = torch.empty(cu.numel(), hidden, dtype=torch.bfloat16)
+        src, xr = (x, ct) if inplace else (gathered, None)
+        OP16(
+            out,
+            src,
+            units,
+            cu,
+            rows,
+            cw,
+            inter,
+            group,
+            offsets,
+            threads,
+            isa,
+            arith,
+            xr,
+        )
+        return out
+
+    got = run(level, False)
+    assert _same(run(level, True), got)
+    assert _same(run(level, True, threads=1), got)
+    if level != 8:
+        assert _same(got, run(1, False, threads=1))
+
+
 def test_a_level_the_host_lacks_is_refused():
     missing = [level for level in LEVELS if not _have(level)]
     if not missing:
