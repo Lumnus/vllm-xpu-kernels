@@ -32,11 +32,19 @@
 //                both), set: the grouped GEMM (weights bf16(q * s)). The
 //                card takes the GEMV for a call of at most 8 rows whose K
 //                is a multiple of 512, the grouped GEMM otherwise
+//                7 (card-exact): both GEMMs as the card's grouped GEMM
+//                computes them, exactly (weights truncated to bf16, products
+//                summed exactly in blocks of 16, each block added to the
+//                fp32 accumulator with one rounding) and the activation from
+//                silu_table (int4_moe_cpu_exact.h)
 //   call_x_row   optional [C] int32: call c reads its input from x's row
 //                call_x_row[c] instead of call_token[c]; call_token then
 //                names its row of out [rows, H] only (x and out may differ
 //                in rows). One output row per call without a gathered copy
 //                of the inputs
+//   silu_table   optional [65536] bf16 (or int16), CPU: the card's
+//                bf16(silu(g)) for every bf16 bit pattern g, indexed by the
+//                bits; required by arith 7, unused otherwise
 void int4_moe_cpu(
     torch::Tensor& out,
     const torch::Tensor& x,
@@ -50,7 +58,8 @@ void int4_moe_cpu(
     int64_t num_threads,
     int64_t isa,
     int64_t arith,
-    const std::optional<torch::Tensor>& call_x_row);
+    const std::optional<torch::Tensor>& call_x_row,
+    const std::optional<torch::Tensor>& silu_table);
 
 // The level `isa` (as above) resolves to on this host (0: the widest of
 // 1..7); raises when the host lacks the level asked for.
@@ -112,7 +121,7 @@ inline void register_int4_moe_cpu(torch::Library& m) {
       "int4_moe_cpu(Tensor(a!) out, Tensor x, Tensor units, Tensor call_unit, "
       "Tensor call_token, Tensor call_weight, int inter, int group, "
       "int[] offsets, int num_threads, int isa, int arith=0, "
-      "Tensor? call_x_row=None) -> ()");
+      "Tensor? call_x_row=None, Tensor? silu_table=None) -> ()");
   m.impl("int4_moe_cpu", torch::kCPU, &int4_moe_cpu);
   m.def("int4_moe_cpu_isa(int isa) -> int", &int4_moe_cpu_isa);
   m.def("int4_moe_cpu_isa_name(int isa) -> str", &int4_moe_cpu_isa_name);

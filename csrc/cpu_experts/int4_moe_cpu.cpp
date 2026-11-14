@@ -60,7 +60,8 @@ void int4_moe_cpu(
     int64_t num_threads,
     int64_t isa,
     int64_t arith,
-    const std::optional<torch::Tensor>& call_x_row) {
+    const std::optional<torch::Tensor>& call_x_row,
+    const std::optional<torch::Tensor>& silu_table) {
   check_cpu(out, "out");
   check_cpu(x, "x");
   check_cpu(units, "units");
@@ -104,9 +105,23 @@ void int4_moe_cpu(
   TORCH_CHECK(
       isa >= 0 && isa <= cpu_moe::kIsaMax, "int4_moe_cpu: isa is 0 to 8");
   TORCH_CHECK(
-      arith >= 0 && arith <= 3,
+      (arith >= 0 && arith <= 3) || arith == cpu_moe::kArithCardExact,
       "int4_moe_cpu: arith is 0 to 3 (bit 0: GEMM1, bit 1: GEMM2 take the "
-      "grouped GEMM's bf16 weights instead of the GEMV's chunk-scaled sums)");
+      "grouped GEMM's bf16 weights instead of the GEMV's chunk-scaled sums), "
+      "or 7 (card-exact: the card's grouped GEMM and silu exactly)");
+  const uint16_t* table = nullptr;
+  if (silu_table.has_value()) {
+    check_cpu(*silu_table, "silu_table");
+    TORCH_CHECK(
+        silu_table->numel() == 65536 && silu_table->element_size() == 2,
+        "int4_moe_cpu: silu_table is the card's bf16 silu of every bf16 gate: "
+        "65,536 two-byte values (bfloat16 or int16)");
+    table = reinterpret_cast<const uint16_t*>(silu_table->data_ptr());
+  }
+  TORCH_CHECK(
+      arith != cpu_moe::kArithCardExact || table != nullptr,
+      "int4_moe_cpu: arith 7 (card-exact) needs silu_table, the card's bf16 "
+      "silu of every bf16 gate (65,536 entries, taken on the card)");
   cpu_moe::Layout L;
   L.hidden = static_cast<int>(x.size(1));
   L.inter = static_cast<int>(inter);
@@ -132,7 +147,8 @@ void int4_moe_cpu(
         C,
         static_cast<int>(arith),
         x_rows ? call_x_row->data_ptr<int32_t>() : nullptr,
-        x.size(0));
+        x.size(0),
+        table);
   } catch (const std::runtime_error& e) {
     TORCH_CHECK(false, e.what());
   }

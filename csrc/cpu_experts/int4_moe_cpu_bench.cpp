@@ -10,7 +10,9 @@
 //   ./int4_moe_cpu_bench [--threads 1,2,4,6] [--experts 256] [--reps 60]
 //                        [--gap-us 2000] [--shapes 30x1,30x2,30x8,...]
 //                        [--cores 0,1,2,...] [--spin-us 100]
-//                        [--stream-mib 1024] [--isa 0|1|2] [--arith 0..3]
+//                        [--stream-mib 1024] [--isa 0..8] [--arith 0..3|7]
+// --arith 7 (card-exact) takes the host's silu formula as its table (the
+// engine passes the card's; the cost is the same).
 // --cores pins pool worker i to cores[i]; the streaming read pins its
 // thread t to cores[t].
 // A shape EXT means E distinct experts per call, each with T tokens (the
@@ -203,11 +205,16 @@ int main(int argc, char** argv) {
       U,
       U * L.unit_bytes / 1048576.0,
       (int)cpu_has_avx2(),
-      resolve_isa(static_cast<Isa>(isa_arg)) == Isa::kAvx2 ? "avx2" : "scalar",
+      level_name(static_cast<int>(resolve_isa(static_cast<Isa>(isa_arg)))),
       arith,
       gap_us,
       reps);
   std::printf("pool cores: %s\n", cores.empty() ? "(none)" : "given");
+  std::vector<uint16_t> silu(65536);
+  for (int i = 0; i < 65536; ++i) {
+    const float v = bf16_to_f32(static_cast<uint16_t>(i));
+    silu[i] = f32_to_bf16(v / (1.0f + std::exp(-v)));
+  }
   std::mt19937 g(1);
   std::vector<uint8_t> units(static_cast<size_t>(U) * L.unit_bytes);
   for (size_t i = 0; i < units.size(); i += 4) {
@@ -298,7 +305,10 @@ int main(int argc, char** argv) {
             ct.data(),
             cw.data(),
             static_cast<int64_t>(cu.size()),
-            arith);
+            arith,
+            nullptr,
+            0,
+            silu.data());
         const auto t1 = Clock::now();
         if (r >= 5)
           ts.push_back(

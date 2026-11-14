@@ -214,7 +214,7 @@ def test_refuses_an_unknown_arith():
     x = torch.randn(1, 256, generator=gen).to(torch.bfloat16)
     one = torch.zeros(1, dtype=torch.int32)
     with pytest.raises(RuntimeError, match="arith"):
-        _run(x, units, one, one, torch.ones(1), 128, 32, arith=4)
+        _run(x, units, one, one, torch.ones(1), 128, 32, arith=8)
 
 
 @pytest.mark.parametrize("arith", [0, 1, 2, 3])

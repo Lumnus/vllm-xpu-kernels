@@ -42,6 +42,12 @@
 // the output's scale on a small share of the values (measured by the
 // self-test).
 //
+// arith 7 ("card-exact", int4_moe_cpu_exact.h) is the grouped GEMM as the
+// card computes it, exactly, with the card's own silu table: the order and
+// rounding of its sums are measured, and the op reproduces them bit for bit
+// (weights truncated to bf16, exact block sums of 16 products, one fp32
+// rounding per block).
+//
 // Structure (what can be replaced without touching the rest):
 //   1. rows(): the one inner function, "these output rows of one expert's
 //      product for these tokens", dispatched by instruction set. Every
@@ -346,12 +352,18 @@ struct CardTable {
   __m256i tl, th;
 };
 
+// rtz: truncate q * s to bf16 (the card's apply_scale, arith 7) instead of
+// rounding it to nearest even (arith 1..3).
 __attribute__((target("avx2,fma"), always_inline)) inline CardTable
-card_table(__m256 scale) {
-  const __m256 lo = round_bf16_ps(
-      _mm256_mul_ps(_mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7), scale));
-  const __m256 hi = round_bf16_ps(
-      _mm256_mul_ps(_mm256_setr_ps(-8, -7, -6, -5, -4, -3, -2, -1), scale));
+card_table(__m256 scale, bool rtz = false) {
+  const __m256 qlo =
+      _mm256_mul_ps(_mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7), scale);
+  const __m256 qhi =
+      _mm256_mul_ps(_mm256_setr_ps(-8, -7, -6, -5, -4, -3, -2, -1), scale);
+  const __m256 top =
+      _mm256_castsi256_ps(_mm256_set1_epi32(static_cast<int>(0xffff0000u)));
+  const __m256 lo = rtz ? _mm256_and_ps(qlo, top) : round_bf16_ps(qlo);
+  const __m256 hi = rtz ? _mm256_and_ps(qhi, top) : round_bf16_ps(qhi);
   // the 16 bf16 words in u order
   __m256i w = _mm256_packus_epi32(
       _mm256_srli_epi32(_mm256_castps_si256(lo), 16),
@@ -695,6 +707,8 @@ inline bool cpu_has_avx2() { return false; }
 // target attributes, chosen at run time).
 #include "int4_moe_cpu_avx512.h"
 #include "int4_moe_cpu_amx.h"
+// The card's grouped-GEMM arithmetic, exactly (arith 7).
+#include "int4_moe_cpu_exact.h"
 
 namespace cpu_moe {
 
@@ -1035,6 +1049,8 @@ struct AlignedAllocator {
   bool operator!=(const AlignedAllocator&) const { return false; }
 };
 using AlignedFloats = std::vector<float, AlignedAllocator<float, 64>>;
+using AlignedDoubles = std::vector<double, AlignedAllocator<double, 64>>;
+using AlignedInt16 = std::vector<int16_t, AlignedAllocator<int16_t, 64>>;
 
 // Rows per work item: GEMM1 takes kRows1 gate rows and the kRows1 up rows
 // that pair with them (so the activation of those columns is computed in the
@@ -1043,11 +1059,19 @@ using AlignedFloats = std::vector<float, AlignedAllocator<float, 64>>;
 // thread count, large enough that an item streams a few tens of KB.
 constexpr int kRows1 = 16;
 constexpr int kRows2 = 16;
+static_assert(
+    kRows1 == kExactBlock,
+    "arith 7 flags GEMM2's input blocks in the GEMM1 item that writes them");
 
 // out [T, H] bf16 is overwritten: zero for tokens without calls. With
 // call_x_row, call c reads its input from row call_x_row[c] of x [x_rows, H]
 // (call_token then names only its output row): a caller that wants one
 // output row per call needs no gathered copy of the inputs.
+// arith 0..3: bit 0 GEMM1, bit 1 GEMM2 take the grouped GEMM's bf16 weights
+// (rounded to nearest) instead of the GEMV's chunk-scaled sums, the silu
+// computed here. arith 7 (kArithCardExact): both GEMMs and the activation as
+// the card computes them, exactly (int4_moe_cpu_exact.h); silu_table, the
+// card's bf16 silu of each of the 65,536 bf16 gates, is then required.
 inline void run_calls(
     Pool& pool,
     Isa isa,
@@ -1063,10 +1087,17 @@ inline void run_calls(
     int64_t C,
     int arith = 0,
     const int32_t* call_x_row = nullptr,
-    int64_t x_rows = 0) {
+    int64_t x_rows = 0,
+    const uint16_t* silu_table = nullptr) {
   check_layout(L);
-  if (arith < 0 || arith > 3)
-    throw std::runtime_error("int4_moe_cpu: arith is 0 to 3");
+  if ((arith < 0 || arith > 3) && arith != kArithCardExact)
+    throw std::runtime_error(
+        "int4_moe_cpu: arith is 0 to 3, or 7 (card-exact)");
+  const bool exact = arith == kArithCardExact;
+  if (exact && silu_table == nullptr)
+    throw std::runtime_error(
+        "int4_moe_cpu: arith 7 (card-exact) needs silu_table, the card's "
+        "bf16 silu of every bf16 gate (65,536 entries)");
   const Arith arith1 = (arith & 1) ? Arith::kBf16Weights : Arith::kChunkScaled;
   const Arith arith2 = (arith & 2) ? Arith::kBf16Weights : Arith::kChunkScaled;
   isa = resolve_isa(isa);
@@ -1117,6 +1148,11 @@ inline void run_calls(
   // thread_local name would be the worker's own.
   struct Scratch {
     AlignedFloats xe, xo, h, ae, ao, y;
+    // arith 7: the inputs of both GEMMs in double, one flag per 16, the
+    // int16 forms and their powers of two (ExactInputs)
+    AlignedDoubles dxe, dxo, dae, dao, px, pa;
+    AlignedInt16 ix, ia;
+    std::vector<uint8_t> fx, fa;
   };
   static thread_local Scratch scratch;
   auto& xe = scratch.xe;
@@ -1125,11 +1161,34 @@ inline void run_calls(
   auto& ae = scratch.ae;
   auto& ao = scratch.ao;
   auto& y = scratch.y;
-  xe.resize(static_cast<size_t>(C) * (H / 2));
-  xo.resize(static_cast<size_t>(C) * (H / 2));
+  auto& dxe = scratch.dxe;
+  auto& dxo = scratch.dxo;
+  auto& dae = scratch.dae;
+  auto& dao = scratch.dao;
+  auto& fx = scratch.fx;
+  auto& fa = scratch.fa;
+  auto& ix = scratch.ix;
+  auto& ia = scratch.ia;
+  auto& px = scratch.px;
+  auto& pa = scratch.pa;
+  if (exact) {
+    ix.resize(static_cast<size_t>(C) * H);
+    ia.resize(static_cast<size_t>(C) * I);
+    px.resize(static_cast<size_t>(C) * (H / kExactBlock));
+    pa.resize(static_cast<size_t>(C) * (I / kExactBlock));
+    dxe.resize(static_cast<size_t>(C) * (H / 2));
+    dxo.resize(static_cast<size_t>(C) * (H / 2));
+    dae.resize(static_cast<size_t>(C) * (I / 2));
+    dao.resize(static_cast<size_t>(C) * (I / 2));
+    fx.resize(static_cast<size_t>(C) * (H / kExactBlock));
+    fa.resize(static_cast<size_t>(C) * (I / kExactBlock));
+  } else {
+    xe.resize(static_cast<size_t>(C) * (H / 2));
+    xo.resize(static_cast<size_t>(C) * (H / 2));
+    ae.resize(static_cast<size_t>(C) * (I / 2));
+    ao.resize(static_cast<size_t>(C) * (I / 2));
+  }
   h.resize(static_cast<size_t>(C) * 2 * I);
-  ae.resize(static_cast<size_t>(C) * (I / 2));
-  ao.resize(static_cast<size_t>(C) * (I / 2));
   y.resize(static_cast<size_t>(C) * H);
   // Calls laid out by group: base[e] is the first call row of unit group e.
   std::vector<int64_t> base(E + 1, 0), row_of(C);
@@ -1142,10 +1201,28 @@ inline void run_calls(
   // (two vector operations per 16 elements): at decode sizes the calling
   // thread does it alone, saving a fork/join.
   auto convert = [&](int64_t c) {
+    const uint16_t* xt =
+        x +
+        static_cast<int64_t>(call_x_row ? call_x_row[c] : call_token[c]) * H;
+    if (exact) {
+      double* e = dxe.data() + row_of[c] * (H / 2);
+      double* o = dxo.data() + row_of[c] * (H / 2);
+      for (int j = 0; j < H / 2; ++j) {
+        e[j] = bf16_to_f32(xt[2 * j]);
+        o[j] = bf16_to_f32(xt[2 * j + 1]);
+      }
+      const int64_t nb = H / kExactBlock;
+      for (int b = 0; b < nb; ++b)
+        exact_input_block(
+            xt + b * kExactBlock,
+            fx.data() + row_of[c] * nb + b,
+            ix.data() + row_of[c] * H + b * kExactBlock,
+            px.data() + row_of[c] * nb + b);
+      return;
+    }
     convert_row(
         isa,
-        x + static_cast<int64_t>(call_x_row ? call_x_row[c] : call_token[c]) *
-                H,
+        xt,
         xe.data() + row_of[c] * (H / 2),
         xo.data() + row_of[c] * (H / 2),
         H);
@@ -1169,9 +1246,41 @@ inline void run_calls(
     const int nt = static_cast<int>(base[e + 1] - base[e]);
     const uint8_t* w13 = u + L.off_w13;
     const auto* s13 = reinterpret_cast<const uint16_t*>(u + L.off_s13);
+    float* hb = h.data() + base[e] * 2 * I;
+    if (exact) {
+      const int lv = static_cast<int>(isa);
+      const ExactInputs in1{
+          dxe.data() + base[e] * (H / 2),
+          dxo.data() + base[e] * (H / 2),
+          fx.data() + base[e] * (H / kExactBlock),
+          ix.data() + base[e] * H,
+          px.data() + base[e] * (H / kExactBlock)};
+      rows_exact(lv, w13, s13, H, G, i0, i1, in1, nt, hb, 2 * I);
+      rows_exact(lv, w13, s13, H, G, I + i0, I + i1, in1, nt, hb, 2 * I);
+      // the card's activation from its table; this item's columns are one
+      // block of GEMM2's inputs (kRows1 = kExactBlock), flagged here
+      for (int64_t r = base[e]; r < base[e + 1]; ++r) {
+        const float* hr = h.data() + r * 2 * I;
+        double* ea = dae.data() + r * (I / 2);
+        double* oa = dao.data() + r * (I / 2);
+        uint16_t ab[kRows1];
+        for (int i = i0; i < i1; ++i) {
+          const float s = bf16_to_f32(silu_table[f32_to_bf16(hr[i])]);
+          const float a = round_bf16(s * round_bf16(hr[I + i]));
+          ab[i - i0] = f32_to_bf16(a);
+          if (i & 1)
+            oa[i / 2] = a;
+          else
+            ea[i / 2] = a;
+        }
+        const int64_t ab_i = r * (I / kExactBlock) + i0 / kExactBlock;
+        exact_input_block(
+            ab, fa.data() + ab_i, ia.data() + r * I + i0, pa.data() + ab_i);
+      }
+      return;
+    }
     const float* e_in = xe.data() + base[e] * (H / 2);
     const float* o_in = xo.data() + base[e] * (H / 2);
-    float* hb = h.data() + base[e] * 2 * I;
     rows(isa, arith1, w13, s13, H, G, i0, i1, e_in, o_in, nt, hb, 2 * I);
     rows(
         isa, arith1, w13, s13, H, G, I + i0, I + i1, e_in, o_in, nt, hb, 2 * I);
@@ -1201,6 +1310,26 @@ inline void run_calls(
     for (int64_t e = 0; e < E; ++e) {
       const uint8_t* u =
           units + static_cast<int64_t>(units_used[e]) * L.unit_bytes;
+      if (exact) {
+        rows_exact(
+            static_cast<int>(isa),
+            u + L.off_w2,
+            reinterpret_cast<const uint16_t*>(u + L.off_s2),
+            I,
+            G,
+            n0,
+            n1,
+            ExactInputs{
+                dae.data() + base[e] * (I / 2),
+                dao.data() + base[e] * (I / 2),
+                fa.data() + base[e] * (I / kExactBlock),
+                ia.data() + base[e] * I,
+                pa.data() + base[e] * (I / kExactBlock)},
+            static_cast<int>(base[e + 1] - base[e]),
+            y.data() + base[e] * H,
+            H);
+        continue;
+      }
       rows(
           isa,
           arith2,
