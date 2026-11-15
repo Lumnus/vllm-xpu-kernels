@@ -7,6 +7,7 @@
 #include <c10/core/DeviceGuard.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
 #include <map>
@@ -3976,6 +3977,22 @@ static bool topKTuned(int64_t topK) {
 // widths the delegate select loses 0.7-0.9x on them where it wins only
 // 1.05-1.4x on smooth rows. At/above them it is >= 0.97x on every row type
 // measured.
+// The radix kernels above are not exact on every row: when the threshold fp16
+// bin of step 0 holds more than kNumFinalItems keys after earlier bins were
+// already taken, step 1 histograms the whole row again and takes those keys a
+// second time (duplicate indices, missing ones). A sparse indexer's scores hit
+// that case on long rows with a dense band of near-equal scores. So on BMG-G31
+// every row of a tuned topK takes the exact select here, whatever its row
+// count and width (up to kMaxWidth); the rule below is then only the speed
+// rule. VLLM_XPU_TOPK_RADIX_RULE=1 restores it as the dispatch rule.
+static bool exactForAllRows() {
+  static const bool exact = [] {
+    const char* v = std::getenv("VLLM_XPU_TOPK_RADIX_RULE");
+    return !(v != nullptr && v[0] == '1' && v[1] == '\0');
+  }();
+  return exact;
+}
+
 // Loose upper bound on the rows tested before the device is known (BMG-G31
 // has 32 Xe cores); the device's own count is checked after it.
 static constexpr int64_t kMaxRowsBound = 128;
@@ -4061,17 +4078,21 @@ static std::optional<ArenaLayout> wideRowLayout(
     int64_t stride1,
     int64_t topK,
     int64_t nextN) {
-  if (!topKTuned(topK) || numRows < 1 || numRows > kMaxRowsBound ||
-      !logits.defined() || logits.dim() != 2)
+  const bool exactAll = exactForAllRows();
+  if (!topKTuned(topK) || numRows < 1 ||
+      (!exactAll && numRows > kMaxRowsBound) || !logits.defined() ||
+      logits.dim() != 2)
     return std::nullopt;
   const int64_t width = logits.size(1);
-  if (width < minWidthFor(topK) || width > kMaxWidth) return std::nullopt;
+  if ((!exactAll && width < minWidthFor(topK)) || width > kMaxWidth)
+    return std::nullopt;
   // The device is queried only for a tensor that is on one, and its decision
   // is cached per device.
   if (!logits.is_xpu()) return std::nullopt;
   const int deviceIndex = logits.device().index();
   const DeviceCaps* caps = capsFor(deviceIndex);
-  if (caps == nullptr || numRows > caps->xeCores) return std::nullopt;
+  if (caps == nullptr || (!exactAll && numRows > caps->xeCores))
+    return std::nullopt;
   if (!legalCommon(logits, indices, numRows, stride0, stride1, topK))
     return std::nullopt;
   if constexpr (kPrefill) {
