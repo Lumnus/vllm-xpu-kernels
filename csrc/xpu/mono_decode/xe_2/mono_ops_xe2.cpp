@@ -14,6 +14,16 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+// Kernel headers older than 5.3 (glibc 2.28 build images such as
+// manylinux_2_28) do not name these syscalls. The numbers are those of the
+// unified syscall table, the same on every architecture except alpha.
+#ifndef SYS_pidfd_open
+  #define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+  #define SYS_pidfd_getfd 438
+#endif
+
 #include <cerrno>
 #include <cstring>
 #include <memory>
