@@ -76,6 +76,8 @@ def _run_cases():
     shuffle_gen = torch.Generator().manual_seed(5)
 
     # ---------------------------------------------------------- shared ops
+    gemm_tiles = []
+
     def quant_ref(x):
         """int8_quant_math.h for bf16 rows: (int8 [T, H], fp32 scale [T])."""
         xf = x.float()
@@ -140,6 +142,7 @@ def _run_cases():
     def grouped_gemm_w4a8(a, a_scale, w, w_scale, bias, d, rows_per_expert,
                           n, k, num_experts, tile=None):
         calls.append("gemm")
+        gemm_tiles.append(tile)
         start = 0
         for e, rows in enumerate(rows_per_expert.tolist()):
             if rows:
@@ -479,6 +482,7 @@ def _run_cases():
                 rpe.fill_(fill)
             out = torch.full_like(a, 3.0)
             calls.clear()
+            gemm_tiles.clear()
             folded = fmi.XpuFusedMoe.apply(impl, output=out, hidden_states=a,
                                            topk_weights=w, topk_ids=ids,
                                            w4a8=True, **kw, **extra)
@@ -489,6 +493,9 @@ def _run_cases():
                 "launches": sum(LAUNCHES[c] for c in calls),
                 "tile_m": moe_w4a8.unfused_tile(n_moe, impl.num_experts),
                 "folded": folded,
+                "gemm_tiles": list(gemm_tiles),
+                "want_tile": moe_w4a8.gemm_tile(n_moe, impl.num_experts,
+                                                impl.total_experts_num),
                 "shared": (sh, gate),
             }
     return results
@@ -542,6 +549,10 @@ def test_w4a8_fused_decode_bit_identical(tmp_path):
         for key in plain:
             ref = base[key]["out"]
             xq = got[key + "|xq"]
+            # The unfused GEMMs get the tile of the corrected rule.
+            if m == "0":
+                g = got[key]
+                assert g["gemm_tiles"] == [g["want_tile"]] * 2, (key, g)
             # Entry rows: same output and counts as the layer's own quant.
             assert torch.equal(_bits(xq["out"]), _bits(ref)), (m, key)
             assert xq["folded"] is False, (m, key)

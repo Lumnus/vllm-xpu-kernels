@@ -72,6 +72,57 @@ STOCK_PREP_ENV = "VLLM_XPU_W4A8_STOCK_PREP"
 _STOCK_PREP = os.environ.get(STOCK_PREP_ENV, "0").strip().upper() in (
     "1", "TRUE", "YES", "ON")
 
+# The grouped GEMM's M tile. The kernel's own rule divides the routed-row
+# buffer (T * top_k: every route of the call, owned by this rank or not) by
+# the LOCAL expert count, so under expert parallelism it sees ep_size x the
+# rows an expert really gets and picks the 128 x 256 tile for prefill chunks
+# whose experts hold 64-128 rows. "rows" (default) applies the same
+# thresholds to the rows per expert this rank really gets in expectation,
+# routes / total experts (n_moe / local / ep_size), and passes the tile to
+# the op. The one-card sweep (both GEMMs, uniform and routed, 32-256 rows
+# per local expert) measured 32 x 64 at 1.23-1.51x the 128 x 256 at 64-81
+# rows and every tile bit-equal, so the tile changes speed, never bits.
+# VLLM_XPU_W4A8_TILE_RULE=buffer restores the kernel's rule;
+# VLLM_XPU_W4A8_TILE (a fixed tile for every call) still overrides both.
+TILE_RULE_ENV = "VLLM_XPU_W4A8_TILE_RULE"
+_TILE_RULE = os.environ.get(TILE_RULE_ENV, "rows").strip().lower() or "rows"
+if _TILE_RULE not in ("rows", "buffer"):
+    raise ValueError(f"{TILE_RULE_ENV}={_TILE_RULE!r}: rows or buffer")
+_TILE_FIXED = os.environ.get("VLLM_XPU_W4A8_TILE", "").strip().lower() not in (
+    "", "auto")
+# avg rows per expert -> tile (the kernel's thresholds: 4 / 8 / 128).
+TILE_TABLE = ((4, "8x64", 8), (8, "16x64", 16), (128, "32x64", 32))
+TILE_BIG = "128x256"
+
+
+def tile_rule() -> str:
+    """VLLM_XPU_W4A8_TILE_RULE as read at import: rows or buffer."""
+    return _TILE_RULE
+
+
+def rows_per_expert_avg(n_moe: int, num_experts: int,
+                        total_experts: Optional[int] = None) -> int:
+    """The average the tile is chosen from: routes / total experts under
+    the rows rule (this rank's real rows per local expert in expectation),
+    routes / local experts under the buffer rule (the kernel's own)."""
+    if _TILE_RULE == "rows" and total_experts:
+        return n_moe // max(total_experts, 1)
+    return n_moe // max(num_experts, 1)
+
+
+def gemm_tile(n_moe: int, num_experts: int,
+              total_experts: Optional[int] = None) -> Optional[str]:
+    """The tile name to pass to cutlass_grouped_gemm_w4a8, or None to let
+    the op choose (buffer rule, or a fixed VLLM_XPU_W4A8_TILE)."""
+    if _TILE_RULE != "rows" or _TILE_FIXED:
+        return None
+    avg = rows_per_expert_avg(n_moe, num_experts, total_experts)
+    for bound, name, _ in TILE_TABLE:
+        if avg <= bound:
+            return name
+    return TILE_BIG
+
+
 FUSED_ENV = "VLLM_XPU_W4A8_FUSED_MOE"
 _FUSED_RAW = os.environ.get(FUSED_ENV, "0").strip()
 _FUSED = int(_FUSED_RAW) if _FUSED_RAW in ("0", "1", "2") else 0
@@ -146,17 +197,15 @@ def load_fused_ops():
     return _FOPS or None
 
 
-def unfused_tile(n_moe: int, num_experts: int) -> Optional[int]:
+def unfused_tile(n_moe: int, num_experts: int,
+                 total_experts: Optional[int] = None) -> Optional[int]:
     """The M tile the unfused dispatch picks for a call of ``n_moe`` routed
-    rows (grouped_gemm_w4a8_xe2.cpp: avg = rows / experts against 4 / 8 /
-    128), when it is one of the fused path's 8 / 16 / 32; else None."""
-    avg = n_moe // max(num_experts, 1)
-    if avg <= 4:
-        return 8
-    if avg <= 8:
-        return 16
-    if avg <= 128:
-        return 32
+    rows (the 4 / 8 / 128 thresholds on rows_per_expert_avg), when it is one
+    of the fused path's 8 / 16 / 32; else None."""
+    avg = rows_per_expert_avg(n_moe, num_experts, total_experts)
+    for bound, _, rows in TILE_TABLE:
+        if avg <= bound:
+            return rows
     return None
 
 
@@ -238,6 +287,24 @@ def _gather(output, g2, topk_weights, unp, num_experts, shared) -> bool:
     return False
 
 
+_LOGGED_TILE = False
+
+
+def _log_tile_once(n_moe: int, impl, tile: Optional[str]) -> None:
+    global _LOGGED_TILE
+    if _LOGGED_TILE:
+        return
+    _LOGGED_TILE = True
+    import logging
+    logging.getLogger("vllm_xpu_kernels").warning(
+        "W4A8 MoE tile rule: %s (%s=%s); first call %d routes over %d of %d "
+        "experts -> %s", "rows per expert on this rank (routes / total "
+        "experts)" if _TILE_RULE == "rows" and not _TILE_FIXED else
+        ("fixed VLLM_XPU_W4A8_TILE" if _TILE_FIXED else
+         "kernel rule (routes / local experts)"), TILE_RULE_ENV, _TILE_RULE,
+        n_moe, impl.num_experts, impl.total_experts_num, tile or "op's choice")
+
+
 def quant_rows(x: torch.Tensor):
     """Symmetric dynamic int8 per row: (int8 [T, H], fp32 scale [T, 1])."""
     t = x.shape[0]
@@ -317,7 +384,8 @@ def apply(impl,
         if rows_per_expert is None:
             rows_per_expert = torch.empty((impl.num_experts, ),
                                           dtype=torch.int32, device=dev)
-        tile_m = unfused_tile(n_moe, impl.num_experts) if _FUSED else None
+        tile_m = (unfused_tile(n_moe, impl.num_experts,
+                               impl.total_experts_num) if _FUSED else None)
         if (tile_m is not None and not fused_act and 0 < n_moe
                 and n_moe <= FUSED_MAX_ROUTES
                 and impl.num_experts <= FUSED_MAX_LOCAL and topk <= 16
@@ -351,6 +419,8 @@ def apply(impl,
         total_experts_num=impl.total_experts_num,
         local_experts_num=impl.local_experts_num)
 
+    tile = gemm_tile(n_moe, impl.num_experts, impl.total_experts_num)
+    _log_tile_once(n_moe, impl, tile)
     glu = load_glu_op() if fused_act and inter % 128 == 0 else None
     if glu is not None:
         global _LOGGED_FUSED
@@ -370,13 +440,13 @@ def apply(impl,
         g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
         op(remapped.view(torch.int8), remapped_sc, impl.w13,
            impl.gemm1_wei_scales, impl.w13_bias, g1, rows_per_expert,
-           2 * inter, hidden, impl.num_experts)
+           2 * inter, hidden, impl.num_experts, tile)
         act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
         impl.act_func(act, g1)
         aq, asc = quant_rows(act)
     g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
     op(aq, asc, impl.w2, impl.gemm2_wei_scales, impl.w2_bias, g2,
-       rows_per_expert, hidden, inter, impl.num_experts)
+       rows_per_expert, hidden, inter, impl.num_experts, tile)
     return _gather(output, g2, topk_weights, unp, impl.num_experts, shared)
 
 
