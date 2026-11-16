@@ -172,6 +172,11 @@ struct paged_decode_args_t {
   // Physical bytes between consecutive KV blocks (INT8 block-local split
   // layout).
   int64_t kv_page_stride_bytes = 0;
+  // INT8 KV with a bfloat16 query, head_size <= 256: quantize Q per (token,
+  // query head) in the kernel and run Q*K as s8 x s8 -> s32 DPAS (see
+  // DecodeFwdMainloop::Int8Dot). Off: Q*K in the query's 16-bit type over the
+  // widened codes, as before.
+  bool int8_dot = false;
 };
 
 template <class FMHAKernel, class ReductionSplitKernel, bool isVarLen>
@@ -510,7 +515,8 @@ template <
     typename GmemTiledCopyQ = void, /* void -> default block 2D */
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
-    typename GmemTiledCopyO = void>
+    typename GmemTiledCopyO = void,
+    bool Int8Dot = false>
 struct PagedDecodeConfig {
   static constexpr int SGTileQ =
       get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
@@ -518,6 +524,8 @@ struct PagedDecodeConfig {
       is_void_v<MMAOperation_>,
       XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>,
       MMAOperation_>;
+  // Q*K on s8 x s8 -> s32 DPAS over the same (q, k, d) tile (INT8 KV only).
+  using MMAOperationQK8 = XE_DPAS_TT<cute::gcd(SGTileQ, 8), int32_t, int8_t>;
   using SubgroupLayoutPV = cute::conditional_t<
       is_void_v<SubgroupLayoutPV_>,
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
@@ -542,6 +550,14 @@ struct PagedDecodeConfig {
         MMA_Atom<MMAOperation>,
         Layout<TileShapePV>,
         SubgroupLayoutPV>::TiledMMA;
+    using TiledMMAQK8 = cute::conditional_t<
+        Int8Dot,
+        typename TiledMMAHelper<
+            MMA_Atom<MMAOperationQK8>,
+            Layout<TileShapeQK>,
+            SubgroupLayoutQK>::TiledMMA,
+        void>;
+    static_assert(!Int8Dot || is_same_v<ElementK, int8_t>);
 
     static_assert(
         get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
@@ -576,7 +592,8 @@ struct PagedDecodeConfig {
         GmemTiledCopyQ,
         GmemTiledCopyK,
         GmemTiledCopyV,
-        Local>;
+        Local,
+        TiledMMAQK8>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
@@ -732,6 +749,39 @@ void decode_policy_dispatch_impl(
       // INT8 per-token-head KV: only head sizes whose K/V surfaces stay
       // 64-byte aligned in the block-local split layout (head_size % 64 == 0).
       if constexpr (decode_policy::HeadDim::value % 64 == 0) {
+        // INT8 Q*K (args.int8_dot): head sizes up to 256 (the mainloop keeps
+        // at most four 64-wide s8 Q chunks in registers).
+        if constexpr (decode_policy::HeadDim::value <= 256) {
+          if (args.int8_dot) {
+            return PagedDecodeConfig<
+                typename decode_policy::ShapeQK,
+                typename decode_policy::ShapePV,
+                typename decode_policy::ShapeOut,
+                typename decode_policy::SubgroupLayoutQK,
+                void,
+                PipelineStages,
+                Causal,
+                Local,
+                Sink,
+                bfloat16_t,
+                int8_t,
+                int8_t,
+                bfloat16_t,
+                void,
+                Stride<int, _1, int, int>,
+                Stride<int, _1, int, int>,
+                Stride<_1, int, int, int>,
+                Stride<int, _1, int, int>,
+                Stride<int, _1, int, int>,
+                void,
+                void,
+                void,
+                void,
+                true>::kernel_dispatch(queue, args);
+          }
+        }
+        TORCH_CHECK(
+            !args.int8_dot, "paged decode int8_dot: head size up to 256 only");
         return PagedDecodeConfig<
             typename decode_policy::ShapeQK,
             typename decode_policy::ShapePV,

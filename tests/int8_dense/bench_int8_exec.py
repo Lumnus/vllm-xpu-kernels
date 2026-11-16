@@ -29,6 +29,14 @@ Modes (comma list, default all):
   fbench   (not in the default list) the fused W4A8 decode path (VLLM_XPU_W4A8_FUSED_MOE 1 and 2) against
            the unfused one at --fbench-tokens, EP4 top-10: us per MoE call under graph replay and eager,
            and bitwise equality of the outputs.
+  abench   (not in the default list) paged decode attention over an INT8 per-token-head KV cache at the
+           per-card QFN shape (6 query heads, 1 KV head, head 256, block --abench-block), one sequence with
+           --abench-rows query rows (1 = decode, more = spec-decode verify) at --abench-ctx context:
+           int8_dot off (BF16 query x widened K codes, today) against on (Q quantized in-kernel, Q.K
+           s8 x s8 -> s32 DPAS): us per call under graph replay with the spec-decode metadata prebuilt
+           (kernel time) and as the engine calls it, KV GB/s, and numerics: on against the fp64
+           quantized-domain reference (the shared query rule), off against the decode contract (BF16
+           query), on against off; NaN check.
 
 Prints one JSON line per case (DENSE / DBENCH / GLU / MOE / MBENCH / HCDET / TSWEEP / FBENCH) and writes --out.
 """
@@ -535,6 +543,119 @@ def run_hcdet(seed):
     return res
 
 
+def query_rule_int8(q):
+    """The paged decode kernel's int8_dot query rule (int8_attn_query_scale / _code), exactly: scale =
+    max(absmax / 127, 1e-10), inv = 1 / scale (IEEE fp32 divisions: a float64 quotient of fp32 operands
+    rounds to the same fp32), y = q * inv, code = sign(y) * min((trunc(2|y|) + 1) >> 1, 127)."""
+    x = q.float()
+    scale = torch.clamp((x.abs().amax(-1).double() / 127.0).float(), min=1e-10)
+    inv = (1.0 / scale.double()).float()
+    y = x * inv[..., None]
+    c = torch.clamp(((torch.clamp(y.abs() * 2.0, max=255.0).to(torch.int32) + 1) >> 1), max=127)
+    return torch.where(y < 0, -c, c).to(torch.int8), scale
+
+
+def _int8_kv_cache(L, block, hkv, hd, seed):
+    """Split-layout INT8 per-token-head cache (as vLLM's FlashAttention backend lays it out) holding one
+    sequence of L tokens in shuffled blocks; returns views, block table and the dequantized K/V (fp64)."""
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    nblk = (L + block - 1) // block
+    nb = nblk + 1
+    page = 2 * (hd + 4) * hkv * block
+    raw = torch.randint(0, 256, (nb, page), dtype=torch.uint8, device=DEV, generator=g)
+    data, sb = block * hkv * 2 * hd, block * hkv * 4
+    d = torch.as_strided(raw.view(torch.int8), (nb, block, hkv, 2 * hd), (page, hkv * 2 * hd, 2 * hd, 1))
+    f = raw.view(torch.float32)
+
+    def scales(off):
+        return torch.as_strided(f, (nb, block, hkv), (page // 4, hkv, 1), f.storage_offset() + off // 4)
+
+    kc, vc, ks, vs = d[..., :hd], d[..., hd:], scales(data), scales(data + sb)
+    table = (torch.randperm(nb - 1, device=DEV, generator=g)[:nblk] + 1).to(torch.int32)[None]
+    deq = []
+    for cache, sc, outlier in ((kc, ks, True), (vc, vs, False)):
+        x = torch.randn(L, hkv, hd, device=DEV, generator=g)
+        if outlier:
+            x[..., :4] *= 8.0
+        x = x.to(torch.bfloat16).float()
+        s = torch.clamp(x.abs().amax(-1) / 127.0, min=1e-6)
+        y = x * (1.0 / s)[..., None]
+        code = torch.where(y >= 0, y + 0.5, y - 0.5).clamp(-128.0, 127.0).trunc().to(torch.int8)
+        pos = torch.arange(L, device=DEV)
+        b = table[0, pos // block].long()
+        cache[b, pos % block] = code
+        sc[b, pos % block] = s
+        deq.append(code.double() * s.double()[..., None])
+    return kc, vc, ks, vs, table, deq[0], deq[1]
+
+
+def _attend64(q, k, v, scale):
+    """fp64 causal attention of the last q.shape[0] positions; q [q, hq, D], k/v [L, hkv, D]."""
+    ql, L, grp = q.shape[0], k.shape[0], q.shape[1] // k.shape[1]
+    k, v = k.repeat_interleave(grp, 1), v.repeat_interleave(grp, 1)
+    s = torch.einsum("qhd,khd->hqk", q.double(), k) * scale
+    ok = torch.arange(L, device=DEV)[None, :] <= torch.arange(L - ql, L, device=DEV)[:, None]
+    return torch.einsum("hqk,khd->qhd", torch.softmax(s.masked_fill(~ok[None], float("-inf")), -1), v)
+
+
+def run_abench(rows_list, ctx_list, block, seed, check, iters):
+    """See the module docstring (abench)."""
+    from vllm_xpu_kernels import flash_attn_interface as fai
+
+    assert getattr(fai, "INT8_DOT_DECODE", False), "kernels build without int8_dot decode"
+    hq, hkv, hd = 6, 1, 256
+    scale = hd**-0.5
+    res = []
+    for L in ctx_list:
+        kc, vc, ks, vs, table, kd, vd = _int8_kv_cache(L, block, hkv, hd, seed + L)
+        kv_bytes = L * hkv * (2 * hd + 8)
+        for ql in rows_list:
+            q = torch.randn(ql, hq, hd, device=DEV).to(torch.bfloat16)
+            cu = torch.tensor([0, ql], dtype=torch.int32, device=DEV)
+            seqused = torch.tensor([L], dtype=torch.int32, device=DEV)
+            outs = {}
+            r = {"ctx": L, "rows": ql, "block": block}
+            for name, dot in (("bf16", False), ("int8", True)):
+                out = torch.empty_like(q)
+                cache = {}
+
+                def call(out=out, dot=dot, cache=cache):
+                    fai.flash_attn_varlen_func(q, kc, vc, ql, cu, L, seqused_k=seqused, softmax_scale=scale,
+                                               causal=True, block_table=table, out=out, k_descale=ks,
+                                               v_descale=vs, spec_decode_meta_cache=cache, int8_dot=dot)
+
+                call()  # builds the spec-decode metadata into `cache` outside the graph
+                sync()
+                outs[name] = out.clone()
+                r[f"{name}_graph_us"] = round(gbench(call, iters=iters), 2)
+                r[f"{name}_eager_us"] = round(ebench(call, iters=max(iters // 4, 5)), 2)
+                # Each decode row reads the whole context once (spec-decode verify: one decode row per position).
+                r[f"{name}_kv_gbs"] = round(ql * kv_bytes / (r[f"{name}_graph_us"] * 1e-6) / 1e9, 1)
+            r["int8_over_bf16"] = round(r["int8_graph_us"] / r["bf16_graph_us"], 3)
+            r["finite"] = bool(torch.isfinite(outs["int8"]).all())
+            if check:
+                qc, qs = query_rule_int8(q)
+                ref_q = _attend64(qc.double() * qs.double()[..., None], kd, vd, scale)
+                ref_c = _attend64(q.float(), kd, vd, scale)
+                r["int8_vs_quantized_rel"] = round(rel(outs["int8"], ref_q), 6)
+                r["bf16_vs_contract_rel"] = round(rel(outs["bf16"], ref_c), 6)
+                r["int8_vs_contract_rel"] = round(rel(outs["int8"], ref_c), 6)
+                r["int8_vs_bf16_rel"] = round(rel(outs["int8"], outs["bf16"]), 6)
+                # CPU bounds of the engine's agreement test (test_xpu_int8_decode_dot.py), x2 for the device.
+                r["ok"] = r["finite"] and r["int8_vs_quantized_rel"] < 1e-2 and r["int8_vs_contract_rel"] < 3e-2
+            print("ABENCH", json.dumps(r), flush=True)
+            res.append(r)
+        del kc, vc, ks, vs, table, kd, vd
+        gc_xpu()
+    return res
+
+
+def gc_xpu():
+    import gc
+    gc.collect()
+    torch.xpu.empty_cache()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="hcdet,dense,dbench,moe,mbench")
@@ -548,6 +669,11 @@ def main():
     ap.add_argument("--tsweep-rows", default="32,64,81,128,256",
                     help="tsweep: rows per local expert")
     ap.add_argument("--fbench-tokens", default="1,2,4,8,16")
+    ap.add_argument("--abench-rows", default="1,8,16", help="abench: query rows of the sequence")
+    ap.add_argument("--abench-ctx", default="2048,32768,131072", help="abench: context lengths")
+    ap.add_argument("--abench-block", type=int, default=1600, help="abench: KV block (the served 1600)")
+    ap.add_argument("--abench-iters", type=int, default=100)
+    ap.add_argument("--no-check", action="store_true", help="abench: skip the fp64 references")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", default="result-int8-exec.json")
     args = ap.parse_args()
@@ -563,6 +689,12 @@ def main():
     modes = args.mode.split(",")
     ms = [int(m) for m in args.dense_m.split(",")]
     out = {"args": vars(args)}
+    if "abench" in modes:
+        out["abench"] = run_abench([int(x) for x in args.abench_rows.split(",")],
+                                   [int(x) for x in args.abench_ctx.split(",")], args.abench_block,
+                                   args.seed, not args.no_check, args.abench_iters)
+        if not args.no_check:
+            print("ABENCH_ALL_OK", all(r["ok"] for r in out["abench"]), flush=True)
     if "hcdet" in modes:
         out["hcdet"] = run_hcdet(args.seed)
         print("HCDET_ALL_OK", all(r["ok"] for r in out["hcdet"]), flush=True)

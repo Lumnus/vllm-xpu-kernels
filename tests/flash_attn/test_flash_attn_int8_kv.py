@@ -39,6 +39,12 @@ MINI_PYTEST_PARAMS = {
         "num_heads": [(16, 2)],
         "block_size": [64],
     },
+    "test_varlen_int8_kv_int8_dot": {
+        "num_heads": [(6, 1)],
+        "head_size": [256],
+        "block_size": [64, 1600],
+        "window": [None],
+    },
 }
 
 
@@ -129,8 +135,23 @@ def build_int8_cache(seq_lens, block_size, hkv, head_size, dtype, dev,
     return kc, vc, ks, vs, block_table, keys, values
 
 
+def quantize_query_rule(q: torch.Tensor):
+    """The decode kernel's int8_dot query rule (int8_attn_query_scale /
+    int8_attn_query_code), exactly: scale = max(absmax / 127, 1e-10) and
+    1 / scale as IEEE fp32 divisions (a float64 quotient of fp32 operands
+    rounds to the same fp32), y = q * (1 / scale), codes half away from zero:
+    sign(y) * min((trunc(2|y|) + 1) >> 1, 127)."""
+    x = q.float()
+    scale = torch.clamp((x.abs().amax(-1).double() / 127.0).float(), min=1e-10)
+    inv = (1.0 / scale.double()).float()
+    y = x * inv[..., None]
+    c = (torch.clamp(y.abs() * 2.0, max=255.0).to(torch.int32) + 1) >> 1
+    c = torch.clamp(c, max=127)
+    return torch.where(y < 0, -c, c).to(torch.int8), scale
+
+
 def run_and_check(q_lens, seq_lens, hq, hkv, head_size, block_size, window,
-                  sinks, dtype, dev, pad_bytes=0, fill=None):
+                  sinks, dtype, dev, pad_bytes=0, fill=None, int8_dot=False):
     kc, vc, ks, vs, block_table, keys, values = build_int8_cache(
         seq_lens, block_size, hkv, head_size, dtype, dev, pad_bytes, fill)
     q = torch.randn(sum(q_lens), hq, head_size, device=dev).to(dtype)
@@ -153,17 +174,25 @@ def run_and_check(q_lens, seq_lens, hq, hkv, head_size, block_size, window,
                            out=out,
                            k_descale=ks,
                            v_descale=vs,
-                           s_aux=sinks)
+                           s_aux=sinks,
+                           int8_dot=int8_dot)
+    if int8_dot:
+        # The int8 query (codes x scales) the kernel multiplies with.
+        qc, qs = quantize_query_rule(q)
+        q_ref = qc.float() * qs[..., None]
+    else:
+        q_ref = q.float()
     ref = []
     for i, (L, ql) in enumerate(zip(seq_lens, q_lens)):
         q0 = int(cu_q[i])
         ref.append(
-            ref_attn(q[q0:q0 + ql].float(), keys[i], values[i], scale,
+            ref_attn(q_ref[q0:q0 + ql], keys[i], values[i], scale,
                      torch.arange(L - ql, L, device=dev), window, sinks))
     torch.testing.assert_close(out.float(),
                                torch.cat(ref),
                                atol=1.5e-2,
                                rtol=1.5e-2)
+    return out
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -206,6 +235,74 @@ def test_varlen_int8_kv_padded_page(num_heads, block_size, pad_bytes):
     hq, hkv = num_heads
     run_and_check([1] * 4, [1, 700, 1500, 3000], hq, hkv, 256, block_size,
                   None, None, torch.bfloat16, "xpu", pad_bytes)
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("num_heads", [(6, 1), (16, 4), (24, 2)])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize("block_size", [64, 128, 1600])
+@pytest.mark.parametrize("window", SLIDING_WINDOWS)
+@pytest.mark.parametrize("is_sink", SINK)
+@torch.inference_mode()
+def test_varlen_int8_kv_int8_dot(mode, num_heads, head_size, block_size,
+                                 window, is_sink):
+    """int8_dot: Q quantized per (token, query head) in the kernel, Q*K on
+    s8 x s8 -> s32 DPAS. Checked against the fp32 reference over the int8
+    query of the shared rule (codes x scales) and the same cache; and, more
+    loosely, against the BF16-query kernel."""
+    if mode != "decode" and _SPEC_DECODE_MAX_QLEN < 5:
+        pytest.skip("speculative-decode route disabled "
+                    "(VLLM_XPU_SPEC_DECODE_MAX_QLEN)")
+    torch.manual_seed(0)
+    dev = "xpu"
+    hq, hkv = num_heads
+    seq_lens = [17, 64, 200, 1 if mode == "decode" else 3, 2100]
+    q_lens = {
+        "decode": [1] * 5,
+        "spec_decode": [3] * 5,
+        "spec_decode_ragged": [3, 1, 5, 2, 16],
+    }[mode]
+    sinks = (torch.randn(hq, device=dev) * 2).to(
+        torch.bfloat16) if is_sink else None
+    args = (q_lens, seq_lens, hq, hkv, head_size, block_size, window, sinks,
+            torch.bfloat16, dev)
+    torch.manual_seed(1)
+    out8 = run_and_check(*args, fill=0x7F, int8_dot=True)
+    torch.manual_seed(1)
+    out16 = run_and_check(*args, fill=0x7F)
+    assert torch.isfinite(out8).all()
+    torch.testing.assert_close(out8.float(), out16.float(), atol=4e-2,
+                               rtol=4e-2)
+
+
+def test_varlen_int8_kv_int8_dot_refusals():
+    dev = "xpu"
+    raw = torch.zeros((4, 2 * (512 + 4) * 1 * 64),
+                      dtype=torch.uint8,
+                      device=dev)
+    for head_size, dtype in ((128, torch.half), (512, torch.bfloat16)):
+        kc, vc, ks, vs = split_layout_views(raw, 64, 1, head_size)
+        q = torch.randn(1, 6, head_size, device=dev, dtype=dtype)
+        with pytest.raises((RuntimeError, ValueError), match="int8_dot"):
+            flash_attn_varlen_func(q,
+                                   kc,
+                                   vc,
+                                   1,
+                                   torch.tensor([0, 1],
+                                                dtype=torch.int32,
+                                                device=dev),
+                                   64,
+                                   seqused_k=torch.full((1, ),
+                                                        64,
+                                                        dtype=torch.int32,
+                                                        device=dev),
+                                   causal=True,
+                                   block_table=torch.ones((1, 1),
+                                                          dtype=torch.int32,
+                                                          device=dev),
+                                   k_descale=ks,
+                                   v_descale=vs,
+                                   int8_dot=True)
 
 
 @pytest.mark.parametrize("q_lens", [[33], [1, 33]])

@@ -137,7 +137,8 @@ void cutlass_paged_decode_interface(
     std::optional<const at::Tensor>& is_prefill,
     std::optional<at::Tensor>& splits_per_seq,
     std::optional<at::Tensor>& work_list,
-    std::optional<at::Tensor>& softmax_lse) {
+    std::optional<at::Tensor>& softmax_lse,
+    bool int8_dot) {
   const bool force_xe3p = vllm::xpu::force_xe3p_kernel();
   if (!force_xe3p && (vllm::xpu::is_xe2_arch() || vllm::xpu::is_xe3_arch())) {
 #ifdef VLLM_XPU_ENABLE_XE2
@@ -170,13 +171,15 @@ void cutlass_paged_decode_interface(
         is_prefill,
         splits_per_seq,
         work_list,
-        softmax_lse);
+        softmax_lse,
+        int8_dot);
 #else
     TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
 #endif
   }
 #ifdef VLLM_XPU_ENABLE_XE3P
   else if (force_xe3p || vllm::xpu::is_xe3p_arch()) {
+    TORCH_CHECK(!int8_dot, "paged decode int8_dot: XE2 kernels only");
     // Use XE3 cutlass kernel for XE3P (CRI simulator)
     vllm::xpu::xe3::cutlass_paged_decode_xe3(
         queue,

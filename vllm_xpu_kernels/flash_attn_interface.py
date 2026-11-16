@@ -106,6 +106,29 @@ except ValueError:
 SPEC_DECODE_META_CACHE = True
 _LOGGED_META_CACHE = False
 
+# INT8 attention arithmetic at decode (``int8_dot=True`` with an INT8
+# per-token-head KV cache and a bfloat16 query): the paged decode kernel
+# quantizes Q per (token, query head) itself (scale = absmax / 127, codes
+# rounded half away from zero, both divisions exactly rounded), runs Q*K as
+# s8 x s8 -> s32 DPAS on the cached K codes and scales the exact int32 dot by
+# q_scale * k_scale in fp32. Softmax and P*V are as without it. Decode and
+# spec-decode verify rows (query length <= _SPEC_DECODE_MAX_QLEN) only; head
+# size up to 256. INT8_DOT_DECODE tells callers the argument exists.
+INT8_DOT_DECODE = True
+_LOGGED_INT8_DOT = False
+
+
+def _int8_dot_kwargs(int8_dot: bool) -> dict:
+    global _LOGGED_INT8_DOT
+    if not int8_dot:
+        return {}
+    if not _LOGGED_INT8_DOT:
+        _LOGGED_INT8_DOT = True
+        _logger.warning(
+            "FA paged decode on INT8 KV: int8_dot on (Q quantized per token "
+            "and head in the kernel, Q*K s8 x s8 -> s32 on DPAS, P*V BF16)")
+    return {"int8_dot": True}
+
 
 def spec_decode_metadata(cu_seqlens_q, seqused_k, block_table, total):
     """(cu_seqlens_q_spec, dummy_cu_seqlens_k, seqused_k_spec,
@@ -170,6 +193,7 @@ def _spec_decode_varlen_fwd(
     window_size,
     softcap,
     meta_cache=None,
+    int8_dot=False,
 ):
     """Decode causal query rows, including empty requests and query padding."""
     (cu_seqlens_q_spec, dummy_cu_seqlens_k, seqused_k_spec, block_table_spec,
@@ -207,6 +231,7 @@ def _spec_decode_varlen_fwd(
         False,  # is_mix_batch
         None,  # splits_per_seq
         None,  # work_list
+        **_int8_dot_kwargs(int8_dot),
     )
     return out.masked_fill_(is_padding[:, None, None], 0)
 
@@ -539,6 +564,7 @@ def flash_attn_varlen_func(
     host_kv_lens: Optional[torch.Tensor] = None,
     dynamic_causal: Optional[torch.Tensor] = None,
     spec_decode_meta_cache: Optional[dict] = None,
+    int8_dot: bool = False,
 ):
     """
     FlashAttention interface for variable-length sequences, with optional
@@ -571,6 +597,9 @@ def flash_attn_varlen_func(
             metadata there, so the layers of a forward that pass the same
             cu_seqlens_q, seqused_k and block_table build it once (see
             ``spec_decode_metadata``). None builds it in every call.
+        int8_dot: INT8 per-token-head KV with a bfloat16 query, decode and
+            spec-decode verify rows only: Q*K in int8 on the matrix engine
+            (see INT8_DOT_DECODE).
     """
     if host_kv_lens is not None:
         if seqused_k is not None:
@@ -606,6 +635,12 @@ def flash_attn_varlen_func(
     else:
         k_descale = _normalize_descale_tensor(k_descale, "k_descale")
         v_descale = _normalize_descale_tensor(v_descale, "v_descale")
+    if int8_dot and (k.dtype != torch.int8 or q.dtype != torch.bfloat16
+                     or max_seqlen_q > max(_SPEC_DECODE_MAX_QLEN, 1)):
+        raise ValueError(
+            "int8_dot needs an INT8 KV cache, a bfloat16 query and decode "
+            f"rows (max_seqlen_q <= {max(_SPEC_DECODE_MAX_QLEN, 1)}); got "
+            f"k {k.dtype}, q {q.dtype}, max_seqlen_q {max_seqlen_q}")
     # custom op does not support non-tuple input
     real_window_size: tuple[int, int]
     if window_size is None:
@@ -695,6 +730,7 @@ def flash_attn_varlen_func(
                     real_window_size,
                     softcap,
                     spec_decode_meta_cache,
+                    int8_dot,
                 )
 
             out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
@@ -730,6 +766,7 @@ def flash_attn_varlen_func(
                 splits_per_seq_dev,
                 work_list_dev,
                 dynamic_causal,
+                **_int8_dot_kwargs(int8_dot),
             )
         except RuntimeError as e:
             # The reference fallback takes per-tensor descales only; INT8

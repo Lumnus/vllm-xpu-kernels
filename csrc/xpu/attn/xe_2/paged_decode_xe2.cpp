@@ -39,7 +39,8 @@ void cutlass_paged_decode_xe2(
     std::optional<const at::Tensor>& is_prefill,
     std::optional<at::Tensor>& splits_per_seq,
     std::optional<at::Tensor>& work_list,
-    std::optional<at::Tensor>& softmax_lse) {
+    std::optional<at::Tensor>& softmax_lse,
+    bool int8_dot) {
   cutlass_paged_decode_impl(
       queue,
       query,
@@ -68,7 +69,8 @@ void cutlass_paged_decode_xe2(
       is_prefill,
       splits_per_seq,
       work_list,
-      softmax_lse);
+      softmax_lse,
+      int8_dot);
 }
 
 inline bool is_single_value_broadcast_tensor(const at::Tensor& t) {
@@ -112,7 +114,8 @@ void cutlass_paged_decode_impl(
     std::optional<const at::Tensor>& is_prefill,
     std::optional<at::Tensor>& splits_per_seq,
     std::optional<at::Tensor>& work_list,
-    std::optional<at::Tensor>& softmax_lse) {
+    std::optional<at::Tensor>& softmax_lse,
+    bool int8_dot) {
   bool is_fp8_kv = key_cache.scalar_type() == at::ScalarType::Float8_e5m2 ||
                    key_cache.scalar_type() == at::ScalarType::Float8_e4m3fn;
   if (is_fp8_kv) {
@@ -237,6 +240,17 @@ void cutlass_paged_decode_impl(
     args.kv_scale_stride_slot = k_scale->stride(1);
     args.kv_scale_stride_head = k_scale->stride(2);
     args.kv_page_stride_bytes = key_cache.stride(0);
+  }
+  if (int8_dot) {
+    TORCH_CHECK(
+        key_cache.scalar_type() == at::ScalarType::Char &&
+            query.scalar_type() == at::ScalarType::BFloat16,
+        "paged decode int8_dot needs an INT8 KV cache and a bfloat16 query");
+    TORCH_CHECK(
+        head_size <= 256 && head_size % 64 == 0,
+        "paged decode int8_dot: head size a multiple of 64 up to 256, got ",
+        head_size);
+    args.int8_dot = true;
   }
 
   // For non-contiguous paged KV (e.g., cross-layer KV cache), enlarge

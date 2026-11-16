@@ -56,4 +56,5 @@ void cutlass_paged_decode_interface(
     std::optional<const at::Tensor>& is_prefill,
     std::optional<at::Tensor>& splits_per_seq,
     std::optional<at::Tensor>& work_list,
-    std::optional<at::Tensor>& softmax_lse);
+    std::optional<at::Tensor>& softmax_lse,
+    bool int8_dot = false);

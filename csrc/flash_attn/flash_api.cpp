@@ -127,7 +127,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
     bool mix_batch,
     std::optional<at::Tensor>& splits_per_seq,
     std::optional<at::Tensor>& work_list,
-    std::optional<const at::Tensor>& dynamic_causal) {
+    std::optional<const at::Tensor>& dynamic_causal,
+    bool int8_dot) {
   auto q_type = q.scalar_type();
   auto k_type = k.scalar_type();
   bool q_is_fp8 = q_type == at::ScalarType::Float8_e5m2 ||
@@ -193,6 +194,11 @@ std::vector<at::Tensor> mha_varlen_fwd(
       !is_int8_kv || max_seqlen_q == 1,
       "INT8 KV cache is supported for decode (max_seqlen_q == 1) only; "
       "dequantize the KV blocks for prefill");
+  // int8_dot: Q quantized per (token, head) in the decode kernel, Q*K as
+  // s8 x s8 -> s32 DPAS (paged decode only; checked again in the kernel).
+  TORCH_CHECK(
+      !int8_dot || (is_int8_kv && q_type == at::ScalarType::BFloat16),
+      "int8_dot needs an INT8 KV cache and a bfloat16 query");
 
   CHECK_DEVICE(cu_seqlens_q);
   CHECK_CONTIGUOUS(cu_seqlens_q);
@@ -477,7 +483,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         no_mask,
         splits_per_seq,
         work_list,
-        softmax_lse_opt);
+        softmax_lse_opt,
+        int8_dot);
   }
 
   if (return_softmax) {
@@ -504,8 +511,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool is_causal, int window_size_left, int window_size_right, float "
       "softcap, bool return_softmax, "
       "Generator? gen, int? num_splits, bool mix_batch, Tensor? "
-      "splits_per_seq, Tensor? work_list, Tensor? dynamic_causal=None) -> "
-      "Tensor[]");
+      "splits_per_seq, Tensor? work_list, Tensor? dynamic_causal=None, "
+      "bool int8_dot=False) -> Tensor[]");
   ops.impl(
       "varlen_fwd",
       torch::kXPU,
