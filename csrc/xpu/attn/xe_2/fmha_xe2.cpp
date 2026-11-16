@@ -34,7 +34,8 @@ void cutlass_chunk_prefill_xe2(
     bool is_sink,
     std::optional<at::Tensor>& softmax_lse,
     std::optional<const at::Tensor>& is_prefill,
-    std::optional<const at::Tensor>& dynamic_causal) {
+    std::optional<const at::Tensor>& dynamic_causal,
+    int int8_prefill) {
   cutlass_chunk_prefill_impl(
       queue,
       query,
@@ -59,7 +60,8 @@ void cutlass_chunk_prefill_xe2(
       is_sink,
       softmax_lse,
       is_prefill,
-      dynamic_causal);
+      dynamic_causal,
+      int8_prefill);
 }
 
 void cutlass_chunk_prefill_impl(
@@ -86,7 +88,8 @@ void cutlass_chunk_prefill_impl(
     bool is_sink,
     std::optional<at::Tensor>& softmax_lse,
     std::optional<const at::Tensor>& is_prefill,
-    std::optional<const at::Tensor>& dynamic_causal) {
+    std::optional<const at::Tensor>& dynamic_causal,
+    int int8_prefill) {
   // general params
   int batch_size, num_heads_q, num_heads_kv, head_size;
   // additional params
@@ -184,6 +187,44 @@ void cutlass_chunk_prefill_impl(
   args.dynamic_causal = dynamic_causal.has_value()
                             ? dynamic_causal.value().data_ptr<int>()
                             : nullptr;
+
+  // INT8 per-token-head KV: prefill over the cache in place (int8_prefill 1:
+  // 16-bit dots over the widened codes; 2: INT8 Q*K; 3: INT8 Q*K and P*V).
+  // k_scale / v_scale are
+  // the per-token scale caches (validated in check_int8_kv_cache by the
+  // caller); the split layout's block stride goes in bytes.
+  if (key_cache.scalar_type() == at::ScalarType::Char) {
+    TORCH_CHECK(
+        int8_prefill >= 1 && int8_prefill <= 3,
+        "chunk prefill on an INT8 KV cache needs int8_prefill 1, 2 or 3, got ",
+        int8_prefill);
+    TORCH_CHECK(
+        query.scalar_type() == at::ScalarType::BFloat16,
+        "chunk prefill int8_prefill: bfloat16 query only");
+    TORCH_CHECK(
+        is_paged && is_varlen && is_causal && !is_local && !is_sink &&
+            !softmax_lse.has_value() && !dynamic_causal.has_value(),
+        "chunk prefill int8_prefill: paged varlen causal attention without "
+        "window, sinks, softmax_lse or dynamic_causal only");
+    TORCH_CHECK(
+        head_size == 256,
+        "chunk prefill int8_prefill: head_size 256 only, got ",
+        head_size);
+    TORCH_CHECK(
+        block_size == 32 || block_size % 64 == 0,
+        "chunk prefill int8_prefill: block_size 32 or a multiple of 64, got ",
+        block_size);
+    args.k_scale = k_scale.value().data_ptr();
+    args.v_scale = v_scale.value().data_ptr();
+    args.kv_scale_stride_block = k_scale->stride(0);
+    args.kv_scale_stride_slot = k_scale->stride(1);
+    args.kv_scale_stride_head = k_scale->stride(2);
+    args.kv_page_stride_bytes = key_cache.stride(0);
+    args.int8_prefill = int8_prefill;
+  } else {
+    TORCH_CHECK(
+        int8_prefill == 0, "chunk prefill int8_prefill needs an INT8 KV cache");
+  }
   // Extract Q, K, V, O strides from tensors
   if (is_varlen) {
     // Q/O: [total_seq, num_heads, head_size]

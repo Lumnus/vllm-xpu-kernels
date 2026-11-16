@@ -35,7 +35,8 @@ void cutlass_chunk_prefill_interface(
     bool is_sink,
     std::optional<at::Tensor>& softmax_lse,
     std::optional<const at::Tensor>& is_prefill,
-    std::optional<const at::Tensor>& dynamic_causal) {
+    std::optional<const at::Tensor>& dynamic_causal,
+    int int8_prefill) {
   const bool force_xe3p = vllm::xpu::force_xe3p_kernel();
   if (!force_xe3p && (vllm::xpu::is_xe2_arch() || vllm::xpu::is_xe3_arch())) {
 #ifdef VLLM_XPU_ENABLE_XE2
@@ -64,7 +65,8 @@ void cutlass_chunk_prefill_interface(
         is_sink,
         softmax_lse,
         is_prefill,
-        dynamic_causal);
+        dynamic_causal,
+        int8_prefill);
 #else
     TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
 #endif
@@ -74,6 +76,8 @@ void cutlass_chunk_prefill_interface(
     TORCH_CHECK(
         !dynamic_causal.has_value(),
         "dynamic_causal is not supported by the XE3P attention kernel");
+    TORCH_CHECK(
+        int8_prefill == 0, "chunk prefill int8_prefill: XE2 kernels only");
     // Use XE3 cutlass kernel
     vllm::xpu::xe3::cutlass_chunk_prefill_xe3(
         queue,

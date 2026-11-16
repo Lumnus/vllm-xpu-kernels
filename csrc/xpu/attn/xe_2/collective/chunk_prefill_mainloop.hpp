@@ -90,12 +90,57 @@ template <
     class TensorV_,
     class TiledCopyQ_ = void,  // Optional TiledCopy for loading Q
     class TiledCopyK_ = void,  // Optional TiledCopy for loading K
-    class TiledCopyV_ = void>  // Optional TiledCopy for loading V
+    class TiledCopyV_ = void,  // Optional TiledCopy for loading V
+    // INT8 KV only (see Int8Dot below): s8 x s8 -> s32 MMA for Q*K and the
+    // 16-bit MMA over the same (q, k, d) tile that loads the query for its
+    // quantization.
+    class TiledMMAQK8_ = void,
+    class TiledMMAQ16_ = void,
+    // INT8 P*V (with the int8 Q*K only): s8 x s8 -> s32 MMA over the P*V tile.
+    class TiledMMAPV8_ = void>
 struct FMHAFwdMainloop {
   static_assert(
       cutlass::detail::dependent_false<DispatchPolicy_>,
       "Could not find a mainloop specialization.");
 };
+
+// Exactly rounded fp32 division a / b (round to nearest even) from FMAs, so the
+// result does not depend on the TU's floating-point model (the attention TUs
+// build with the default fast model, where '/' may be approximate). The
+// reciprocal comes from native::recip (opaque to algebraic folding) and two
+// Newton steps; the quotient gets one FMA residual correction (Markstein).
+// Finite, normal operands only (the callers pass |b| >= 1e-10).
+static inline float int8_attn_div_rn(float a, float b) {
+  float r = sycl::native::recip(b);
+  r = sycl::fma(sycl::fma(-b, r, 1.0f), r, r);
+  r = sycl::fma(sycl::fma(-b, r, 1.0f), r, r);
+  float q = a * r;
+  float e = sycl::fma(-b, q, a);
+  return sycl::fma(e, r, q);
+}
+
+// The shared INT8 query rule of the attention kernels (paged decode and chunk
+// prefill here, prefill in the engine's Triton kernel): per (token, query head)
+//   scale = max(absmax / 127, 1e-10), y = x * (1 / scale) (both divisions
+//   exactly rounded), code = sign(y) * min(floor(|y| + 1/2), 127),
+// with the half-up rounding computed exactly: floor(|y| + 1/2) =
+// (trunc(2 |y|) + 1) >> 1 (2 |y| is exact), so no fp addition can round.
+static inline float int8_attn_query_scale(float absmax) {
+  return sycl::fmax(int8_attn_div_rn(absmax, 127.0f), 1.0e-10f);
+}
+static inline float int8_attn_query_code(float x, float inv_scale) {
+  const float y = x * inv_scale;
+  const float a2 = sycl::fabs(y) * 2.0f;
+  int c = a2 < 255.0f ? (static_cast<int>(a2) + 1) >> 1 : 127;
+  c = c > 127 ? 127 : c;
+  return y < 0.0f ? static_cast<float>(-c) : static_cast<float>(c);
+}
+// INT8 P*V: P * v_scale (>= 0) per query row of a KV tile, scale = max(row max
+// / 127, 1e-30) exactly rounded, codes by int8_attn_query_code with the exactly
+// rounded inverse (the engine's Triton reference uses the same rule).
+static inline float int8_attn_p_scale(float rowmax) {
+  return sycl::fmax(int8_attn_div_rn(rowmax, 127.0f), 1.0e-30f);
+}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -112,7 +157,10 @@ template <
     class TensorV_,
     class TiledCopyQ_,
     class TiledCopyK_,
-    class TiledCopyV_>
+    class TiledCopyV_,
+    class TiledMMAQK8_,
+    class TiledMMAQ16_,
+    class TiledMMAPV8_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -126,7 +174,10 @@ struct FMHAFwdMainloop<
     TensorV_,
     TiledCopyQ_,
     TiledCopyK_,
-    TiledCopyV_> {
+    TiledCopyV_,
+    TiledMMAQK8_,
+    TiledMMAQ16_,
+    TiledMMAPV8_> {
   //
   // Type Aliases
   //
@@ -199,8 +250,41 @@ struct FMHAFwdMainloop<
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PagedKV = PagedKV_;
 
+  // INT8 per-token-head KV (prefill over the cache in place): int8 K/V codes in
+  // the block-local split layout plus one fp32 scale per (KV token, KV head),
+  // read from [num_blocks, block_size, num_heads_kv] scale caches (scale_k /
+  // scale_v point to them); one 2D surface per (block, head), so the block
+  // stride is passed in bytes. Paged, causal or full, no window. The arithmetic
+  // is the paged decode kernel's (DecodeFwdMainloop): S = (Q*K) * k_scale per
+  // column before the mask, fp32 online softmax, P *= v_scale per column after
+  // the row sums, P*V in the query's 16-bit type over the widened V codes.
+  static constexpr bool Int8KV = is_same_v<ElementK, int8_t>;
+  // INT8 Q*K (int8 KV only): the query is quantized per (token, query head)
+  // in the kernel with the shared rule (int8_attn_query_scale / _code), Q*K
+  // runs as s8 x s8 -> s32 DPAS on the cached K codes and
+  // S = s32 * q_scale * k_scale in fp32. Without it, Q*K runs on the 16-bit
+  // query over the widened K codes, exactly as the paged decode kernel does.
+  static constexpr bool Int8Dot = !is_void_v<TiledMMAQK8_>;
+  static_assert(!Int8Dot || Int8KV, "the int8 Q*K dot needs an int8 KV cache");
+  static_assert(
+      !Int8KV || (PagedKV && !LocalMask),
+      "INT8 KV prefill: paged KV cache, no local window");
+  static_assert(
+      Int8Dot == !is_void_v<TiledMMAQ16_>,
+      "the int8 Q*K dot needs both its s8 and its 16-bit query MMA");
+  using TiledMMAQK8 = conditional_t<Int8Dot, TiledMMAQK8_, TiledMMAQK_>;
+  using TiledMMAQ16 = conditional_t<Int8Dot, TiledMMAQ16_, TiledMMAQK_>;
+  // INT8 P*V (with Int8Dot): after the softmax and P *= v_scale, P is
+  // quantized per query row of the KV tile (int8_attn_p_scale), P*V runs as
+  // s8 x s8 -> s32 DPAS on the cached V codes as loaded (no widening), and
+  // O = O * rescale + s32 * p_scale in fp32.
+  static constexpr bool Int8PV = !is_void_v<TiledMMAPV8_>;
+  static_assert(!Int8PV || Int8Dot, "the int8 P*V needs the int8 Q*K");
+  using TiledMMAPV8 = conditional_t<Int8PV, TiledMMAPV8_, TiledMMAPV_>;
+  using TileShapeQK8 = decltype(TiledMMAQK8{}.tile_mnk());
+
   // User-facing arguments
-  struct Arguments {
+  struct ArgumentsCommon {
     ElementS const scale;
     void* const scale_k;
     void* const scale_v;
@@ -215,26 +299,68 @@ struct FMHAFwdMainloop<
     // Physical stride between paged blocks in seq-position units.
     int page_stride_elements;
   };
+  // INT8 KV: the same fields plus the scale-cache strides (elements) and the
+  // block stride of the split layout (bytes). A separate type, so the other
+  // instantiations keep their parameter block unchanged.
+  struct ArgumentsInt8KV {
+    ElementS const scale;
+    void* const scale_k;
+    void* const scale_v;
+    const int* ptr_page_table;
+    int page_size;
+    int max_pages_per_seq;
+    int total_seqlen_kv;
+    int local_left, local_right;
+    int page_stride_elements;
+    int64_t scale_stride_block = 0;
+    int64_t scale_stride_slot = 0;
+    int64_t scale_stride_head = 0;
+    int64_t page_stride_bytes = 0;
+  };
+  using Arguments = conditional_t<Int8KV, ArgumentsInt8KV, ArgumentsCommon>;
 
   // Kernel-facing parameters
   using Params = Arguments;
 
-  // SLM data
-  struct SharedStorage {};
+  // SLM data. Int8Dot: each sub-group's s8 Q operand (head_dim / 64 chunks of
+  // the 64-wide s8 A fragment), written once per work tile and read back in
+  // every KV tile, so the s8 query is not live in registers across the KV
+  // loop next to the O accumulator. Stored element-major across the
+  // sub-group's lanes ([element][lane] bytes: the fragment's register image),
+  // so a sub-group block read of 16 bytes per lane lands in the fragment
+  // registers as they are, without per-byte moves. The epilogue of this
+  // kernel uses no SLM (ReduceK == 1).
+  static constexpr int kInt8DChunks = 4;  // head_dim <= 256, 64-wide chunks
+  using FragQ8 = decltype(TiledMMAQK8{}.get_slice(0).partition_sg_fragment_A(
+      make_identity_tensor(select<0, 2>(TileShapeQK8{}))));
+  static constexpr int kQ8LaneBytes =
+      Int8Dot ? int(decltype(size(FragQ8{}.tensor()))::value) : 16;
+  static_assert(kQ8LaneBytes % 16 == 0);
+  static constexpr int kQ8Blocks = kQ8LaneBytes / 16;  // uchar16 block reads
+  struct SharedStorageInt8Dot {
+    alignas(64)
+        uint8_t q8[SGPerWG::value][kInt8DChunks][kQ8LaneBytes * intel::sg_size];
+  };
+  using Q8Block = uint8_t __attribute__((ext_vector_type(16)));
+  struct SharedStorageNone {};
+  using SharedStorage =
+      conditional_t<Int8Dot, SharedStorageInt8Dot, SharedStorageNone>;
 
   Params params;
+  SharedStorage* smem_ = nullptr;
 
   //
   // Methods
   //
 
-  FMHAFwdMainloop(Params const& params_, SharedStorage&) : params(params_) {}
+  FMHAFwdMainloop(Params const& params_, SharedStorage& smem)
+      : params(params_), smem_(&smem) {}
 
   static constexpr Params
   to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
-    return Params{
+    Params p{
         val,
         args.scale_k,
         args.scale_v,
@@ -245,6 +371,13 @@ struct FMHAFwdMainloop<
         args.local_left,
         args.local_right,
         args.page_stride_elements};
+    if constexpr (Int8KV) {
+      p.scale_stride_block = args.scale_stride_block;
+      p.scale_stride_slot = args.scale_stride_slot;
+      p.scale_stride_head = args.scale_stride_head;
+      p.page_stride_bytes = args.page_stride_bytes;
+    }
+    return p;
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -283,8 +416,29 @@ struct FMHAFwdMainloop<
       int seq_len,
       int full_tile_offset,
       int blk_local_l_safe,
-      int blk_local_r_safe) {
+      int blk_local_r_safe,
+      int head_kv = 0) {  // KV head (INT8 KV: indexes the scale caches)
     using namespace sycl::ext::oneapi::this_work_item;
+
+    if constexpr (Int8KV) {
+      int8_kv_mainloop(
+          Q_2D,
+          K_2D,
+          V_2D,
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          idx_b,
+          blk_k0,
+          blk_k1,
+          blk_k1_causal,
+          thr_id,
+          seq_len,
+          full_tile_offset,
+          head_kv);
+      return;
+    }
 
     // Short dimension names:
     //    q = sequence len dimension for Q
@@ -709,6 +863,492 @@ struct FMHAFwdMainloop<
     }
   }
 
+  // INT8 per-token-head KV prefill: the chunk-prefill walk (Q tile per
+  // work-group, one sub-group per SG_Q rows, KV tiles of tile_k slots, causal
+  // mask on absolute positions, workgroup split barrier per tile) over the int8
+  // cache in place. Per KV tile: one page-table read, one K and one V surface
+  // for that block (the split layout's block stride is in bytes), the tile's
+  // K and V scales (0 past seq_len, so stale bytes never multiply), Q*K as
+  // s8 x s8 -> s32 (Int8Dot) or on the 16-bit query over widened K codes, the
+  // K scale per column, masks, fp32 online softmax, the V scale per column
+  // after the row sums, P*V over widened V codes. No dequantized scratch.
+  template <typename QVCoord>
+  CUTLASS_DEVICE void int8_kv_mainloop(
+      TensorQ2D const& Q_2D,  // (q,d)
+      TensorK2D const& K_2D,  // (k,d), int8, head offset applied
+      TensorV2D const& V_2D,  // (d,k), int8, head offset applied
+      FragA& tArA,
+      FragARow& tA_max,
+      FragARow& tA_sum,
+      QVCoord blk_qv,
+      int const& idx_b,
+      int blk_k0,
+      int blk_k1,
+      int blk_k1_causal,
+      int thr_id,
+      int seq_len,
+      int full_tile_offset,
+      int head_kv) {
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    constexpr int tile_k = get<1>(TileShapeQK{});
+    // Query rows per sub-group (the chunk-prefill policies split Q only).
+    constexpr int kSGRows = decltype(get<0>(
+        shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{}))))::value;
+    auto tile_shape_v =
+        make_shape(get<1>(TileShapePV{}) * C<VTiles>{}, get<2>(TileShapePV{}));
+
+    const int lane = get_sub_group().get_local_id()[0];
+    const int sg = thr_id / intel::sg_size;
+    const int tiles_per_page = params.page_size / tile_k;
+    const int row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + sg * kSGRows;
+
+    /* Q: the 16-bit query, 64B-aligned surface as the base path */
+    int x_shift_q;
+    auto Q_2D_al = align_block_2d_base<1>(Q_2D, x_shift_q);
+    Tensor cQ =
+        make_shifted_identity_tensor<1>(Q_2D.shape(), x_shift_q);  // (q,d)
+    Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));   // (q,k)
+    Tensor gQ = local_tile(
+        cQ, TileShapeQK{}, append(blk_qv, _), Step<_1, X, _1>{});  // (q,d,D)
+
+    /* K and V of one cache block: the coordinates do not depend on the block */
+    auto layout_kb = make_layout(
+        make_shape(params.page_size, get<1>(K_2D.shape())), K_2D.stride());
+    auto layout_vb = make_layout(
+        make_shape(get<0>(V_2D.shape()), params.page_size), V_2D.stride());
+    auto k_block = [&](int pblk) {
+      return make_tensor(
+          K_2D.data() + int64_t(pblk) * params.page_stride_bytes, layout_kb);
+    };
+    auto v_block = [&](int pblk) {
+      return make_tensor(
+          V_2D.data() + int64_t(pblk) * params.page_stride_bytes, layout_vb);
+    };
+    Tensor cKb = make_identity_tensor(shape(layout_kb));  // (k,d)
+    Tensor cVb = make_identity_tensor(shape(layout_vb));  // (v,k)
+    Tensor gKb = local_tile(
+        cKb,
+        TileShapeQK{},
+        make_coord(_, _, _),
+        Step<X, _1, _1>{});  // (k,d,T,D)
+    Tensor gVb = local_tile(
+        cVb, tile_shape_v, make_coord(get<1>(blk_qv), _));  // (v,k,T)
+    Tensor gVb_split = local_tile(
+        gVb,
+        TileShapePV{},
+        make_coord(_, _, 0),
+        Step<X, _1, _1>{});  // (v,k,VV,T)
+
+    TiledCopyQ copy_q{Q_2D_al};
+    TiledCopyV copy_v{v_block(0)};
+    TiledMMAQK mma_qk{};
+    TiledMMAPV mma_pv{};
+    auto thr_copy_q = copy_q.get_slice(thr_id);
+    auto thr_copy_v = copy_v.get_slice(thr_id);
+    auto thr_mma_qk = mma_qk.get_slice(thr_id);
+    auto thr_mma_pv = mma_pv.get_slice(thr_id);
+
+    auto tQgQ = thr_copy_q.partition_S(gQ);         // (atom_val,q',d',D)
+    auto tVgV = thr_copy_v.partition_S(gVb_split);  // (atom_val,v',k',VV,T)
+    auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_, _, 0));
+    auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_, _, 0));
+    auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
+    auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
+    auto tVrV = thr_copy_v.partition_sg_fragment_D(gVb_split(_, _, 0, 0));
+    auto tArV = thr_mma_pv.partition_sg_fragment_B(gVb_split(_, _, 0, 0));
+
+    /* Q prefetch */
+    auto prefetch_q = make_block_2d_prefetch(copy_q);
+    auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
+    CUTLASS_PRAGMA_UNROLL
+    for (int D = 0; D < size<3>(pQgQ); D++) {
+      prefetch(prefetch_q, pQgQ(_, _, _, D));
+    }
+
+    auto phys_block = [&](int k_tile) {
+      int page_local = k_tile * tile_k / params.page_size;
+      page_local = page_local < params.max_pages_per_seq
+                       ? page_local
+                       : params.max_pages_per_seq - 1;
+      return params
+          .ptr_page_table[idx_b * params.max_pages_per_seq + page_local];
+    };
+    // fp32 scales of this tile's columns (this lane's: lane, lane + 16, ...);
+    // 0 at and past seq_len, where the cache may hold stale bytes. A tile lies
+    // inside one block: its slot is t * tile_k + column (t = tile in block).
+    auto tile_scales = [&](void* cache, int k_tile, int t, int pblk) {
+      FragSCol sc;
+      const float* base = static_cast<const float*>(cache) +
+                          int64_t(pblk) * params.scale_stride_block +
+                          int64_t(head_kv) * params.scale_stride_head;
+      int k = k_tile * tile_k + lane;
+      int slot = t * tile_k + lane;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < sc.size();
+           i++, k += intel::sg_size, slot += intel::sg_size) {
+        sc(i) = (k < seq_len)
+                    ? ElementS(base[int64_t(slot) * params.scale_stride_slot])
+                    : ElementS(0);
+      }
+      return sc;
+    };
+
+    // ---- INT8 Q*K: s8 operands, query quantized here once per work tile ----
+    using TiledCopyK8 =
+        decltype(make_block_2d_copy_B(TiledMMAQK8{}, TensorK2D{}));
+    using TiledCopyQ16 =
+        decltype(make_block_2d_copy_A(TiledMMAQ16{}, TensorQ2D{}));
+    TiledMMAQK8 mma_qk8{};
+    auto thr_mma_qk8 = mma_qk8.get_slice(thr_id);
+    auto thr_mma_q16 = TiledMMAQ16{}.get_slice(thr_id);
+    Tensor gQ8 = local_tile(
+        cQ, TileShapeQK8{}, append(blk_qv, _), Step<_1, X, _1>{});  // (q,d,D8)
+    Tensor gKb8 = local_tile(
+        cKb,
+        TileShapeQK8{},
+        make_coord(_, _, _),
+        Step<X, _1, _1>{});  // (k,d,T,D8)
+    TiledCopyK8 copy_k8{k_block(0)};
+    auto thr_copy_k8 = copy_k8.get_slice(thr_id);
+    auto tKgK8 = thr_copy_k8.partition_S(gKb8);  // (atom_val,k',d',T,D8)
+    auto tKrK8 = thr_copy_k8.partition_sg_fragment_D(gKb8(_, _, 0, 0));
+    auto tSrK8 = thr_mma_qk8.partition_sg_fragment_B(gKb8(_, _, 0, 0));
+    auto tSrQ8 = thr_mma_qk8.partition_sg_fragment_A(gQ8(_, _, 0));
+    float row_scale[Int8Dot ? kSGRows : 1];
+    row_scale[0] = 1.0f;
+
+    if constexpr (Int8Dot) {
+      static_assert(decltype(size(tSrQ8.tensor()))::value == kQ8LaneBytes);
+      TiledCopyQ16 copy_q16{Q_2D_al};
+      auto thr_copy_q16 = copy_q16.get_slice(thr_id);
+      auto tQgQ16 = thr_copy_q16.partition_S(gQ8);  // (atom_val,q',d',D8)
+      auto tQrQ16 = thr_copy_q16.partition_sg_fragment_D(gQ8(_, _, 0));
+      auto tSrQ16 = thr_mma_q16.partition_sg_fragment_A(gQ8(_, _, 0));
+      const int d_chunks = size<3>(tQgQ16);
+      // (lane, value) -> (q, d) of the 16-bit A fragment, sub-group local; the
+      // row of a value does not depend on the lane in the DPAS A layout, so
+      // it folds to a constant per value once the loops are unrolled.
+      auto qtv = tSrQ16.tv_layout();
+      constexpr int kQVals = decltype(size(tSrQ16.tensor()))::value;
+
+      // Pass 1: per-row absmax over the whole head, then over the sub-group.
+      // A sub-group owns its kSGRows query rows whole: no SLM exchange.
+      float row_absmax[kSGRows];
+      CUTLASS_PRAGMA_UNROLL
+      for (int r = 0; r < kSGRows; r++) {
+        row_absmax[r] = 0.0f;
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int D = 0; D < kInt8DChunks; D++) {
+        if (D < d_chunks) {
+          copy(copy_q16, tQgQ16(_, _, _, D), tQrQ16);
+          reorder(tQrQ16, tSrQ16);
+          CUTLASS_PRAGMA_UNROLL
+          for (int v = 0; v < kQVals; v++) {
+            const int r = int(get<0>(qtv(lane, v))) % kSGRows;
+            const float a = sycl::fabs(static_cast<float>(tSrQ16.data()[v]));
+            CUTLASS_PRAGMA_UNROLL
+            for (int rr = 0; rr < kSGRows; rr++) {
+              row_absmax[rr] =
+                  (r == rr) ? sycl::fmax(row_absmax[rr], a) : row_absmax[rr];
+            }
+          }
+        }
+      }
+      float row_inv[kSGRows];
+      CUTLASS_PRAGMA_UNROLL
+      for (int r = 0; r < kSGRows; r++) {
+        const float m = sycl::reduce_over_group(
+            get_sub_group(), row_absmax[r], sycl::maximum<float>());
+        row_scale[r] = int8_attn_query_scale(m);
+        row_inv[r] = int8_attn_div_rn(1.0f, row_scale[r]);
+      }
+
+      // Pass 2: the codes, as exact integers in the 16-bit A fragment,
+      // converted and relaid into the s8 A operand, stored to this
+      // work-item's SLM words.
+      CUTLASS_PRAGMA_UNROLL
+      for (int D = 0; D < kInt8DChunks; D++) {
+        if (D < d_chunks) {
+          copy(copy_q16, tQgQ16(_, _, _, D), tQrQ16);
+          reorder(tQrQ16, tSrQ16);
+          CUTLASS_PRAGMA_UNROLL
+          for (int v = 0; v < kQVals; v++) {
+            const int r = int(get<0>(qtv(lane, v))) % kSGRows;
+            float inv = row_inv[0];
+            CUTLASS_PRAGMA_UNROLL
+            for (int rr = 1; rr < kSGRows; rr++) {
+              inv = (r == rr) ? row_inv[rr] : inv;
+            }
+            tSrQ16.data()[v] = static_cast<ElementQ>(int8_attn_query_code(
+                static_cast<float>(tSrQ16.data()[v]), inv));
+          }
+          reorder(tSrQ16, tSrQ8);
+          uint8_t* slot = smem_->q8[sg][D];
+          CUTLASS_PRAGMA_UNROLL
+          for (int e = 0; e < kQ8LaneBytes; e++) {
+            slot[e * intel::sg_size + lane] =
+                static_cast<uint8_t>(tSrQ8.data()[e]);
+          }
+        }
+      }
+      // The KV loop reads these bytes back with sub-group block reads.
+      sycl::group_barrier(get_sub_group());
+    }
+
+    clear(tArA);
+    fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
+    clear(tA_sum);
+
+    const bool check_remainder_k = (seq_len % tile_k != 0);
+    const ElementS effective_scale = params.scale;
+
+    // s32 view of the f32 S registers (Int8Dot): same layout, same width,
+    // converted in place.
+    using FragS8 = decltype(thr_mma_qk8.partition_sg_fragment_C(cP));
+    static_assert(
+        !Int8Dot ||
+            is_same_v<decltype(FragS8{}.layout()), decltype(tSrS.layout())>,
+        "s32 and f32 S fragments must share one layout");
+    static_assert(
+        !Int8Dot || is_same_v<
+                        decltype(FragS8{}.tv_layout()),
+                        decltype(tSrS.tv_layout())>,
+        "s32 and f32 S fragments must share one TV layout");
+    auto tSrS8 = make_subgroup_tensor(
+        make_tensor(recast_ptr<int32_t>(tSrS.data()), tSrS.layout()),
+        tSrS.tv_layout());
+    auto stv = tSrS.tv_layout();  // (lane, value) -> (q, k), sub-group local
+    constexpr int kSVals = decltype(size(tSrS.tensor()))::value;
+
+    // ---- INT8 P*V: s8 P (A operand), V codes as the s8 B operand ----
+    using TiledCopyV8 =
+        decltype(make_block_2d_copy_B(TiledMMAPV8{}, TensorV2D{}));
+    TiledMMAPV8 mma_pv8{};
+    auto thr_mma_pv8 = mma_pv8.get_slice(thr_id);
+    TiledCopyV8 copy_v8{v_block(0)};
+    auto thr_copy_v8 = copy_v8.get_slice(thr_id);
+    auto tVgV8 = thr_copy_v8.partition_S(gVb_split);  // (atom_val,v',k',VV,T)
+    auto tVrV8 = thr_copy_v8.partition_sg_fragment_D(gVb_split(_, _, 0, 0));
+    auto tArV8 = thr_mma_pv8.partition_sg_fragment_B(gVb_split(_, _, 0, 0));
+    auto tArP8 = thr_mma_pv8.partition_sg_fragment_A(cP);
+    auto tArO8 = thr_mma_pv8.partition_sg_fragment_C(
+        make_identity_tensor(select<0, 1>(TileShapePV{})));
+    static_assert(
+        !Int8PV || is_same_v<
+                       decltype(tArO8.layout()),
+                       decltype(SingleFragA{}.layout())>,
+        "s32 P*V and f32 O fragments must share one layout");
+
+    // ---- 16-bit Q*K over widened K codes (without Int8Dot) ----
+    using TiledCopyKw = TiledCopyK;
+    TiledCopyKw copy_kw{k_block(0)};
+    auto thr_copy_kw = copy_kw.get_slice(thr_id);
+    auto tKgKw = thr_copy_kw.partition_S(gKb);  // (atom_val,k',d',T,D)
+    auto tKrKw = thr_copy_kw.partition_sg_fragment_D(gKb(_, _, 0, 0));
+    auto tSrKw = thr_mma_qk.partition_sg_fragment_B(gKb(_, _, 0, 0));
+
+    auto prefetch_k_tile = [&](int k_tile) {
+      if (k_tile >= blk_k1) return;
+      const int pblk = phys_block(k_tile);
+      if constexpr (Int8Dot) {
+        TiledCopyK8 copy_blk{k_block(pblk)};
+        auto pf = make_block_2d_prefetch(copy_blk);
+        auto pKg = pf.get_slice(thr_id).partition_S(gKb8);
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < size<4>(pKg); D++) {
+          prefetch(pf, pKg(_, _, _, k_tile % tiles_per_page, D));
+        }
+      } else {
+        TiledCopyKw copy_blk{k_block(pblk)};
+        auto pf = make_block_2d_prefetch(copy_blk);
+        auto pKg = pf.get_slice(thr_id).partition_S(gKb);
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < size<4>(pKg); D++) {
+          prefetch(pf, pKg(_, _, _, k_tile % tiles_per_page, D));
+        }
+      }
+    };
+
+    prefetch_k_tile(blk_k0);
+
+    /* Main loop, blocked in k. */
+    for (int K = blk_k0; K < blk_k1; K++) {
+      barrier_arrive(ScopeWorkgroup);
+
+      bool need_causal = false;
+      if constexpr (CausalMask) {
+        need_causal = K >= blk_k1_causal;
+      }
+
+      const int pblk = phys_block(K);
+      const int t = K % tiles_per_page;
+      FragSCol ksc = tile_scales(params.scale_k, K, t, pblk);
+      FragSCol vsc = tile_scales(params.scale_v, K, t, pblk);
+      auto V_blk = v_block(pblk);
+      TiledCopyV copy_v_blk{V_blk};
+
+      /* V prefetch for GEMM 2 */
+      auto pf_v = make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, V_blk);
+      auto pVgV = pf_v.get_slice(thr_id).partition_S(gVb);
+      prefetch(pf_v, pVgV(_, _, _, t));
+
+      /* GEMM 1: S = Q * K^T */
+      if constexpr (Int8Dot) {
+        TiledCopyK8 copy_k8_blk{k_block(pblk)};
+        clear(tSrS8);
+        const int d8_chunks = size<4>(tKgK8);
+        for (int D = 0; D < d8_chunks; D++) {
+          copy(copy_k8_blk, tKgK8(_, _, _, t, D), tKrK8);
+          // Sub-group block reads: lane l gets bytes [i * 16 + l] of each
+          // 256-byte block, i.e. its fragment elements in register order.
+#ifdef __SYCL_DEVICE_ONLY__
+          auto slot = sycl::address_space_cast<
+              sycl::access::address_space::local_space,
+              sycl::access::decorated::yes>(smem_->q8[sg][D]);
+#endif
+          CUTLASS_PRAGMA_UNROLL
+          for (int b = 0; b < kQ8Blocks; b++) {
+#ifdef __SYCL_DEVICE_ONLY__
+            Q8Block blk = __spirv_SubgroupBlockReadINTEL<Q8Block>(
+                slot.get_decorated() + b * 16 * intel::sg_size);
+#else
+            Q8Block blk{};  // host pass: never executed
+#endif
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < 16; i++) {
+              tSrQ8.data()[b * 16 + i] = static_cast<int8_t>(blk[i]);
+            }
+          }
+          reorder(tKrK8, tSrK8);
+          cute::gemm(mma_qk8, tSrQ8, tSrK8, tSrS8);
+        }
+        // S = s32 * q_scale[row] (k_scale below), exact int32 dot.
+        CUTLASS_PRAGMA_UNROLL
+        for (int v = 0; v < kSVals; v++) {
+          const int r = int(get<0>(stv(lane, v))) % kSGRows;
+          float qs = row_scale[0];
+          CUTLASS_PRAGMA_UNROLL
+          for (int rr = 1; rr < kSGRows; rr++) {
+            qs = (r == rr) ? row_scale[rr] : qs;
+          }
+          tSrS.data()[v] = static_cast<ElementS>(tSrS8.data()[v]) * qs;
+        }
+      } else {
+        TiledCopyKw copy_k_blk{k_block(pblk)};
+        clear(tSrS);
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < size<4>(tKgKw); D++) {
+          copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+          copy(copy_k_blk, tKgKw(_, _, _, t, D), tKrKw);
+          reorder(tQrQ, tSrQ);
+          reorder(tKrKw, tSrKw);  // int8 -> 16-bit (exact)
+          cute::gemm(mma_qk, tSrQ, tSrKw, tSrS);
+        }
+      }
+      prefetch_k_tile(K + 1);
+
+      // S(:, j) *= k_scale[j]: per-token K dequantization (before masking).
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tSrS.size(); i++) {
+        tSrS(i) *= broadcast<1>(ksc, tSrS, i);
+      }
+
+      /* Causal masking (absolute positions), as the base walk */
+      if constexpr (CausalMask) {
+        if (need_causal) {
+          constexpr int n_reps = tile_k / intel::sg_size;
+          constexpr int elems_per_n = tSrS.size() / n_reps;
+          int k_base = K * tile_k;
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < n_reps; n++) {
+            int col = k_base + n * intel::sg_size + lane;
+            int causal_bound = col - full_tile_offset - row_base;
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < elems_per_n; j++) {
+              if (j < causal_bound) {
+                tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+              }
+            }
+          }
+        }
+      }
+      /* k masking for remainder tiles */
+      if (check_remainder_k && K == blk_k1 - 1) {
+        FragSCol k_rem_mask;
+        int k = K * tile_k + lane;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
+          k_rem_mask(i) =
+              (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); i++) {
+          tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
+        }
+      }
+
+      /* Softmax; then P(:, j) *= v_scale[j] after the row sums */
+      auto rescale =
+          softmax(effective_scale, K == blk_k0, tSrS, tA_max, tA_sum);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tSrS.size(); i++) {
+        tSrS(i) *= broadcast<1>(vsc, tSrS, i);
+      }
+
+      if constexpr (Int8PV) {
+        /* P to int8 per query row of this tile; GEMM 2 in s8 x s8 -> s32 */
+        auto pmax = reduce<1>(tSrS, sycl::maximum{});
+        decltype(pmax) pscale, pinv;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < pmax.size(); i++) {
+          pscale(i) = int8_attn_p_scale(pmax(i));
+          pinv(i) = int8_attn_div_rn(1.0f, pscale(i));
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); i++) {
+          tSrS(i) = int8_attn_query_code(tSrS(i), broadcast<0>(pinv, tSrS, i));
+        }
+        reorder(tSrS, tArP8);  // exact integers -> s8 A operand
+        TiledCopyV8 copy_v8_blk{V_blk};
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          copy(copy_v8_blk, tVgV8(_, _, _, VV, t), tVrV8);
+          reorder(tVrV8, tArV8);  // relayout only, codes as loaded
+          clear(tArO8);
+          cute::gemm(mma_pv8, tArP8, tArV8, tArO8);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tArA.size() / VTiles; i++) {
+            ElementA o = tArA(_, _, _, VV)(i);
+            if (K != blk_k0) {
+              o *= broadcast<0>(rescale, tArA, i);
+            }
+            tArA(_, _, _, VV)(i) = o + static_cast<ElementA>(tArO8(i)) *
+                                           broadcast<0>(pscale, tArA, i);
+          }
+        }
+      } else {
+        reorder(tSrS, tArP);
+
+        /* GEMM 2: A += P * V over widened V codes, split in v dimension */
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          copy(copy_v_blk, tVgV(_, _, _, VV, t), tVrV);
+          reorder(tVrV, tArV);  // int8 -> 16-bit (exact)
+          if (K != blk_k0) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++)
+              tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+          }
+          cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+        }
+      }
+
+      barrier_wait(ScopeWorkgroup);
+    }
+  }
+
   // Single step of blocked softmax.
   CUTLASS_DEVICE
   FragSRow softmax(
@@ -774,37 +1414,8 @@ struct DecodeFwdMainloop {
       "Could not find a mainloop specialization.");
 };
 
-// Exactly rounded fp32 division a / b (round to nearest even) from FMAs, so the
-// result does not depend on the TU's floating-point model (the attention TUs
-// build with the default fast model, where '/' may be approximate). The
-// reciprocal comes from native::recip (opaque to algebraic folding) and two
-// Newton steps; the quotient gets one FMA residual correction (Markstein).
-// Finite, normal operands only (the callers pass |b| >= 1e-10).
-static inline float int8_attn_div_rn(float a, float b) {
-  float r = sycl::native::recip(b);
-  r = sycl::fma(sycl::fma(-b, r, 1.0f), r, r);
-  r = sycl::fma(sycl::fma(-b, r, 1.0f), r, r);
-  float q = a * r;
-  float e = sycl::fma(-b, q, a);
-  return sycl::fma(e, r, q);
-}
-
-// The shared INT8 query rule of the attention kernels (decode here, prefill in
-// the engine's Triton kernel): per (token, query head)
-//   scale = max(absmax / 127, 1e-10), y = x * (1 / scale) (both divisions
-//   exactly rounded), code = sign(y) * min(floor(|y| + 1/2), 127),
-// with the half-up rounding computed exactly: floor(|y| + 1/2) =
-// (trunc(2 |y|) + 1) >> 1 (2 |y| is exact), so no fp addition can round.
-static inline float int8_attn_query_scale(float absmax) {
-  return sycl::fmax(int8_attn_div_rn(absmax, 127.0f), 1.0e-10f);
-}
-static inline float int8_attn_query_code(float x, float inv_scale) {
-  const float y = x * inv_scale;
-  const float a2 = sycl::fabs(y) * 2.0f;
-  int c = a2 < 255.0f ? (static_cast<int>(a2) + 1) >> 1 : 127;
-  c = c > 127 ? 127 : c;
-  return y < 0.0f ? static_cast<float>(-c) : static_cast<float>(c);
-}
+// int8_attn_div_rn / int8_attn_query_scale / int8_attn_query_code: the shared
+// INT8 query rule, defined above FMHAFwdMainloop.
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 

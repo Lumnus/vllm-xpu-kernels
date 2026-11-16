@@ -10,8 +10,10 @@ supported by the paged decode kernel, including small causal multi-query
 batches (speculative-decode verification, uniform or ragged), which the
 interface runs through the decode kernel; batches routed to chunk prefill are
 rejected (callers dequantize the referenced blocks and use the fp16/bf16
-path). The kernel output is compared with an fp32 reference computed on the
-same quantized cache.
+path) unless ``int8_prefill`` is set, in which case the chunk-prefill kernel
+reads the cache in place (head size 256, bfloat16 query, causal). The kernel
+output is compared with an fp32 reference computed on the same quantized
+cache.
 """
 import pytest
 import torch
@@ -44,6 +46,10 @@ MINI_PYTEST_PARAMS = {
         "head_size": [256],
         "block_size": [64, 1600],
         "window": [None],
+    },
+    "test_varlen_int8_kv_prefill": {
+        "num_heads": [(6, 1)],
+        "block_size": [64, 1600],
     },
 }
 
@@ -99,7 +105,7 @@ def ref_attn(q, k, v, scale, q_pos, window, sinks):
 
 
 def build_int8_cache(seq_lens, block_size, hkv, head_size, dtype, dev,
-                     pad_bytes=0, fill=None):
+                     pad_bytes=0, fill=None, codes=False):
     """Quantize random K/V into a split-layout cache with random block
     placement. Returns the views, the block table and the dequantized
     per-sequence K/V for the reference."""
@@ -131,7 +137,8 @@ def build_int8_cache(seq_lens, block_size, hkv, head_size, dtype, dev,
         vq, vscale = quantize_per_token_head(val)
         kc[b, o], vc[b, o], ks[b, o], vs[b, o] = kq, vq, kscale, vscale
         keys.append(kq.float() * kscale[..., None])
-        values.append(vq.float() * vscale[..., None])
+        values.append(
+            (vq, vscale) if codes else vq.float() * vscale[..., None])
     return kc, vc, ks, vs, block_table, keys, values
 
 
@@ -150,10 +157,47 @@ def quantize_query_rule(q: torch.Tensor):
     return torch.where(y < 0, -c, c).to(torch.int8), scale
 
 
+def quantize_p_rule(p: torch.Tensor):
+    """The chunk-prefill kernel's int8 P rule per row of a 32-slot tile
+    (int8_attn_p_scale / int8_attn_query_code), P >= 0: scale = max(row max /
+    127, 1e-30) and 1 / scale as IEEE fp32 divisions, codes half up."""
+    scale = torch.clamp((p.amax(-1).double() / 127.0).float(), min=1e-30)
+    inv = (1.0 / scale.double()).float()
+    y = p * inv[..., None]
+    c = (torch.clamp(y * 2.0, max=255.0).to(torch.int32) + 1) >> 1
+    return torch.clamp(c, max=127).float(), scale
+
+
+def ref_attn_pv8(q, k, kv_codes, kv_scales, scale, q_pos):
+    """fp32 reference of int8_prefill=3: online softmax over 32-slot tiles,
+    P * v_scale quantized per (row, tile) by the kernel's rule, P*V on the
+    codes, times the tile's P scale. q [q, hq, D] (codes x scales), k the
+    dequantized keys [L, hkv, D], V as (codes [L, hkv, D], scales [L, hkv])."""
+    vq, vs = kv_codes, kv_scales
+    g = q.shape[1] // k.shape[1]
+    k = k.repeat_interleave(g, 1)
+    vq, vs = vq.repeat_interleave(g, 1).float(), vs.repeat_interleave(g, 1)
+    s = torch.einsum("qhd,khd->hqk", q, k) * scale
+    kpos = torch.arange(k.shape[0], device=q.device)
+    s = s.masked_fill(~(kpos[None, :] <= q_pos[:, None])[None], float("-inf"))
+    m = s.amax(-1, keepdim=True)
+    p = torch.exp(s - m)
+    den = p.sum(-1)
+    out = torch.zeros(q.shape[1], q.shape[0], q.shape[2], device=q.device)
+    for t0 in range(0, k.shape[0], 32):
+        pv = p[..., t0:t0 + 32] * vs[t0:t0 + 32].T[:, None, :]
+        codes, ps = quantize_p_rule(pv)
+        out += torch.einsum("hqk,khd->hqd", codes,
+                            vq[t0:t0 + 32]) * ps[..., None]
+    return (out / den[..., None]).transpose(0, 1)
+
+
 def run_and_check(q_lens, seq_lens, hq, hkv, head_size, block_size, window,
-                  sinks, dtype, dev, pad_bytes=0, fill=None, int8_dot=False):
+                  sinks, dtype, dev, pad_bytes=0, fill=None, int8_dot=False,
+                  int8_prefill=0, tol=1.5e-2):
     kc, vc, ks, vs, block_table, keys, values = build_int8_cache(
-        seq_lens, block_size, hkv, head_size, dtype, dev, pad_bytes, fill)
+        seq_lens, block_size, hkv, head_size, dtype, dev, pad_bytes, fill,
+        codes=int8_prefill == 3)
     q = torch.randn(sum(q_lens), hq, head_size, device=dev).to(dtype)
     cu_q = torch.tensor([0] + torch.tensor(q_lens).cumsum(0).tolist(),
                         dtype=torch.int32, device=dev)
@@ -175,8 +219,12 @@ def run_and_check(q_lens, seq_lens, hq, hkv, head_size, block_size, window,
                            k_descale=ks,
                            v_descale=vs,
                            s_aux=sinks,
-                           int8_dot=int8_dot)
-    if int8_dot:
+                           int8_dot=int8_dot,
+                           int8_prefill=int8_prefill)
+    # Prefill rows take int8 Q*K with int8_prefill 2 and 3; decode rows of the
+    # batch take it with int8_dot.
+    int8_q = (int8_prefill >= 2) if int8_prefill else int8_dot
+    if int8_q:
         # The int8 query (codes x scales) the kernel multiplies with.
         qc, qs = quantize_query_rule(q)
         q_ref = qc.float() * qs[..., None]
@@ -185,14 +233,33 @@ def run_and_check(q_lens, seq_lens, hq, hkv, head_size, block_size, window,
     ref = []
     for i, (L, ql) in enumerate(zip(seq_lens, q_lens)):
         q0 = int(cu_q[i])
+        q_pos = torch.arange(L - ql, L, device=dev)
+        if int8_prefill == 3 and ql > 1:
+            vq, vsc = values[i]
+            ref.append(
+                ref_attn_pv8(q_ref[q0:q0 + ql], keys[i], vq, vsc, scale, q_pos))
+            continue
+        if int8_prefill == 3:
+            vq, vsc = values[i]
+            v_deq = vq.float() * vsc[..., None]
+        else:
+            v_deq = values[i]
+        # Decode rows of a mixed batch: the decode kernel's query.
+        q_rows = q_ref if (ql > 1 or not int8_prefill) else (
+            _int8_query(q) if int8_dot else q.float())
         ref.append(
-            ref_attn(q_ref[q0:q0 + ql], keys[i], values[i], scale,
-                     torch.arange(L - ql, L, device=dev), window, sinks))
+            ref_attn(q_rows[q0:q0 + ql], keys[i], v_deq, scale, q_pos, window,
+                     sinks))
     torch.testing.assert_close(out.float(),
                                torch.cat(ref),
-                               atol=1.5e-2,
-                               rtol=1.5e-2)
+                               atol=tol,
+                               rtol=tol)
     return out
+
+
+def _int8_query(q):
+    qc, qs = quantize_query_rule(q)
+    return qc.float() * qs[..., None]
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -303,6 +370,63 @@ def test_varlen_int8_kv_int8_dot_refusals():
                                    k_descale=ks,
                                    v_descale=vs,
                                    int8_dot=True)
+
+
+# (q_lens, seq_lens): a chunk after cached context, a fresh prompt crossing
+# blocks, a mixed batch with a decode row and a short verify row, a chunk whose
+# context ends inside a block.
+PREFILL_CASES = [
+    ([300], [2100]),
+    ([257], [257]),
+    ([1, 40, 5, 64], [90, 40, 700, 1700]),
+    ([96], [1631]),
+]
+
+
+@pytest.mark.parametrize("int8_prefill", [1, 2, 3])
+@pytest.mark.parametrize("num_heads", [(6, 1), (16, 4), (24, 2)])
+@pytest.mark.parametrize("block_size", [64, 128, 1600])
+@pytest.mark.parametrize("case", range(len(PREFILL_CASES)))
+@pytest.mark.parametrize("int8_dot", [False, True])
+@torch.inference_mode()
+def test_varlen_int8_kv_prefill(int8_prefill, num_heads, block_size, case,
+                                int8_dot):
+    """int8_prefill: the chunk-prefill kernel reads the int8 cache in place
+    (garbage in every unused byte). 1: BF16 dots over the widened codes,
+    against the BF16-query reference; 2: int8 Q*K (the decode kernel's query
+    rule), against the int8-query reference; 3: also int8 P*V, against the
+    reference with the kernel's P rounding. Decode rows of a mixed batch take
+    the paged decode kernel (int8_dot as passed)."""
+    torch.manual_seed(case)
+    hq, hkv = num_heads
+    q_lens, seq_lens = PREFILL_CASES[case]
+    run_and_check(q_lens, seq_lens, hq, hkv, 256, block_size, None, None,
+                  torch.bfloat16, "xpu", int8_dot=int8_dot,
+                  int8_prefill=int8_prefill,
+                  tol=3e-2 if int8_prefill == 3 else 1.5e-2)
+
+
+def test_varlen_int8_kv_prefill_refusals():
+    dev = "xpu"
+    for head_size, dtype, window, sink in ((128, torch.bfloat16, None, False),
+                                           (256, torch.half, None, False),
+                                           (256, torch.bfloat16, 128, False),
+                                           (256, torch.bfloat16, None, True)):
+        page = 2 * (head_size + 4) * 64
+        raw = torch.zeros((4, page), dtype=torch.uint8, device=dev)
+        kc, vc, ks, vs = split_layout_views(raw, 64, 1, head_size)
+        q = torch.randn(40, 6, head_size, device=dev, dtype=dtype)
+        with pytest.raises((RuntimeError, ValueError), match="int8_prefill"):
+            flash_attn_varlen_func(
+                q, kc, vc, 40,
+                torch.tensor([0, 40], dtype=torch.int32, device=dev), 64,
+                seqused_k=torch.full((1, ), 64, dtype=torch.int32, device=dev),
+                causal=True,
+                window_size=[window - 1, 0] if window else None,
+                block_table=torch.ones((1, 1), dtype=torch.int32, device=dev),
+                k_descale=ks, v_descale=vs,
+                s_aux=torch.zeros(6, device=dev, dtype=dtype) if sink else None,
+                int8_prefill=2)
 
 
 @pytest.mark.parametrize("q_lens", [[33], [1, 33]])

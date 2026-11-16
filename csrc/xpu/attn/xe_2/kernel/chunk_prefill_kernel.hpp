@@ -290,10 +290,10 @@ class XeFMHAFwdKernel {
       // sequence must also stop at the causal bound to skip fully masked
       // KV blocks to the right of the diagonal.
       const int sg_seq_len =
-          LocalMask ? cute::min(
-                          seq_is_causal ? sg_causal_seq_len : seq_len_kv,
-                          full_tile_offset + seq_coord + q_sg_tile +
-                              params.mainloop.local_right)
+          LocalMask       ? cute::min(
+                                seq_is_causal ? sg_causal_seq_len : seq_len_kv,
+                                full_tile_offset + seq_coord + q_sg_tile +
+                                    params.mainloop.local_right)
           : seq_is_causal ? sg_causal_seq_len
                           : seq_len_kv;
       const int sg_k_block0 =
@@ -426,7 +426,8 @@ class XeFMHAFwdKernel {
             seq_len,
             full_tile_offset,
             k_block_local_l_safe,
-            k_block_local_r_safe);
+            k_block_local_r_safe,
+            head);
       } else {
         mainloop.template operator()<false>(
             Q(_, _, head_q, l_coord_qo),
@@ -444,7 +445,8 @@ class XeFMHAFwdKernel {
             seq_len,
             full_tile_offset,
             k_block_local_l_safe,
-            k_block_local_r_safe);
+            k_block_local_r_safe,
+            head);
       }
 
       // return softmax_lse

@@ -128,7 +128,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
     std::optional<at::Tensor>& splits_per_seq,
     std::optional<at::Tensor>& work_list,
     std::optional<const at::Tensor>& dynamic_causal,
-    bool int8_dot) {
+    bool int8_dot,
+    int64_t int8_prefill) {
   auto q_type = q.scalar_type();
   auto k_type = k.scalar_type();
   bool q_is_fp8 = q_type == at::ScalarType::Float8_e5m2 ||
@@ -188,12 +189,28 @@ std::vector<at::Tensor> mha_varlen_fwd(
   TORCH_CHECK(
       !is_int8_kv || !q_is_fp8,
       "INT8 KV cache requires a half or bfloat16 query");
-  // INT8 KV is implemented in the paged decode kernel only. Prefill / mixed
-  // batches should dequantize the referenced blocks and use the fp16/bf16 path.
+  // INT8 KV: the paged decode kernel reads it natively; prefill / mixed
+  // batches read it in place in the chunk-prefill kernel when int8_prefill is
+  // set (1: 16-bit dots over the widened codes, 2: INT8 Q*K, s8 x s8 -> s32
+  // with the query quantized in the kernel, 3: also INT8 P*V; paged causal,
+  // head size 256);
+  // otherwise they dequantize the referenced blocks and use the fp16/bf16 path.
   TORCH_CHECK(
-      !is_int8_kv || max_seqlen_q == 1,
-      "INT8 KV cache is supported for decode (max_seqlen_q == 1) only; "
-      "dequantize the KV blocks for prefill");
+      !is_int8_kv || max_seqlen_q == 1 || int8_prefill != 0,
+      "INT8 KV cache is supported for decode (max_seqlen_q == 1) only unless "
+      "int8_prefill is set; dequantize the KV blocks for prefill");
+  TORCH_CHECK(
+      int8_prefill >= 0 && int8_prefill <= 3,
+      "int8_prefill must be 0, 1, 2 or 3, got ",
+      int8_prefill);
+  TORCH_CHECK(
+      int8_prefill == 0 ||
+          (is_int8_kv && q_type == at::ScalarType::BFloat16 && is_causal &&
+           window_size_left == -1 && window_size_right == -1 &&
+           !softmax_sink_.has_value() && !return_softmax &&
+           !dynamic_causal.has_value()),
+      "int8_prefill needs an INT8 KV cache, a bfloat16 query and causal "
+      "attention without window, sinks, softmax_lse or dynamic_causal");
   // int8_dot: Q quantized per (token, head) in the decode kernel, Q*K as
   // s8 x s8 -> s32 DPAS (paged decode only; checked again in the kernel).
   TORCH_CHECK(
@@ -294,7 +311,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         is_sink,
         softmax_lse_opt,
         no_mask,
-        dynamic_causal);
+        dynamic_causal,
+        static_cast<int>(int8_prefill));
   } else if (max_seqlen_q > 1) {
     if (!out_.has_value()) {
       // For fp8 query the output cannot be fp8; default to fp16 (matches the
@@ -333,7 +351,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         is_sink,
         softmax_lse_opt,
         is_prefill_opt,
-        dynamic_causal);
+        dynamic_causal,
+        static_cast<int>(int8_prefill));
 
     // Paged decode: processes only decode batches (skips prefill)
     int eff_window_left =
@@ -384,7 +403,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         is_prefill_opt,
         splits_per_seq,
         work_list,
-        softmax_lse_opt);
+        softmax_lse_opt,
+        int8_dot);
   } else {
     // Normalize -1 (unbounded) to max_seqlen_k for kernel masking logic
     // In decode phase the window_size_right doesn't have effect
@@ -512,7 +532,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "softcap, bool return_softmax, "
       "Generator? gen, int? num_splits, bool mix_batch, Tensor? "
       "splits_per_seq, Tensor? work_list, Tensor? dynamic_causal=None, "
-      "bool int8_dot=False) -> Tensor[]");
+      "bool int8_dot=False, int int8_prefill=0) -> Tensor[]");
   ops.impl(
       "varlen_fwd",
       torch::kXPU,

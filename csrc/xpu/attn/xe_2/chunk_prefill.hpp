@@ -94,6 +94,19 @@ struct chunk_prefill_args_t {
   int page_stride_elements = 0;
   // Per-sequence mask: nonzero = causal, zero = bidirectional.
   const int* dynamic_causal = nullptr;
+  // INT8 per-token-head KV (key/value dtype int8), prefill over the cache in
+  // place: 0 = not enabled (refused), 1 = Q*K and P*V on the 16-bit query over
+  // the widened codes (the paged decode kernel's arithmetic), 2 = Q*K as
+  // s8 x s8 -> s32 with the query quantized in the kernel, P*V as 1, 3 = as 2
+  // with P*V as s8 x s8 -> s32 (P quantized per query row of each KV tile).
+  // k_scale / v_scale then point to the fp32 scale caches [num_blocks,
+  // block_size, num_heads_kv] (strides in elements); the split layout's block
+  // stride is passed in bytes.
+  int int8_prefill = 0;
+  int64_t kv_scale_stride_block = 0;
+  int64_t kv_scale_stride_slot = 0;
+  int64_t kv_scale_stride_head = 0;
+  int64_t kv_page_stride_bytes = 0;
 };
 
 template <class FMHAKernel, bool isVarLen>
@@ -208,6 +221,12 @@ struct KernelLauncher {
          args.page_stride_elements},
         {},
         hw_info};
+    if constexpr (CollectiveMainloop::Int8KV) {
+      arguments.mainloop.scale_stride_block = args.kv_scale_stride_block;
+      arguments.mainloop.scale_stride_slot = args.kv_scale_stride_slot;
+      arguments.mainloop.scale_stride_head = args.kv_scale_stride_head;
+      arguments.mainloop.page_stride_bytes = args.kv_page_stride_bytes;
+    }
 
     // Define device-global scratch memory
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
@@ -278,7 +297,9 @@ template <
     typename GmemTiledCopyQ = void, /* void -> default block 2D */
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
-    typename GmemTiledCopyO = void>
+    typename GmemTiledCopyO = void,
+    bool Int8Dot = false,
+    bool Int8PV = false>
 struct FMHAConfig {
   static constexpr int SGTileQ =
       get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
@@ -286,6 +307,15 @@ struct FMHAConfig {
       is_void_v<MMAOperation_>,
       XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>,
       MMAOperation_>;
+  // INT8 Q*K (INT8 KV only): s8 x s8 -> s32 over a (q, k, 64) tile (one s8
+  // DPAS K-step of 32 twice per 64-wide head chunk; full 64-byte rows in the
+  // K block loads), and the 16-bit MMA over the same tile that loads the
+  // query for its in-kernel quantization.
+  using TileShapeQK8 = Shape<
+      decltype(get<0>(TileShapeQK{})),
+      decltype(get<1>(TileShapeQK{})),
+      _64>;
+  using MMAOperationQK8 = XE_DPAS_TT<cute::gcd(SGTileQ, 8), int32_t, int8_t>;
   using SubgroupLayoutPV = cute::conditional_t<
       is_void_v<SubgroupLayoutPV_>,
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
@@ -307,6 +337,31 @@ struct FMHAConfig {
         MMA_Atom<MMAOperation>,
         Layout<TileShapePV>,
         SubgroupLayoutPV>::TiledMMA;
+    using TiledMMAQK8 = cute::conditional_t<
+        Int8Dot,
+        typename TiledMMAHelper<
+            MMA_Atom<MMAOperationQK8>,
+            Layout<TileShapeQK8>,
+            SubgroupLayoutQK>::TiledMMA,
+        void>;
+    using TiledMMAQ16 = cute::conditional_t<
+        Int8Dot,
+        typename TiledMMAHelper<
+            MMA_Atom<MMAOperation>,
+            Layout<TileShapeQK8>,
+            SubgroupLayoutQK>::TiledMMA,
+        void>;
+    static_assert(!Int8Dot || is_same_v<ElementK, int8_t>);
+    // INT8 P*V: s8 x s8 -> s32 over the P*V tile (its KV depth of 32 is one
+    // s8 DPAS K-step).
+    using TiledMMAPV8 = cute::conditional_t<
+        Int8PV,
+        typename TiledMMAHelper<
+            MMA_Atom<MMAOperationQK8>,
+            Layout<TileShapePV>,
+            SubgroupLayoutPV>::TiledMMA,
+        void>;
+    static_assert(!Int8PV || Int8Dot);
 
     static_assert(
         get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
@@ -340,7 +395,10 @@ struct FMHAConfig {
         TensorV,
         GmemTiledCopyQ,
         GmemTiledCopyK,
-        GmemTiledCopyV>;
+        GmemTiledCopyV,
+        TiledMMAQK8,
+        TiledMMAQ16,
+        TiledMMAPV8>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
@@ -491,6 +549,97 @@ __attribute__((visibility("hidden"))) void policy_dispatch_impl(
           float_e5m2_t,
           float_e5m2_t,
           bfloat16_t>::kernel_dispatch(queue, args);
+    } else if (cuQKType.k_type == CutlassDType::int8) {
+      // INT8 per-token-head KV prefill over the cache in place
+      // (args.int8_prefill 1, 2 or 3, checked by the caller): instantiated only
+      // for the head-256 policy, paged and causal, without window, sinks or
+      // LSE, so it adds three kernels to one translation unit.
+      if constexpr (
+          is_same_v<chunk_policy, chunk_policy_head256> && Paged && Causal &&
+          !Local && !Sink && !SoftmaxLSE) {
+        if (args.int8_prefill == 3) {
+          return FMHAConfig<
+              typename chunk_policy::ShapeQK,
+              typename chunk_policy::ShapePV,
+              typename chunk_policy::ShapeOut,
+              typename chunk_policy::SubgroupLayoutQK,
+              void,
+              PipelineStages,
+              Paged,
+              Causal,
+              Local,
+              Sink,
+              SoftmaxLSE,
+              bfloat16_t,
+              int8_t,
+              int8_t,
+              bfloat16_t,
+              void,
+              Stride<int, _1, int, int>,
+              Stride<int, _1, int, int>,
+              Stride<_1, int, int, int>,
+              Stride<int, _1, int, int>,
+              void,
+              void,
+              void,
+              void,
+              true,
+              true>::kernel_dispatch(queue, args);
+        }
+        if (args.int8_prefill == 2) {
+          return FMHAConfig<
+              typename chunk_policy::ShapeQK,
+              typename chunk_policy::ShapePV,
+              typename chunk_policy::ShapeOut,
+              typename chunk_policy::SubgroupLayoutQK,
+              void,
+              PipelineStages,
+              Paged,
+              Causal,
+              Local,
+              Sink,
+              SoftmaxLSE,
+              bfloat16_t,
+              int8_t,
+              int8_t,
+              bfloat16_t,
+              void,
+              Stride<int, _1, int, int>,
+              Stride<int, _1, int, int>,
+              Stride<_1, int, int, int>,
+              Stride<int, _1, int, int>,
+              void,
+              void,
+              void,
+              void,
+              true>::kernel_dispatch(queue, args);
+        }
+        if (args.int8_prefill == 1) {
+          return FMHAConfig<
+              typename chunk_policy::ShapeQK,
+              typename chunk_policy::ShapePV,
+              typename chunk_policy::ShapeOut,
+              typename chunk_policy::SubgroupLayoutQK,
+              void,
+              PipelineStages,
+              Paged,
+              Causal,
+              Local,
+              Sink,
+              SoftmaxLSE,
+              bfloat16_t,
+              int8_t,
+              int8_t,
+              bfloat16_t>::kernel_dispatch(queue, args);
+        }
+      }
+      TORCH_CHECK(
+          false,
+          "chunk prefill on an INT8 KV cache: built for head_size 256, paged, "
+          "causal, no window, no sinks, no LSE, with int8_prefill 1, 2 or 3; "
+          "got "
+          "int8_prefill=",
+          args.int8_prefill);
     }
   }
 }
