@@ -93,6 +93,67 @@ except ValueError:
     _SPEC_DECODE_MAX_QLEN = 16
 
 
+# Building the decode metadata of the fast path takes 14 small kernels
+# (arange, a fill, searchsorted, three index_selects, compares, adds, clamps
+# and two masked fills), all integer, from cu_seqlens_q, seqused_k,
+# block_table and the row count alone. Every attention layer of a forward
+# passes the same tensors, so a caller may hand in ``spec_decode_meta_cache``,
+# a dict that lives for one forward pass: the first layer builds the metadata
+# and stores it there, keyed by those tensors (held, compared by identity) and
+# the row count; the next layers take it as it is. The values are the ones
+# each layer would build. Under graph capture the first layer's kernels are
+# captured and the later layers read their outputs on every replay.
+SPEC_DECODE_META_CACHE = True
+_LOGGED_META_CACHE = False
+
+
+def spec_decode_metadata(cu_seqlens_q, seqused_k, block_table, total):
+    """(cu_seqlens_q_spec, dummy_cu_seqlens_k, seqused_k_spec,
+    block_table_spec, is_padding) of the spec-decode fast path."""
+    batch = cu_seqlens_q.numel() - 1
+    device = cu_seqlens_q.device
+    # One decode query per (sequence, position) pair; the row order already
+    # matches q, so the output needs no reordering.
+    cu_seqlens_q_spec = torch.arange(total + 1,
+                                     dtype=torch.int32,
+                                     device=device)
+    dummy_cu_seqlens_k = torch.zeros_like(cu_seqlens_q_spec)
+    positions = cu_seqlens_q_spec[:-1]
+    request_ids = torch.searchsorted(cu_seqlens_q[1:], positions,
+                                    right=True).clamp_(max=batch - 1)
+    query_ends = cu_seqlens_q[1:].index_select(0, request_ids)
+    is_padding = positions >= cu_seqlens_q[-1]
+    seqused_k_spec = (seqused_k.index_select(0, request_ids) -
+                     (query_ends - positions - 1)).clamp_(min=1).to(torch.int32)
+    seqused_k_spec.masked_fill_(is_padding, 1)
+    block_table_spec = block_table.index_select(0, request_ids)
+    block_table_spec.masked_fill_(is_padding[:, None], 0)
+    return (cu_seqlens_q_spec, dummy_cu_seqlens_k, seqused_k_spec,
+            block_table_spec, is_padding)
+
+
+def _cached_spec_decode_metadata(cache, cu_seqlens_q, seqused_k, block_table,
+                                 total):
+    global _LOGGED_META_CACHE
+    if cache is None:
+        return spec_decode_metadata(cu_seqlens_q, seqused_k, block_table,
+                                    total)
+    entries = cache.setdefault("spec_decode_meta", [])
+    for key, meta in entries:
+        if (key[0] is cu_seqlens_q and key[1] is seqused_k
+                and key[2] is block_table and key[3] == total):
+            return meta
+    meta = spec_decode_metadata(cu_seqlens_q, seqused_k, block_table, total)
+    entries.append(((cu_seqlens_q, seqused_k, block_table, total), meta))
+    if not _LOGGED_META_CACHE:
+        _LOGGED_META_CACHE = True
+        _logger.warning(
+            "FA spec-decode metadata: built once per forward for the layers "
+            "that share cu_seqlens_q, seqused_k and block_table (the caller's "
+            "per-forward cache), instead of 14 kernels in every layer")
+    return meta
+
+
 def _spec_decode_varlen_fwd(
     q,
     k,
@@ -108,27 +169,13 @@ def _spec_decode_varlen_fwd(
     s_aux,
     window_size,
     softcap,
+    meta_cache=None,
 ):
     """Decode causal query rows, including empty requests and query padding."""
-    batch = cu_seqlens_q.numel() - 1
-    total = q.shape[0]
-
-    # One decode query per (sequence, position) pair; the row order already
-    # matches q, so the output needs no reordering.
-    cu_seqlens_q_spec = torch.arange(total + 1,
-                                     dtype=torch.int32,
-                                     device=q.device)
-    dummy_cu_seqlens_k = torch.zeros_like(cu_seqlens_q_spec)
-    positions = cu_seqlens_q_spec[:-1]
-    request_ids = torch.searchsorted(cu_seqlens_q[1:], positions,
-                                    right=True).clamp_(max=batch - 1)
-    query_ends = cu_seqlens_q[1:].index_select(0, request_ids)
-    is_padding = positions >= cu_seqlens_q[-1]
-    seqused_k_spec = (seqused_k.index_select(0, request_ids) -
-                     (query_ends - positions - 1)).clamp_(min=1).to(torch.int32)
-    seqused_k_spec.masked_fill_(is_padding, 1)
-    block_table_spec = block_table.index_select(0, request_ids)
-    block_table_spec.masked_fill_(is_padding[:, None], 0)
+    (cu_seqlens_q_spec, dummy_cu_seqlens_k, seqused_k_spec, block_table_spec,
+     is_padding) = _cached_spec_decode_metadata(meta_cache, cu_seqlens_q,
+                                                seqused_k, block_table,
+                                                q.shape[0])
 
     out, _ = torch.ops._vllm_fa2_C.varlen_fwd(
         q,
@@ -491,6 +538,7 @@ def flash_attn_varlen_func(
     is_mix_batch: bool = True,
     host_kv_lens: Optional[torch.Tensor] = None,
     dynamic_causal: Optional[torch.Tensor] = None,
+    spec_decode_meta_cache: Optional[dict] = None,
 ):
     """
     FlashAttention interface for variable-length sequences, with optional
@@ -518,6 +566,11 @@ def flash_attn_varlen_func(
         dynamic_causal: Optional int32 tensor with one entry per sequence.
             Nonzero entries use causal masking and zero entries use
             bidirectional attention. When provided, it overrides ``causal``.
+        spec_decode_meta_cache: Optional dict that lives for one forward
+            pass. The speculative-decoding fast path keeps its decode
+            metadata there, so the layers of a forward that pass the same
+            cu_seqlens_q, seqused_k and block_table build it once (see
+            ``spec_decode_metadata``). None builds it in every call.
     """
     if host_kv_lens is not None:
         if seqused_k is not None:
@@ -641,6 +694,7 @@ def flash_attn_varlen_func(
                     s_aux,
                     real_window_size,
                     softcap,
+                    spec_decode_meta_cache,
                 )
 
             out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
