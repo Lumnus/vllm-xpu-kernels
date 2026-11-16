@@ -83,7 +83,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def(
       "moe_gather(Tensor! output, Tensor moe_output, Tensor topk_weights, "
       "Tensor unpermuted_row_to_permuted_row, "
-      "int num_experts) -> ()");
+      "int num_experts, Tensor? shared=None, Tensor? shared_gate=None, "
+      "bool single_round=False) -> ()");
   m.impl("moe_gather", torch::kXPU, &moe_gather);
   m.def(
       "init_expert_map(Tensor expert_map,"

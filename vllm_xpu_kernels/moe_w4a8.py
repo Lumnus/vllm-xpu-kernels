@@ -41,6 +41,24 @@ would pick an 8, 16 or 32-row tile:
 The values per element are those of the unfused path; only row positions
 and the GEMM scheduler change. Larger calls, ``fused_act`` and the stock
 prep keep the unfused path.
+
+Two optional inputs let a caller drop work it already did or still has to
+do around the layer; neither changes a value:
+  x_q     the token rows already quantized by the per-token int8 op
+          (``_C.dynamic_per_token_scaled_int8_quant``, the op this path
+          calls itself) at the MoE entry, shared with the other consumers of
+          the row. The unfused path remaps them instead of quantizing again;
+          the fused path gathers them (``moe_w4a8_route_gather_q``) instead
+          of quantizing in its gather.
+  shared  ``(out, gate)``: the shared expert's output and its sigmoid gate
+          column. ``moe_gather`` adds ``gate * out`` to the routed sum with
+          the rounding points of the separate multiply and add
+          (``out = T(T(acc) + T(gate * out))``), so the caller drops both.
+          ``apply`` returns True when it did; False leaves the add to the
+          caller (a kernels build whose moe_gather has no shared term).
+          ``(out, gate, True)`` asks for one fp32 rounding of
+          ``acc + gate * out`` instead (different bits: no T rounding of
+          the routed sum or of the gated product).
 """
 
 import os
@@ -162,6 +180,64 @@ def _log_fused_moe_once(mode: int, tile_m: int) -> None:
         ", stock silu_and_mul and quant", tile_m, FUSED_MAX_ROUTES)
 
 
+_GATHER_SHARED = None
+_GATHER_Q = None
+
+
+def gather_takes_shared() -> bool:
+    """Whether ``_moe_C.moe_gather`` takes the shared expert's term."""
+    global _GATHER_SHARED
+    if _GATHER_SHARED is None:
+        try:
+            schema = torch.ops._moe_C.moe_gather.default._schema
+            _GATHER_SHARED = any(a.name == "shared_gate"
+                                 for a in schema.arguments)
+        except (AttributeError, RuntimeError):
+            _GATHER_SHARED = False
+    return _GATHER_SHARED
+
+
+def load_gather_q_op():
+    """``_xpu_C.moe_w4a8_route_gather_q`` (the fused map with a gather of
+    pre-quantized rows), or None if this build lacks it."""
+    global _GATHER_Q
+    if _GATHER_Q is None:
+        try:
+            _GATHER_Q = torch.ops._xpu_C.moe_w4a8_route_gather_q
+        except (AttributeError, RuntimeError):
+            _GATHER_Q = False
+    return _GATHER_Q or None
+
+
+# Markers the engine reads: apply takes x_q and shared.
+TAKES_ENTRY_ROWS = True
+TAKES_SHARED = True
+
+
+def _entry_rows_ok(x_q, hs: torch.Tensor) -> bool:
+    if x_q is None:
+        return False
+    q, sc = x_q
+    return (q.dtype == torch.int8 and q.shape == hs.shape
+            and q.device == hs.device and q.stride(-1) == 1
+            and sc.dtype == torch.float32 and sc.numel() == hs.shape[0])
+
+
+def _gather(output, g2, topk_weights, unp, num_experts, shared) -> bool:
+    if shared is not None and gather_takes_shared():
+        out, gate = shared[0], shared[1]
+        if len(shared) > 2 and shared[2]:
+            # Tier 2: one fp32 rounding of acc + gate * out.
+            torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp,
+                                        num_experts, out, gate, True)
+        else:
+            torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp,
+                                        num_experts, out, gate)
+        return True
+    torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp, num_experts)
+    return False
+
+
 def quant_rows(x: torch.Tensor):
     """Symmetric dynamic int8 per row: (int8 [T, H], fp32 scale [T, 1])."""
     t = x.shape[0]
@@ -206,13 +282,18 @@ def apply(impl,
           topk_ids: torch.Tensor,
           expert_map: Optional[torch.Tensor] = None,
           fused_act: bool = False,
-          rows_per_expert: Optional[torch.Tensor] = None) -> None:
+          rows_per_expert: Optional[torch.Tensor] = None,
+          x_q=None,
+          shared=None) -> bool:
     """Drop-in for XpuFusedMoe._apply_kernel with the W4A8 grouped GEMMs.
 
     ``rows_per_expert``: optional int32 ``[num_experts]`` buffer of the
     caller; the remap clears it and fills it with each local expert's rows.
     With VLLM_XPU_W4A8_STOCK_PREP=1 it is ignored here (the caller derives it
-    again, see ``XpuFusedMoe.apply``)."""
+    again, see ``XpuFusedMoe.apply``).
+
+    ``x_q`` / ``shared``: see the module docstring. Returns True when the
+    shared expert's term was added in the gather."""
     op = load_op()
     _log_prep_once()
     num_rows, hidden = hidden_states.shape
@@ -228,6 +309,7 @@ def apply(impl,
         hs = hidden_states.masked_fill(invalid.unsqueeze(1), 0)
         rows_per_expert = torch.zeros((impl.num_experts, ),
                                       dtype=torch.int32, device=dev)
+        x_q = None
     else:
         # No padding mask: such a row is never remapped and is gathered as
         # zeros (module docstring). The remap clears rows_per_expert first.
@@ -242,11 +324,15 @@ def apply(impl,
                 and hs.dtype == torch.bfloat16
                 and output.dtype == torch.bfloat16 and hidden % 8 == 0
                 and inter % 8 == 0 and load_fused_ops() is not None):
-            _apply_fused(impl, output, hs, topk_weights, topk_ids,
-                         expert_map, rows_per_expert, tile_m)
-            return
+            return _apply_fused(impl, output, hs, topk_weights, topk_ids,
+                                expert_map, rows_per_expert, tile_m, x_q,
+                                shared)
 
-    hq, hsc = quant_rows(hs)
+    if _entry_rows_ok(x_q, hs):
+        hq, hsc = x_q
+        hsc = hsc.reshape(-1, 1)
+    else:
+        hq, hsc = quant_rows(hs)
     # The stock remap copies bytes (e4m3 = uint8 path) and routes the
     # per-token scale ([T, 1] -> block_k = hidden) with them.
     remapped = torch.empty((n_moe, hidden), dtype=torch.float8_e4m3fn,
@@ -291,12 +377,12 @@ def apply(impl,
     g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
     op(aq, asc, impl.w2, impl.gemm2_wei_scales, impl.w2_bias, g2,
        rows_per_expert, hidden, inter, impl.num_experts)
-    torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp,
-                                impl.num_experts)
+    return _gather(output, g2, topk_weights, unp, impl.num_experts, shared)
 
 
 def _apply_fused(impl, output, hs, topk_weights, topk_ids, expert_map,
-                 rows_per_expert, tile_m: int) -> None:
+                 rows_per_expert, tile_m: int, x_q=None,
+                 shared=None) -> bool:
     """The layer on the fused decode ops (module docstring). Same contract as
     the unfused apply: output, the caller's rows_per_expert filled with each
     local expert's rows, padding / unrouted / unowned slots skipped."""
@@ -312,9 +398,17 @@ def _apply_fused(impl, output, hs, topk_weights, topk_ids, expert_map,
     aq = torch.empty((n_moe, hidden), dtype=torch.int8, device=dev)
     asc = torch.empty((n_moe, ), dtype=torch.float32, device=dev)
     unp = torch.empty((num_rows, topk), dtype=torch.int32, device=dev)
-    # 1 + 2: map (rows_per_expert, route -> row, tiles), quant + gather.
-    route_quant(hs, topk_ids, expert_map, aq, asc, unp, rows_per_expert, ws,
-                impl.total_experts_num, impl.local_experts_num, tile_m)
+    # 1 + 2: map (rows_per_expert, route -> row, tiles), quant + gather; or
+    # the gather of the rows quantized at the MoE entry.
+    gather_q = load_gather_q_op() if _entry_rows_ok(x_q, hs) else None
+    if gather_q is not None:
+        gather_q(x_q[0], x_q[1], topk_ids, expert_map, aq, asc, unp,
+                 rows_per_expert, ws, impl.total_experts_num,
+                 impl.local_experts_num, tile_m)
+    else:
+        route_quant(hs, topk_ids, expert_map, aq, asc, unp, rows_per_expert,
+                    ws, impl.total_experts_num, impl.local_experts_num,
+                    tile_m)
     # 3: gemm1 over the tile map.
     g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
     tile_gemm(aq, asc, impl.w13, impl.gemm1_wei_scales, impl.w13_bias, g1,
@@ -333,5 +427,4 @@ def _apply_fused(impl, output, hs, topk_weights, topk_ids, expert_map,
     g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
     tile_gemm(q2, s2, impl.w2, impl.gemm2_wei_scales, impl.w2_bias, g2, ws,
               hidden, inter, tile_m)
-    torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp,
-                                impl.num_experts)
+    return _gather(output, g2, topk_weights, unp, impl.num_experts, shared)
