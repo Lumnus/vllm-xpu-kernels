@@ -695,11 +695,15 @@ class cp_gather_indexer_k_quant_cache_kernel {
         static_cast<int>(item.get_group(1) * local_range_y + local_y) *
         VEC_SIZE;
 
-    // Initialise SLM to 0 before the search to avoid stale values
-    // from the previous work-group that ran on the same EU.
+    // Initialise SLM to -1 before the search: a token that falls outside
+    // every [cu_seq_lens[b], cu_seq_lens[b + 1]) range (dst sized to an upper
+    // bound of cu_seq_lens[-1]) keeps -1 and is skipped below, as in CUDA.
     if (local_y == 0 && token_idx < num_tokens_) {
-      batch_idx_acc_[local_x] = 0;
+      batch_idx_acc_[local_x] = -1;
     }
+    // The init must land before any other local_y writes a match into the
+    // same slot; without this barrier a late init could overwrite a match.
+    sycl::group_barrier(item.get_group());
 
     for (int iter = 0; iter < (batch_size_ + local_range_y - 1) / local_range_y;
          ++iter) {
@@ -722,6 +726,10 @@ class cp_gather_indexer_k_quant_cache_kernel {
     }
 
     const int my_batch = batch_idx_acc_[local_x];
+    // Out-of-range token: leave dst untouched and do not index block_table.
+    if (my_batch < 0) {
+      return;
+    }
     const int inbatch_seq_idx = token_idx - cu_seq_lens_[my_batch];
     const int block_idx = block_table_
         [my_batch * num_blocks_ + inbatch_seq_idx / cache_block_size_];
