@@ -1606,3 +1606,107 @@ def test_fused_moe_int4_w4a8_padding_rows_and_counts(ep_rank):
         torch.testing.assert_close(out[:m], ref, rtol=0, atol=0)
         assert not out[m:].any()
         assert torch.equal(rpe.long(), expected)
+
+
+@pytest.mark.parametrize("ep_rank", [None, 0, 3])
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 33])
+@pytest.mark.parametrize("pad_ids", ["negative", "owned"])
+def test_fused_moe_int4_w4a8_fused_decode_bits(ep_rank, m, pad_ids,
+                                               monkeypatch):
+    """The fused W4A8 decode path (VLLM_XPU_W4A8_FUSED_MOE=1: silu + quant
+    in one kernel; =2: stock silu_and_mul and quant) gives the unfused
+    path's output and rows_per_expert bit for bit on the device: QFN's
+    expert shapes (H 2560, I 640, g128, top-10), unrouted slots, NaN padding
+    rows with negative ids or with an id this rank owns (computed as a real
+    expert on both paths), expert parallelism off and on (a moved
+    placement). This is the device half of tests/fused_moe/
+    test_moe_w4a8_fused_cpu.py, which proves the composition on CPU."""
+    from vllm_xpu_kernels import moe_w4a8
+    if moe_w4a8.load_fused_ops() is None:
+        pytest.skip("this build has no fused W4A8 decode ops")
+    seed_everything(11)
+    hidden_size, intermediate_size, e, topk = 2560, 640, 64, 10
+    group_size, dtype = 128, torch.bfloat16
+    ep_size = 1 if ep_rank is None else 4
+    local = e // ep_size
+
+    def make_w(*shape):
+        return torch.randint(0, 0xff, shape, device=DEVICE).to(torch.uint8)
+
+    def make_s(*shape):
+        return (torch.rand(shape, device=DEVICE) / 256 + 1e-4).to(dtype)
+
+    expert_map = None
+    if ep_rank is not None:
+        g = torch.Generator().manual_seed(ep_rank)
+        perm = torch.randperm(e, generator=g)
+        expert_map = torch.full((e, ), -1, dtype=torch.int32)
+        expert_map[perm[:local]] = torch.arange(local, dtype=torch.int32)
+        expert_map = expert_map.to(DEVICE)
+    impl = XpuFusedMoe(
+        w13=make_w(local, 2 * intermediate_size, hidden_size // 2),
+        w13_scales=make_s(local, 2 * intermediate_size,
+                          hidden_size // group_size),
+        w13_bias=None, w2=make_w(local, hidden_size, intermediate_size // 2),
+        w2_scales=make_s(local, hidden_size, intermediate_size // group_size),
+        w2_bias=None, n_experts_per_token=topk, activation="silu",
+        num_experts=local, ep_rank=ep_rank or 0, ep_size=ep_size,
+        expert_map=expert_map)
+    pad = 3
+    a = torch.randn((m + pad, hidden_size), device=DEVICE, dtype=dtype) / 4
+    a[:, :16] *= 20  # outlier channels, as in the HC streams
+    a[m:] = float("nan")
+    weights, ids = torch.topk(
+        torch.randn((m + pad, e), device=DEVICE,
+                    dtype=torch.float32).softmax(-1), k=topk, dim=-1)
+    ids = ids.to(torch.int32)
+    ids[::3, 1] = -1
+    if pad_ids == "negative":
+        ids[m:] = -1
+    else:
+        em = expert_map if expert_map is not None else torch.arange(
+            e, dtype=torch.int32, device=DEVICE)
+        ids[m:] = int((em >= 0).nonzero()[0])  # an expert this rank owns
+
+    results = {}
+    for mode in (0, 1, 2):
+        monkeypatch.setattr(moe_w4a8, "_FUSED", mode)
+        rpe = torch.full((local, ), 7, dtype=torch.int32, device=DEVICE)
+        out = torch.full_like(a, 3.0)
+        impl.apply(output=out, hidden_states=a, topk_weights=weights,
+                   topk_ids=ids, w4a8=True, ids_valid=True,
+                   rows_per_expert=rpe)
+        torch.xpu.synchronize()
+        results[mode] = (out.view(torch.int16).cpu(), rpe.cpu())
+    assert impl._w4a8_why is None
+    for mode in (1, 2):
+        assert torch.equal(results[mode][0], results[0][0]), mode
+        assert torch.equal(results[mode][1], results[0][1]), mode
+    if pad_ids == "negative":
+        assert not results[1][0][m:].any()
+
+
+@pytest.mark.parametrize("rows", [8, 81, 300])
+def test_w4a8_tile_override_bits(rows):
+    """Every plain W4A8 tile the override can name gives the auto tile's
+    bits (same k order and epilogue per element) and is the one dispatched."""
+    seed_everything(3)
+    e, n, k = 4, 1280, 2560
+    a = torch.randint(-127, 128, (rows * e, k), dtype=torch.int8,
+                      device=DEVICE)
+    a_s = (torch.rand((rows * e, 1), device=DEVICE) / 64 + 1e-3)
+    w = torch.randint(-128, 128, (e, n, k // 2), dtype=torch.int8,
+                      device=DEVICE)
+    ws = (torch.rand((e, n, k // 128), device=DEVICE) / 256 + 1e-4).to(
+        torch.bfloat16)
+    rpe = torch.full((e, ), rows, dtype=torch.int32, device=DEVICE)
+    op = torch.ops._xpu_C.cutlass_grouped_gemm_w4a8
+    ref = torch.empty((rows * e, n), dtype=torch.bfloat16, device=DEVICE)
+    op(a, a_s, w, ws, None, ref, rpe, n, k, e)
+    for tile in ("8x64", "16x64", "32x64", "8x128s8", "16x128s8",
+                 "32x128s8", "8x128s4", "16x128s4", "32x128s4", "128x256"):
+        d = torch.empty_like(ref)
+        op(a, a_s, w, ws, None, d, rpe, n, k, e, tile)
+        torch.xpu.synchronize()
+        assert torch.ops._xpu_C._cutlass_grouped_gemm_last_w4a8_tile() == tile
+        assert torch.equal(d.view(torch.int16), ref.view(torch.int16)), tile

@@ -30,6 +30,17 @@ it, so the caller's buffer is handed to it directly: no zero fill and no
 second count. ``VLLM_XPU_W4A8_STOCK_PREP=1`` restores the earlier sequence
 (padding mask, out-of-place ``masked_fill``, own zeroed counts, and the
 caller's counts derived again in torch). Read once at import.
+
+``VLLM_XPU_W4A8_FUSED_MOE`` (default 0, read once at import) runs the layer
+on the fused decode ops (csrc/xpu/grouped_gemm/xe_2_w4a8/w4a8_moe_fused.h)
+when a call has at most ``FUSED_MAX_ROUTES`` routes and the unfused dispatch
+would pick an 8, 16 or 32-row tile:
+  1  map + quant/gather, gemm1 over the map's tiles, silu_and_mul + quant in
+     one kernel, gemm2, moe_gather: 6 launches against 11.
+  2  as 1, but silu_and_mul and the quant stay the two stock ops: 7.
+The values per element are those of the unfused path; only row positions
+and the GEMM scheduler change. Larger calls, ``fused_act`` and the stock
+prep keep the unfused path.
 """
 
 import os
@@ -43,10 +54,19 @@ STOCK_PREP_ENV = "VLLM_XPU_W4A8_STOCK_PREP"
 _STOCK_PREP = os.environ.get(STOCK_PREP_ENV, "0").strip().upper() in (
     "1", "TRUE", "YES", "ON")
 
+FUSED_ENV = "VLLM_XPU_W4A8_FUSED_MOE"
+_FUSED_RAW = os.environ.get(FUSED_ENV, "0").strip()
+_FUSED = int(_FUSED_RAW) if _FUSED_RAW in ("0", "1", "2") else 0
+# The map kernel's bound (w4a8_moe_fused_prep.cpp kMaxRoutes, kMaxLocal).
+FUSED_MAX_ROUTES = 2048
+FUSED_MAX_LOCAL = 512
+
 _OP = None
 _GLU = None
+_FOPS = None
 _LOGGED_FUSED = False
 _LOGGED_PREP = False
+_LOGGED_FUSED_MOE = False
 
 
 def stock_prep() -> bool:
@@ -87,6 +107,59 @@ def load_glu_op():
         except (AttributeError, RuntimeError):
             return None
     return _GLU
+
+
+def fused_mode() -> int:
+    """VLLM_XPU_W4A8_FUSED_MOE as read at import: 0 off, 1, 2."""
+    return _FUSED
+
+
+def load_fused_ops():
+    """The fused decode ops from ``_xpu_C``, or None if this build lacks
+    them."""
+    global _FOPS
+    if _FOPS is None:
+        try:
+            xo = torch.ops._xpu_C
+            _FOPS = (xo.moe_w4a8_route_quant, xo.moe_w4a8_tile_gemm,
+                     xo.moe_w4a8_silu_mul_quant)
+        except (AttributeError, RuntimeError):
+            _FOPS = False
+    return _FOPS or None
+
+
+def unfused_tile(n_moe: int, num_experts: int) -> Optional[int]:
+    """The M tile the unfused dispatch picks for a call of ``n_moe`` routed
+    rows (grouped_gemm_w4a8_xe2.cpp: avg = rows / experts against 4 / 8 /
+    128), when it is one of the fused path's 8 / 16 / 32; else None."""
+    avg = n_moe // max(num_experts, 1)
+    if avg <= 4:
+        return 8
+    if avg <= 8:
+        return 16
+    if avg <= 128:
+        return 32
+    return None
+
+
+def fused_umt(n_moe: int, tile_m: int, num_experts: int) -> int:
+    """Tiles the map can need: each expert with c > 0 rows takes
+    ceil(c / tile_m) <= c / tile_m + 1 tiles, and no tile is empty."""
+    return min(n_moe, n_moe // tile_m + min(n_moe, num_experts))
+
+
+def _log_fused_moe_once(mode: int, tile_m: int) -> None:
+    global _LOGGED_FUSED_MOE
+    if _LOGGED_FUSED_MOE:
+        return
+    _LOGGED_FUSED_MOE = True
+    import logging
+    logging.getLogger("vllm_xpu_kernels").warning(
+        "W4A8 MoE fused decode on (%s=%d): map + quant/gather, gemm1 and "
+        "gemm2 over the tile map%s, moe_gather; first call tile %d rows, "
+        "up to %d routes per call", FUSED_ENV, mode,
+        ", silu_and_mul + quant in one kernel" if mode == 1 else
+        ", stock silu_and_mul and quant", tile_m, FUSED_MAX_ROUTES)
 
 
 def quant_rows(x: torch.Tensor):
@@ -162,6 +235,16 @@ def apply(impl,
         if rows_per_expert is None:
             rows_per_expert = torch.empty((impl.num_experts, ),
                                           dtype=torch.int32, device=dev)
+        tile_m = unfused_tile(n_moe, impl.num_experts) if _FUSED else None
+        if (tile_m is not None and not fused_act and 0 < n_moe
+                and n_moe <= FUSED_MAX_ROUTES
+                and impl.num_experts <= FUSED_MAX_LOCAL and topk <= 16
+                and hs.dtype == torch.bfloat16
+                and output.dtype == torch.bfloat16 and hidden % 8 == 0
+                and inter % 8 == 0 and load_fused_ops() is not None):
+            _apply_fused(impl, output, hs, topk_weights, topk_ids,
+                         expert_map, rows_per_expert, tile_m)
+            return
 
     hq, hsc = quant_rows(hs)
     # The stock remap copies bytes (e4m3 = uint8 path) and routes the
@@ -208,5 +291,47 @@ def apply(impl,
     g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
     op(aq, asc, impl.w2, impl.gemm2_wei_scales, impl.w2_bias, g2,
        rows_per_expert, hidden, inter, impl.num_experts)
+    torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp,
+                                impl.num_experts)
+
+
+def _apply_fused(impl, output, hs, topk_weights, topk_ids, expert_map,
+                 rows_per_expert, tile_m: int) -> None:
+    """The layer on the fused decode ops (module docstring). Same contract as
+    the unfused apply: output, the caller's rows_per_expert filled with each
+    local expert's rows, padding / unrouted / unowned slots skipped."""
+    route_quant, tile_gemm, silu_quant = load_fused_ops()
+    num_rows, hidden = hs.shape
+    topk = impl.n_experts_per_token
+    n_moe = num_rows * topk
+    inter = impl.inter_size
+    dev = hs.device
+    _log_fused_moe_once(_FUSED, tile_m)
+    umt = fused_umt(n_moe, tile_m, impl.num_experts)
+    ws = torch.empty((2 + 3 * umt, ), dtype=torch.int32, device=dev)
+    aq = torch.empty((n_moe, hidden), dtype=torch.int8, device=dev)
+    asc = torch.empty((n_moe, ), dtype=torch.float32, device=dev)
+    unp = torch.empty((num_rows, topk), dtype=torch.int32, device=dev)
+    # 1 + 2: map (rows_per_expert, route -> row, tiles), quant + gather.
+    route_quant(hs, topk_ids, expert_map, aq, asc, unp, rows_per_expert, ws,
+                impl.total_experts_num, impl.local_experts_num, tile_m)
+    # 3: gemm1 over the tile map.
+    g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
+    tile_gemm(aq, asc, impl.w13, impl.gemm1_wei_scales, impl.w13_bias, g1,
+              ws, 2 * inter, hidden, tile_m)
+    # 4: silu_and_mul + the per-token quant of its output.
+    if _FUSED == 1:
+        q2 = torch.empty((n_moe, inter), dtype=torch.int8, device=dev)
+        s2 = torch.empty((n_moe, ), dtype=torch.float32, device=dev)
+        silu_quant(g1, q2, s2, ws)
+    else:
+        act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
+        impl.act_func(act, g1)
+        q2, s2 = quant_rows(act)
+        s2 = s2.view(-1)
+    # 5: gemm2 over the tile map; then the stock gather through the map.
+    g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
+    tile_gemm(q2, s2, impl.w2, impl.gemm2_wei_scales, impl.w2_bias, g2, ws,
+              hidden, inter, tile_m)
     torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp,
                                 impl.num_experts)

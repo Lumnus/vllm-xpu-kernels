@@ -125,12 +125,35 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   xpu_ops.impl("moe_int4_gemv", torch::kXPU, &moe_int4_gemv);
 
   // W4A8 grouped GEMM: int8 per-token activations x int4 g128 weights.
+  // tile: an explicit work-group tile for sweeps (default: VLLM_XPU_W4A8_TILE,
+  // else the rows-per-expert rule); speed only, never bits.
   xpu_ops.def(
       "cutlass_grouped_gemm_w4a8(Tensor ptr_A, Tensor ptr_A_scale, "
       "Tensor ptr_B, Tensor ptr_B_scale, Tensor? ptr_bias, Tensor ptr_D, "
-      "Tensor rows_per_expert, int N, int K, int num_experts) -> Tensor");
+      "Tensor rows_per_expert, int N, int K, int num_experts, "
+      "str? tile=None) -> Tensor");
   xpu_ops.impl(
       "cutlass_grouped_gemm_w4a8", torch::kXPU, &cutlass_grouped_gemm_w4a8);
+  xpu_ops.def(
+      "_cutlass_grouped_gemm_last_w4a8_tile() -> str",
+      &_cutlass_grouped_gemm_last_w4a8_tile);
+  // Fused W4A8 MoE decode: map + quant/gather, tile-map GEMM, silu + quant.
+  xpu_ops.def(
+      "moe_w4a8_route_quant(Tensor x, Tensor topk_ids, Tensor? expert_map, "
+      "Tensor! a_q, Tensor! a_scale, Tensor! perm_pos, "
+      "Tensor! rows_per_expert, Tensor! tile_ws, int total_experts, "
+      "int local_experts, int tile_m) -> ()");
+  xpu_ops.impl("moe_w4a8_route_quant", torch::kXPU, &moe_w4a8_route_quant);
+  xpu_ops.def(
+      "moe_w4a8_tile_gemm(Tensor a, Tensor a_scale, Tensor b, Tensor b_scale, "
+      "Tensor? bias, Tensor! d, Tensor tile_ws, int N, int K, int tile_m) -> "
+      "()");
+  xpu_ops.impl("moe_w4a8_tile_gemm", torch::kXPU, &moe_w4a8_tile_gemm);
+  xpu_ops.def(
+      "moe_w4a8_silu_mul_quant(Tensor g1, Tensor! q_out, Tensor! q_scale, "
+      "Tensor tile_ws) -> ()");
+  xpu_ops.impl(
+      "moe_w4a8_silu_mul_quant", torch::kXPU, &moe_w4a8_silu_mul_quant);
   // fused W4A8 gemm1 (silu-and-mul + int8 quant with per-row,
   // per-128-column scales in the epilogue).
   xpu_ops.def(

@@ -19,8 +19,18 @@ Modes (comma list, default all):
            shape, a 256-row pool; every row's output must be bit-identical across 2 runs and across batch
            compositions (sub-batches of 1..256 rows in shuffled order, so M crosses the 8/16/32/64 tiles
            and the split-K choice).
+  tsweep   (not in the default list) W4A8 grouped GEMM tile sweep at prefill sizes: for each rows per local
+           expert in --tsweep-rows (128 local experts, uniform and routed with the bench's skew), gemm1
+           (N 1280, K 2560) and gemm2 (N 2560, K 640) eager us and TOPS (and % of the 367 TOPS int8 peak)
+           for every compiled plain tile (the op's tile argument) and for the auto choice twice: with the
+           A buffer of the local rows (as mbench's PREFILL) and with the serving buffer (every routed row,
+           T * top-k, which is what the engine passes, so avg rows per expert is ep times larger). Checks
+           every tile's output against auto's, bitwise.
+  fbench   (not in the default list) the fused W4A8 decode path (VLLM_XPU_W4A8_FUSED_MOE 1 and 2) against
+           the unfused one at --fbench-tokens, EP4 top-10: us per MoE call under graph replay and eager,
+           and bitwise equality of the outputs.
 
-Prints one JSON line per case (DENSE / DBENCH / GLU / MOE / MBENCH / HCDET) and writes --out.
+Prints one JSON line per case (DENSE / DBENCH / GLU / MOE / MBENCH / HCDET / TSWEEP / FBENCH) and writes --out.
 """
 import argparse
 import json
@@ -386,6 +396,113 @@ def run_gemm_prefill(fm, w4, T, seed, grid):
     return r
 
 
+# --------------------------------------------------------------------------- tsweep
+PEAK_INT8_TOPS = 367.0  # Arc Pro B70 spec sheet
+W4A8_TILES = ("8x64", "16x64", "32x64", "8x128s8", "16x128s8", "32x128s8",
+              "8x128s4", "16x128s4", "32x128s4", "128x256")
+
+
+def run_tsweep(fm, w4, rows_list, seed, ep):
+    """Tile sweep of the plain W4A8 grouped GEMM at prefill sizes (see the module docstring)."""
+    op = torch.ops._xpu_C.cutlass_grouped_gemm_w4a8
+    last = torch.ops._xpu_C._cutlass_grouped_gemm_last_w4a8_tile
+    E = fm.num_experts
+    res = []
+    for rpe_target in rows_list:
+        for dist in ("uniform", "routed"):
+            if dist == "uniform":
+                rpe = torch.full((E, ), rpe_target, dtype=torch.int32, device=DEV)
+                T = rpe_target * E * ep // TOPK
+            else:
+                T = max(1, rpe_target * E * ep // TOPK)
+                ids, _ = routing(T, seed + T)
+                loc = fm.expert_map[ids.long()]
+                sel = loc[loc >= 0].long()
+                rpe = torch.zeros(E, dtype=torch.int32, device=DEV)
+                rpe.index_add_(0, sel, torch.ones_like(sel, dtype=torch.int32))
+            rows = int(rpe.sum().item())
+            n_serv = T * TOPK  # the engine's buffer: every routed row
+            r = {"dist": dist, "rows_per_expert": rpe_target, "T": T, "rows": rows,
+                 "max_rows_one_expert": int(rpe.max().item()), "serving_buffer_rows": n_serv}
+            for gname, N, K in (("g1", 2 * INTER, H), ("g2", H, INTER)):
+                a8, as8 = w4.quant_rows((torch.randn(rows, K, device=DEV) * 0.5).to(torch.bfloat16))
+                d = torch.empty(rows, N, dtype=torch.bfloat16, device=DEV)
+                B = fm.w13 if gname == "g1" else fm.w2
+                S = fm.gemm1_wei_scales if gname == "g1" else fm.gemm2_wei_scales
+                flops = 2.0 * rows * N * K
+                t = ebench(lambda: op(a8, as8, B, S, None, d, rpe, N, K, E), iters=20)
+                ref = d.clone()
+                r[f"{gname}_auto_tile"] = last()
+                r[f"{gname}_auto_us"] = round(t, 1)
+                r[f"{gname}_auto_tops"] = round(flops / t / 1e6, 1)
+                # The engine's call: the same rows, an A buffer of every routed row.
+                a_s = torch.zeros(n_serv, K, dtype=torch.int8, device=DEV)
+                a_s[:rows] = a8
+                s_s = torch.ones(n_serv, 1, dtype=torch.float32, device=DEV)
+                s_s[:rows] = as8
+                d_s = torch.empty(n_serv, N, dtype=torch.bfloat16, device=DEV)
+                t = ebench(lambda: op(a_s, s_s, B, S, None, d_s, rpe, N, K, E), iters=20)
+                r[f"{gname}_serving_tile"] = last()
+                r[f"{gname}_serving_us"] = round(t, 1)
+                r[f"{gname}_serving_tops"] = round(flops / t / 1e6, 1)
+                r[f"{gname}_serving_bits_equal"] = bool(torch.equal(d_s[:rows].view(torch.int16),
+                                                                    ref.view(torch.int16)))
+                del a_s, s_s, d_s
+                best = None
+                for tile in W4A8_TILES:
+                    try:
+                        t = ebench(lambda: op(a8, as8, B, S, None, d, rpe, N, K, E, tile), iters=20)
+                    except Exception as ex:  # noqa
+                        r[f"{gname}_{tile}_err"] = repr(ex)[:160]
+                        continue
+                    tops = flops / t / 1e6
+                    r[f"{gname}_{tile}_us"] = round(t, 1)
+                    r[f"{gname}_{tile}_tops"] = round(tops, 1)
+                    r[f"{gname}_{tile}_pct_peak"] = round(100.0 * tops / PEAK_INT8_TOPS, 1)
+                    r[f"{gname}_{tile}_bits_equal"] = bool(torch.equal(d.view(torch.int16),
+                                                                       ref.view(torch.int16)))
+                    if best is None or tops > best[1]:
+                        best = (tile, tops)
+                r[f"{gname}_best"] = best[0] if best else None
+                r[f"{gname}_best_tops"] = round(best[1], 1) if best else None
+                r[f"{gname}_best_over_serving"] = round(best[1] / r[f"{gname}_serving_tops"], 3) if best else None
+            print("TSWEEP", json.dumps(r), flush=True)
+            res.append(r)
+    return res
+
+
+# --------------------------------------------------------------------------- fbench
+def run_fbench(fm, w4, tokens, seed):
+    """Fused W4A8 decode path (modes 1, 2) against the unfused one: us per MoE call, bits."""
+    if w4.load_fused_ops() is None:
+        print("FBENCH", json.dumps({"err": "this build has no fused W4A8 decode ops"}), flush=True)
+        return []
+    res = []
+    saved = w4._FUSED
+    try:
+        for T in tokens:
+            ids, tw = routing(T, seed + T)
+            x = (torch.randn(T, H, device=DEV) * 0.5).to(torch.bfloat16)
+            x[:, :16] *= 20
+            r = {"T": T, "routes": T * TOPK, "tile_m": w4.unfused_tile(T * TOPK, fm.num_experts)}
+            outs = {}
+            for mode in (0, 1, 2):
+                w4._FUSED = mode
+                o = torch.empty(T, H, dtype=torch.bfloat16, device=DEV)
+                w4.apply(fm, o, x, tw, ids)
+                sync()
+                outs[mode] = o.view(torch.int16).clone()
+                r[f"m{mode}_graph_us"] = round(gbench(lambda: w4.apply(fm, o, x, tw, ids)), 1)
+                r[f"m{mode}_eager_us"] = round(ebench(lambda: w4.apply(fm, o, x, tw, ids)), 1)
+            r["m1_bits_equal"] = bool(torch.equal(outs[1], outs[0]))
+            r["m2_bits_equal"] = bool(torch.equal(outs[2], outs[0]))
+            print("FBENCH", json.dumps(r), flush=True)
+            res.append(r)
+    finally:
+        w4._FUSED = saved
+    return res
+
+
 # --------------------------------------------------------------------------- hcdet
 def run_hcdet(seed):
     """Bitwise: same input -> same output for every run, batch composition, split and tile."""
@@ -428,6 +545,9 @@ def main():
     ap.add_argument("--moe-tokens", default="1,8,16,64,256,1024")
     ap.add_argument("--bench-tokens", default="1,2,4,8,16,32,64,96,256,1024")
     ap.add_argument("--prefill-tokens", type=int, default=4096)
+    ap.add_argument("--tsweep-rows", default="32,64,81,128,256",
+                    help="tsweep: rows per local expert")
+    ap.add_argument("--fbench-tokens", default="1,2,4,8,16")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", default="result-int8-exec.json")
     args = ap.parse_args()
@@ -462,6 +582,15 @@ def main():
         if "mbench" in modes:
             out["mbench"] = run_mbench(fm, w4, [int(t) for t in args.bench_tokens.split(",")], args.seed, grid)
             out["prefill"] = run_gemm_prefill(fm, w4, args.prefill_tokens, args.seed, grid)
+    if "tsweep" in modes or "fbench" in modes:
+        fm = make_moe(args.seed, args.experts, args.ep)
+        sync()
+        if "tsweep" in modes:
+            out["tsweep"] = run_tsweep(fm, w4, [int(t) for t in args.tsweep_rows.split(",")],
+                                       args.seed, args.ep)
+        if "fbench" in modes:
+            out["fbench"] = run_fbench(fm, w4, [int(t) for t in args.fbench_tokens.split(",")],
+                                       args.seed)
     out["peak_gib"] = torch.xpu.max_memory_allocated() / 2**30
     print("PEAK_GIB", round(out["peak_gib"], 3), flush=True)
     with open(args.out, "w") as f:

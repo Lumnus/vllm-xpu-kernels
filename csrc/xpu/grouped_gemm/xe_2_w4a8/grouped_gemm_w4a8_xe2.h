@@ -1,8 +1,12 @@
 #pragma once
 #include <torch/all.h>
 
+#include <string>
+
 // int8 A [M, K] (per-row fp32 scale [M]) x packed int4 B [E, N, K/2]
 // (bf16 scales [E, N, K/128]) -> bf16 D [M, N]; rows of A grouped by expert.
+// tile: an explicit work-group tile ("32x128s8", ...), else
+// VLLM_XPU_W4A8_TILE, else the rows-per-expert rule (grouped_gemm_w4a8_xe2.cpp).
 at::Tensor cutlass_grouped_gemm_w4a8_xe2(
     at::Tensor ptr_A,
     at::Tensor ptr_A_scale,
@@ -13,7 +17,11 @@ at::Tensor cutlass_grouped_gemm_w4a8_xe2(
     at::Tensor rows_per_expert,
     int64_t N,
     int64_t K,
-    int64_t num_experts);
+    int64_t num_experts,
+    const c10::optional<std::string>& tile = c10::nullopt);
+
+// The tile name of this thread's last plain W4A8 GEMM dispatch.
+std::string cutlass_grouped_gemm_w4a8_last_tile_xe2();
 
 // Fused gemm1 of the W4A8 MoE: int8 A [M, K] (fp32 per-row scale) x w13
 // [E, 2*inter, K/2] (gate rows, then up rows), epilogue silu(gate) * up

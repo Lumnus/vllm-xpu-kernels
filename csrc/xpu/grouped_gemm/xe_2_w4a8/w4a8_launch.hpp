@@ -66,6 +66,38 @@ class W4A8GemmName;
 template <class, int, int>
 class W4A8GluName;
 
+// Work-group tiles of the plain W4A8 GEMM that the dispatch can run, as an
+// explicit choice (force): every one computes each output element with the
+// same k order and epilogue, so the choice changes speed, never bits.
+// kAuto keeps the rows-per-expert rule of dispatch_plain.
+enum W4A8Tile : int {
+  kAuto = 0,
+  kM8 = 1,       // 8 x 64, 1 x 4 SGs
+  kM16 = 2,      // 16 x 64, 1 x 4 SGs
+  kM32 = 3,      // 32 x 64, 1 x 4 SGs
+  kS1M8 = 4,     // 8 x 128, 1 x 8 SGs
+  kS1M16 = 5,    // 16 x 128, 1 x 8 SGs
+  kS1M32 = 6,    // 32 x 128, 1 x 8 SGs
+  kS2M8 = 7,     // 8 x 128, 1 x 4 SGs
+  kS2M16 = 8,    // 16 x 128, 1 x 4 SGs
+  kS2M32 = 9,    // 32 x 128, 1 x 4 SGs
+  kBig = 10,     // 128 x 256, 4 x 8 SGs
+  kTileCount = 11
+};
+
+inline const char* w4a8_tile_name(int t) {
+  static const char* const names[kTileCount] = {
+      "auto",     "8x64",     "16x64",    "32x64",    "8x128s8", "16x128s8",
+      "32x128s8", "8x128s4", "16x128s4", "32x128s4", "128x256"};
+  return (t >= 0 && t < kTileCount) ? names[t] : "?";
+}
+
+// The tile of this thread's last plain W4A8 dispatch (for tests and sweeps).
+inline int& last_w4a8_tile() {
+  static thread_local int tile = kAuto;
+  return tile;
+}
+
 struct PlainArgs {
   sycl::queue* q;
   const int8_t* a;
@@ -78,6 +110,7 @@ struct PlainArgs {
   const int* rows;
   int32_t* atomic;
   int avg_m, t8, t16, t32, small_tile;
+  int force;  // W4A8Tile; kAuto = the rows-per-expert rule
 };
 
 struct GluArgs {
@@ -429,7 +462,22 @@ void launch_glu(const GluArgs& p) {
 template <int PF, int TK, int AG>
 void dispatch_plain(const PlainArgs& p) {
   constexpr int GS = 128;  // only g128 is built (Intel AutoRound / GPTQ)
+  // An explicit tile (VLLM_XPU_W4A8_TILE or the op's tile argument) first.
+  switch (p.force) {
+    case kM8: last_w4a8_tile() = kM8; return launch<w4a8_policy_m_8<TK>, GS, AG, PF>(p);
+    case kM16: last_w4a8_tile() = kM16; return launch<w4a8_policy_m_16<TK>, GS, AG, PF>(p);
+    case kM32: last_w4a8_tile() = kM32; return launch<w4a8_policy_m_32<TK>, GS, AG, PF>(p);
+    case kS1M8: last_w4a8_tile() = kS1M8; return launch<w4a8_policy_s1<8, TK>, GS, AG, PF>(p);
+    case kS1M16: last_w4a8_tile() = kS1M16; return launch<w4a8_policy_s1<16, TK>, GS, AG, PF>(p);
+    case kS1M32: last_w4a8_tile() = kS1M32; return launch<w4a8_policy_s1<32, TK>, GS, AG, PF>(p);
+    case kS2M8: last_w4a8_tile() = kS2M8; return launch<w4a8_policy_s2<8, TK>, GS, AG, PF>(p);
+    case kS2M16: last_w4a8_tile() = kS2M16; return launch<w4a8_policy_s2<16, TK>, GS, AG, PF>(p);
+    case kS2M32: last_w4a8_tile() = kS2M32; return launch<w4a8_policy_s2<32, TK>, GS, AG, PF>(p);
+    case kBig: last_w4a8_tile() = kBig; return launch<w4a8_policy_big<TK>, GS, AG, PF>(p);
+    default: break;
+  }
   if (p.avg_m <= p.t8) {
+    last_w4a8_tile() = p.small_tile == 1 ? kS1M8 : (p.small_tile == 2 ? kS2M8 : kM8);
     if (p.small_tile == 1)
       launch<w4a8_policy_s1<8, TK>, GS, AG, PF>(p);
     else if (p.small_tile == 2)
@@ -437,6 +485,7 @@ void dispatch_plain(const PlainArgs& p) {
     else
       launch<w4a8_policy_m_8<TK>, GS, AG, PF>(p);
   } else if (p.avg_m <= p.t16) {
+    last_w4a8_tile() = p.small_tile == 1 ? kS1M16 : (p.small_tile == 2 ? kS2M16 : kM16);
     if (p.small_tile == 1)
       launch<w4a8_policy_s1<16, TK>, GS, AG, PF>(p);
     else if (p.small_tile == 2)
@@ -444,6 +493,7 @@ void dispatch_plain(const PlainArgs& p) {
     else
       launch<w4a8_policy_m_16<TK>, GS, AG, PF>(p);
   } else if (p.avg_m <= p.t32) {
+    last_w4a8_tile() = p.small_tile == 1 ? kS1M32 : (p.small_tile == 2 ? kS2M32 : kM32);
     if (p.small_tile == 1)
       launch<w4a8_policy_s1<32, TK>, GS, AG, PF>(p);
     else if (p.small_tile == 2)
@@ -451,6 +501,7 @@ void dispatch_plain(const PlainArgs& p) {
     else
       launch<w4a8_policy_m_32<TK>, GS, AG, PF>(p);
   } else {
+    last_w4a8_tile() = kBig;
     launch<w4a8_policy_big<TK>, GS, AG, PF>(p);
   }
 }

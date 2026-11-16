@@ -9,14 +9,54 @@
 // average-rows-per-expert bounds 4 / 8 / 128 for the 8 / 16 / 32-row tiles.
 // The other instantiated variants (tile K 32, prefetch 6, 128-wide small
 // tiles) stay compiled and are not selected.
+//
+// Tile override (default unchanged): the op's tile argument, else
+// VLLM_XPU_W4A8_TILE (read once), names one of the compiled plain tiles
+// (8x64, 16x64, 32x64, 8x128s8, 16x128s8, 32x128s8, 8x128s4, 16x128s4,
+// 32x128s4, 128x256; s8 / s4 = sub-groups per work-group) for every call;
+// unset, empty or "auto" keeps the rule above. For tile sweeps; the tile
+// changes speed, never bits (same k order and epilogue per element).
 #include <torch/all.h>
 #include <c10/xpu/XPUStream.h>
+
+#include <cctype>
+#include <cstdlib>
+#include <string>
 
 #include "w4a8_launch.hpp"
 #include "grouped_gemm_w4a8_xe2.h"
 
 namespace MoEW4A8 {
 W4A8_EXTERN_SLICES(extern)
+
+static int parse_tile(const std::string& value, const char* source) {
+  std::string v;
+  for (char c : value) {
+    if (c != ' ' && c != '\t') {
+      v.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+  }
+  if (v.empty()) return kAuto;
+  for (int t = 0; t < kTileCount; ++t) {
+    if (v == w4a8_tile_name(t)) return t;
+  }
+  TORCH_CHECK(
+      false, "cutlass_grouped_gemm_w4a8: unknown tile '", value, "' from ",
+      source,
+      " (auto, 8x64, 16x64, 32x64, 8x128s8, 16x128s8, 32x128s8, 8x128s4, "
+      "16x128s4, 32x128s4, 128x256)");
+  return kAuto;
+}
+
+// VLLM_XPU_W4A8_TILE, read on the first call.
+static int env_tile() {
+  static const int tile = [] {
+    const char* v = std::getenv("VLLM_XPU_W4A8_TILE");
+    return v == nullptr ? static_cast<int>(kAuto)
+                        : parse_tile(v, "VLLM_XPU_W4A8_TILE");
+  }();
+  return tile;
+}
 
 static constexpr int kTileK = 64;
 static constexpr int kPrefetch = 4;
@@ -98,7 +138,8 @@ at::Tensor cutlass_grouped_gemm_w4a8_xe2(
     at::Tensor rows_per_expert,
     int64_t N,
     int64_t K,
-    int64_t num_experts) {
+    int64_t num_experts,
+    const c10::optional<std::string>& tile) {
   TORCH_CHECK(ptr_A.scalar_type() == at::kChar, "w4a8: A must be int8");
   TORCH_CHECK(
       ptr_A.dim() == 2 && ptr_A.size(1) == K && ptr_A.is_contiguous(),
@@ -154,8 +195,15 @@ at::Tensor cutlass_grouped_gemm_w4a8_xe2(
   p.rows = reinterpret_cast<const int*>(rows_per_expert.data_ptr());
   p.atomic = static_cast<int32_t*>(atomic_buffer.data_ptr());
   p.avg_m = static_cast<int>(M / num_experts);
+  p.force = (tile.has_value() && !tile->empty())
+                ? MoEW4A8::parse_tile(*tile, "the tile argument")
+                : MoEW4A8::env_tile();
   MoEW4A8::run_plain(p, ag);
   return ptr_D;
+}
+
+std::string cutlass_grouped_gemm_w4a8_last_tile_xe2() {
+  return MoEW4A8::w4a8_tile_name(MoEW4A8::last_w4a8_tile());
 }
 
 void cutlass_grouped_gemm_w4a8_silu_quant_xe2(
