@@ -1542,3 +1542,67 @@ def test_fused_moe_int4_padding_rows_need_no_mask():
                    topk_ids=ids_pad, ids_valid=ids_valid)
         torch.testing.assert_close(out[:m], ref, rtol=0, atol=0)
         assert not out[m:].any()
+
+
+@pytest.mark.parametrize("ep_rank", [None, 0, 3])
+def test_fused_moe_int4_w4a8_padding_rows_and_counts(ep_rank):
+    """W4A8: NaN padding rows (all ids negative) come out as zeros with no
+    mask, every other row equals the result without the padding rows, and a
+    caller's stale rows_per_expert is filled with the remap's counts."""
+    seed_everything(7)
+    hidden_size, intermediate_size, e, topk = 512, 256, 16, 4
+    group_size, dtype = 128, torch.bfloat16
+    ep_size = 1 if ep_rank is None else 4
+    local = e // ep_size
+
+    def make_w(*shape):
+        return torch.randint(0, 0xff, shape, device=DEVICE).to(torch.uint8)
+
+    def make_s(*shape):
+        return torch.pow(
+            2.0,
+            torch.randint(-5, -4, shape, device=DEVICE).float()).to(dtype)
+
+    expert_map = None
+    if ep_rank is not None:
+        expert_map = torch.full((e, ), -1, dtype=torch.int32, device=DEVICE)
+        expert_map[ep_rank * local:(ep_rank + 1) * local] = torch.arange(
+            local, dtype=torch.int32, device=DEVICE)
+    impl = XpuFusedMoe(
+        w13=make_w(local, 2 * intermediate_size, hidden_size // 2),
+        w13_scales=make_s(local, 2 * intermediate_size,
+                          hidden_size // group_size),
+        w13_bias=None, w2=make_w(local, hidden_size, intermediate_size // 2),
+        w2_scales=make_s(local, hidden_size, intermediate_size // group_size),
+        w2_bias=None, n_experts_per_token=topk, activation="silu",
+        num_experts=local, ep_rank=ep_rank or 0, ep_size=ep_size,
+        expert_map=expert_map)
+    m, pad = 24, 5
+    a = torch.randn((m, hidden_size), device=DEVICE, dtype=dtype) / 16
+    weights, ids = torch.topk(
+        torch.randn((m, e), device=DEVICE, dtype=torch.float32), k=topk,
+        dim=-1)
+    ids = ids.to(torch.int32)
+    ids[::3, 1] = -1
+    ref = torch.empty_like(a)
+    impl.apply(output=ref, hidden_states=a, topk_weights=weights,
+               topk_ids=ids, w4a8=True)
+    assert impl._w4a8_why is None
+    a_pad = torch.cat([a, torch.full((pad, hidden_size), float("nan"),
+                                     device=DEVICE, dtype=dtype)])
+    ids_pad = torch.cat([ids, torch.full((pad, topk), -1, device=DEVICE,
+                                         dtype=torch.int32)])
+    w_pad = torch.cat([weights, torch.ones((pad, topk), device=DEVICE)])
+    em = expert_map if expert_map is not None else torch.arange(
+        e, dtype=torch.int32, device=DEVICE)
+    loc = em[ids_pad[ids_pad >= 0].long()].long()
+    expected = torch.bincount(loc[loc >= 0], minlength=local)
+    for ids_valid in (False, True):
+        rpe = torch.full((local, ), 7, dtype=torch.int32, device=DEVICE)
+        out = torch.empty_like(a_pad)
+        impl.apply(output=out, hidden_states=a_pad, topk_weights=w_pad,
+                   topk_ids=ids_pad, w4a8=True, ids_valid=ids_valid,
+                   rows_per_expert=rpe)
+        torch.testing.assert_close(out[:m], ref, rtol=0, atol=0)
+        assert not out[m:].any()
+        assert torch.equal(rpe.long(), expected)

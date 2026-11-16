@@ -18,17 +18,56 @@ silu(gate) * up in fp32 and writes it as int8 with one fp32 scale per (row,
 bf16 gemm1 output, the silu_and_mul kernel and the second quant_rows go away.
 
 Both ops are registered in ``_xpu_C``.
+
+Around the GEMMs the path launches only what the result needs. Rows whose ids
+are all negative (DP or graph padding) are not masked: the activation quant
+is per row, ``remap_hidden_states`` never copies a slot whose id is negative,
+out of range or not owned by this rank, and ``moe_gather`` writes zeros for a
+row with no computed slot, so such a row comes out as zeros whatever its
+activations hold (NaN included), as on ``XpuFusedMoe._apply_kernel``. The
+remap clears ``rows_per_expert`` and counts every local expert's rows into
+it, so the caller's buffer is handed to it directly: no zero fill and no
+second count. ``VLLM_XPU_W4A8_STOCK_PREP=1`` restores the earlier sequence
+(padding mask, out-of-place ``masked_fill``, own zeroed counts, and the
+caller's counts derived again in torch). Read once at import.
 """
 
+import os
 from typing import Optional
 
 import torch
 
 GROUP = 128
 
+STOCK_PREP_ENV = "VLLM_XPU_W4A8_STOCK_PREP"
+_STOCK_PREP = os.environ.get(STOCK_PREP_ENV, "0").strip().upper() in (
+    "1", "TRUE", "YES", "ON")
+
 _OP = None
 _GLU = None
 _LOGGED_FUSED = False
+_LOGGED_PREP = False
+
+
+def stock_prep() -> bool:
+    """True when VLLM_XPU_W4A8_STOCK_PREP=1 keeps the earlier padding mask
+    and count re-derivation around the W4A8 GEMMs."""
+    return _STOCK_PREP
+
+
+def _log_prep_once() -> None:
+    global _LOGGED_PREP
+    if _LOGGED_PREP:
+        return
+    _LOGGED_PREP = True
+    import logging
+    if _STOCK_PREP:
+        msg = ("W4A8 MoE prep: padding mask and torch re-count of "
+               "rows_per_expert kept (%s=1)")
+    else:
+        msg = ("W4A8 MoE prep: no padding mask, no re-count; the remap fills "
+               "the caller's rows_per_expert (%s=1 restores both)")
+    logging.getLogger("vllm_xpu_kernels").warning(msg, STOCK_PREP_ENV)
 
 
 def load_op():
@@ -93,9 +132,16 @@ def apply(impl,
           topk_weights: torch.Tensor,
           topk_ids: torch.Tensor,
           expert_map: Optional[torch.Tensor] = None,
-          fused_act: bool = False) -> None:
-    """Drop-in for XpuFusedMoe._apply_kernel with the W4A8 grouped GEMMs."""
+          fused_act: bool = False,
+          rows_per_expert: Optional[torch.Tensor] = None) -> None:
+    """Drop-in for XpuFusedMoe._apply_kernel with the W4A8 grouped GEMMs.
+
+    ``rows_per_expert``: optional int32 ``[num_experts]`` buffer of the
+    caller; the remap clears it and fills it with each local expert's rows.
+    With VLLM_XPU_W4A8_STOCK_PREP=1 it is ignored here (the caller derives it
+    again, see ``XpuFusedMoe.apply``)."""
     op = load_op()
+    _log_prep_once()
     num_rows, hidden = hidden_states.shape
     topk = impl.n_experts_per_token
     n_moe = num_rows * topk
@@ -103,9 +149,19 @@ def apply(impl,
     dev = hidden_states.device
     if expert_map is None and impl.ep_size > 1:
         expert_map = impl.expert_map
-    # Same as stock: rows routed nowhere (all -1, DP padding) are zeroed.
-    invalid = (topk_ids < 0).all(dim=1)
-    hs = hidden_states.masked_fill(invalid.unsqueeze(1), 0)
+    if _STOCK_PREP:
+        # Rows routed nowhere (all -1, DP padding) are zeroed.
+        invalid = (topk_ids < 0).all(dim=1)
+        hs = hidden_states.masked_fill(invalid.unsqueeze(1), 0)
+        rows_per_expert = torch.zeros((impl.num_experts, ),
+                                      dtype=torch.int32, device=dev)
+    else:
+        # No padding mask: such a row is never remapped and is gathered as
+        # zeros (module docstring). The remap clears rows_per_expert first.
+        hs = hidden_states
+        if rows_per_expert is None:
+            rows_per_expert = torch.empty((impl.num_experts, ),
+                                          dtype=torch.int32, device=dev)
 
     hq, hsc = quant_rows(hs)
     # The stock remap copies bytes (e4m3 = uint8 path) and routes the
@@ -113,8 +169,6 @@ def apply(impl,
     remapped = torch.empty((n_moe, hidden), dtype=torch.float8_e4m3fn,
                            device=dev)
     remapped_sc = torch.empty((n_moe, 1), dtype=torch.float32, device=dev)
-    rows_per_expert = torch.zeros((impl.num_experts, ), dtype=torch.int32,
-                                  device=dev)
     unp = torch.empty((num_rows, topk), dtype=torch.int32, device=dev)
     torch.ops._moe_C.remap_hidden_states(
         hidden_states=hq.view(torch.float8_e4m3fn),

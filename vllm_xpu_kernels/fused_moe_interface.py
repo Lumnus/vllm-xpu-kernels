@@ -454,9 +454,9 @@ class XpuFusedMoe:
 
             ids_valid: Accepted for compatibility; no effect. Negative ids,
                 ids outside ``[0, total_experts)`` and ids this rank does
-                not own are skipped by the kernel path (never used to index
-                the expert map), so padding rows need no mask. A sentinel
-                only works if this rank does not own it: with expert
+                not own are skipped by the kernel and W4A8 paths (never
+                used to index the expert map), so padding rows need no mask.
+                A sentinel only works if this rank does not own it: with expert
                 parallelism off, or an expert map that moved ownership (for
                 example under EPLB), a sentinel the rank owns is computed as
                 a real expert and gathered with its ``topk_weights`` entry,
@@ -486,10 +486,17 @@ class XpuFusedMoe:
             if getattr(self, "_w4a8_why", "") == "":
                 self._w4a8_why = moe_w4a8.eligible(self)
             if self._w4a8_why is None:
-                moe_w4a8.apply(self, output, hidden_states, topk_weights,
+                if moe_w4a8.stock_prep():
+                    moe_w4a8.apply(self, output, hidden_states, topk_weights,
                                    topk_ids, expert_map)
-                self._fill_rows_per_expert(rows_per_expert, topk_ids,
-                                           expert_map)
+                    self._fill_rows_per_expert(rows_per_expert, topk_ids,
+                                               expert_map)
+                else:
+                    # The W4A8 remap fills rows_per_expert as the kernel
+                    # path's does: no torch re-count.
+                    moe_w4a8.apply(self, output, hidden_states, topk_weights,
+                                   topk_ids, expert_map,
+                                   rows_per_expert=rows_per_expert)
                 return
         if self._use_ref:
             self._apply_ref(output, hidden_states,
@@ -506,7 +513,8 @@ class XpuFusedMoe:
 
     def _fill_rows_per_expert(self, rows_per_expert, topk_ids, expert_map):
         """Rows per local expert, as the kernel path's remap counts them,
-        for the paths that do not run it (reference, W4A8)."""
+        for the paths that do not run it (reference; W4A8 with
+        VLLM_XPU_W4A8_STOCK_PREP=1)."""
         if rows_per_expert is None:
             return
         ids = topk_ids.reshape(-1).long()
