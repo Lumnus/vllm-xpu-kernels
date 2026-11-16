@@ -60,6 +60,21 @@ void topk_softmax(
     std::optional<torch::Tensor> bias,
     std::optional<torch::Tensor> is_padding);
 
+void topk_softmax_route(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& token_expert_indices,
+    torch::Tensor& gating_output,
+    const bool renormalize,
+    std::optional<torch::Tensor> is_padding,
+    const torch::Tensor& logical_to_physical,
+    const torch::Tensor& replica_count,
+    torch::Tensor& expert_load,
+    const torch::Tensor& record_enabled,
+    std::optional<torch::Tensor> num_unpadded_tokens,
+    const int64_t sentinel,
+    const bool write_sentinel);
+
 void topk_sigmoid(
     torch::Tensor& topk_weights,
     torch::Tensor& topk_indices,

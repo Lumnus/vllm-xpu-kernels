@@ -21,6 +21,81 @@ static inline float sigmoid_typed(T x) {
   const float val = sigmoid(static_cast<float>(x));
   return static_cast<float>(static_cast<T>(val));
 }
+
+// The routing epilogue of topk_softmax_route: what vLLM's EPLB mapping kernel
+// (eplb_map_and_record in eplb_triton.py, run by _eplb_map_and_record_i32_kernel)
+// does to each selected id, in the lane that writes it. Integer work only:
+//   valid    = 0 <= id < num_logical
+//   physical = logical_to_physical[id, hash(row) % replica_count[id]]
+//              (hash = (row * 2654435769) & 0xFFFFFFFF), else -1
+//   record   = record_enabled && 0 <= physical < num_physical
+//              && row < num_unpadded (when given): expert_load[physical] += 1
+//   sentinel: physical < 0 -> sentinel (when write_sentinel), as the
+//              mapping kernel's SENTINEL branch writes it for the XPU MoE.
+// Integer tables arrive as int32 or int64 (element size given).
+struct RouteArgs {
+  const void* l2p = nullptr;
+  int l2p_esz = 8;
+  int64_t l2p_stride = 0;
+  const void* replicas = nullptr;
+  int rep_esz = 8;
+  int64_t num_logical = 0;
+  void* load = nullptr;
+  int load_esz = 4;
+  int64_t num_physical = 0;
+  const bool* record_enabled = nullptr;
+  const int32_t* num_unpadded = nullptr;
+  int64_t sentinel = 0;
+  bool write_sentinel = false;
+};
+
+static inline int64_t route_ld(const void* p, int esz, int64_t i) {
+  return esz == 8 ? static_cast<const int64_t*>(p)[i]
+                  : static_cast<int64_t>(static_cast<const int32_t*>(p)[i]);
+}
+
+static inline int64_t route_map_and_record(
+    const RouteArgs& ra, int64_t logical, int64_t row) {
+  int64_t physical = -1;
+  if (logical >= 0 && logical < ra.num_logical) {
+    const int64_t replicas = route_ld(ra.replicas, ra.rep_esz, logical);
+    const int64_t hashed =
+        static_cast<int64_t>((static_cast<uint64_t>(row) * 2654435769ull) &
+                             0xFFFFFFFFull);
+    if (replicas > 0) {
+      physical = route_ld(
+          ra.l2p, ra.l2p_esz, logical * ra.l2p_stride + hashed % replicas);
+    }
+  }
+  bool record = *ra.record_enabled && physical >= 0 &&
+                physical < ra.num_physical;
+  if (ra.num_unpadded != nullptr) {
+    record = record && row < static_cast<int64_t>(*ra.num_unpadded);
+  }
+  if (record) {
+    if (ra.load_esz == 8) {
+      sycl::atomic_ref<
+          unsigned long long,
+          sycl::memory_order::relaxed,
+          sycl::memory_scope::device,
+          sycl::access::address_space::global_space>
+          a(static_cast<unsigned long long*>(ra.load)[physical]);
+      a.fetch_add(1ull);
+    } else {
+      sycl::atomic_ref<
+          int,
+          sycl::memory_order::relaxed,
+          sycl::memory_scope::device,
+          sycl::access::address_space::global_space>
+          a(static_cast<int*>(ra.load)[physical]);
+      a.fetch_add(1);
+    }
+  }
+  if (ra.write_sentinel && physical < 0) {
+    physical = ra.sentinel;
+  }
+  return physical;
+}
 // ====================== Softmax things ===============================
 // We have our own implementation of softmax here so we can support transposing
 // the output in the softmax kernel when we extend this module to support
@@ -296,7 +371,8 @@ template <
     int WARP_SIZE_PARAM,
     typename InputdType,
     typename IndType,
-    ScoringFunc ScoringFuncParam>
+    ScoringFunc ScoringFuncParam,
+    bool ROUTE = false>
 class TopKGating {
  public:
   TopKGating(
@@ -312,8 +388,10 @@ class TopKGating {
       const bool renormalize,
       const float* bias,
       const double routed_scaling_factor,
-      const bool* is_padding)
-      : input(input),
+      const bool* is_padding,
+      const RouteArgs route = RouteArgs{})
+      : route(route),
+        input(input),
         finished(finished),
         output(output),
         num_rows(num_rows),
@@ -571,10 +649,21 @@ class TopKGating {
         // input/output matrices.
         const int idx = k * thread_row + k_idx;
         output[idx] = is_pad_row ? 0.0f : max_val;
-        indices[idx] =
-            is_pad_row
-                ? static_cast<IndType>(-1)
-                : (should_process_row ? (expert - start_expert) : NUM_EXPERTS);
+        if constexpr (ROUTE) {
+          // The id the stock write stores, then the EPLB mapping kernel's
+          // work on it (RouteArgs).
+          const int64_t logical =
+              is_pad_row
+                  ? -1
+                  : (should_process_row ? (expert - start_expert) : NUM_EXPERTS);
+          indices[idx] = static_cast<IndType>(
+              route_map_and_record(route, logical, thread_row));
+        } else {
+          indices[idx] =
+              is_pad_row
+                  ? static_cast<IndType>(-1)
+                  : (should_process_row ? (expert - start_expert) : NUM_EXPERTS);
+        }
         source_rows[idx] = k_idx * num_rows + thread_row;
       }
 
@@ -599,6 +688,7 @@ class TopKGating {
   }
 
  private:
+  const RouteArgs route;
   const InputdType* input;
   const bool* finished;
   float* output;
@@ -643,7 +733,8 @@ template <
     int MAX_BYTES_PER_LDG,
     typename InputdType,
     typename IndType,
-    ScoringFunc ScoringFuncParam>
+    ScoringFunc ScoringFuncParam,
+    bool ROUTE = false>
 void topk_gating_launcher_helper(
     const InputdType* input,
     const bool* finished,
@@ -658,7 +749,8 @@ void topk_gating_launcher_helper(
     float* bias,
     double routed_scaling_factor,
     const bool* is_padding,
-    sycl::queue& queue) {
+    sycl::queue& queue,
+    const RouteArgs route = RouteArgs{}) {
   static constexpr int BYTES_PER_LDG =
       MIN(MAX_BYTES_PER_LDG, sizeof(InputdType) * EXPERTS);
   using Constants = detail::
@@ -681,7 +773,8 @@ void topk_gating_launcher_helper(
             WARP_SIZE_PARAM,
             InputdType,
             IndType,
-            ScoringFuncParam>(
+            ScoringFuncParam,
+            ROUTE>(
             input,
             finished,
             output,
@@ -694,7 +787,8 @@ void topk_gating_launcher_helper(
             renormalize,
             bias,
             routed_scaling_factor,
-            is_padding));
+            is_padding,
+            route));
   });
 }
 
@@ -848,6 +942,85 @@ void topk_gating_kernel_launcher(
 
 #undef LAUNCH_TOPK
 
+// topk_softmax_route: the softmax top-k of topk_gating_kernel_launcher (the
+// same TopKGating code, so the same weights, ids and tie order) with the
+// EPLB mapping, load record and sentinel in the lane that writes each id.
+// Only the TopKGating expert counts; the two-kernel fallback for other counts
+// has no route epilogue.
+inline bool topk_route_supported(int num_experts) {
+  switch (num_experts) {
+    case 1: case 2: case 4: case 8: case 16: case 32: case 64: case 128:
+    case 256: case 512: case 192: case 320: case 384: case 448: case 576:
+      return true;
+    default:
+      return false;
+  }
+}
+
+#define LAUNCH_TOPK_ROUTE(NUM_EXPERTS, WARPS_PER_TB, MAX_BYTES)               \
+  topk_gating_launcher_helper<                                                \
+      NUM_EXPERTS,                                                            \
+      WARPS_PER_TB,                                                           \
+      WARP_SIZE,                                                              \
+      MAX_BYTES,                                                              \
+      InputdType,                                                             \
+      int,                                                                    \
+      ScoringFunc::SOFTMAX,                                                   \
+      true>(                                                                  \
+      gating_output,                                                          \
+      nullptr,                                                                \
+      topk_weights,                                                           \
+      topk_indices,                                                           \
+      token_expert_indices,                                                   \
+      num_tokens,                                                             \
+      topk,                                                                   \
+      0,                                                                      \
+      num_experts,                                                            \
+      renormalize,                                                            \
+      nullptr,                                                                \
+      1.0,                                                                    \
+      is_padding,                                                             \
+      queue,                                                                  \
+      route);
+
+template <typename InputdType>
+void topk_route_kernel_launcher(
+    const InputdType* gating_output,
+    float* topk_weights,
+    int* topk_indices,
+    int* token_expert_indices,
+    const int num_tokens,
+    const int num_experts,
+    const int topk,
+    const bool renormalize,
+    const bool* is_padding,
+    const RouteArgs& route,
+    sycl::queue& queue) {
+  static constexpr int WARPS_PER_TB = 4;
+  static constexpr int P2 = 16;
+  static constexpr int M64 = 2 * sizeof(InputdType);
+  switch (num_experts) {
+    case 1: LAUNCH_TOPK_ROUTE(1, WARPS_PER_TB, P2); break;
+    case 2: LAUNCH_TOPK_ROUTE(2, WARPS_PER_TB, P2); break;
+    case 4: LAUNCH_TOPK_ROUTE(4, WARPS_PER_TB, P2); break;
+    case 8: LAUNCH_TOPK_ROUTE(8, WARPS_PER_TB, P2); break;
+    case 16: LAUNCH_TOPK_ROUTE(16, WARPS_PER_TB, P2); break;
+    case 32: LAUNCH_TOPK_ROUTE(32, WARPS_PER_TB, P2); break;
+    case 64: LAUNCH_TOPK_ROUTE(64, WARPS_PER_TB, P2); break;
+    case 128: LAUNCH_TOPK_ROUTE(128, WARPS_PER_TB, P2); break;
+    case 256: LAUNCH_TOPK_ROUTE(256, WARPS_PER_TB, P2); break;
+    case 512: LAUNCH_TOPK_ROUTE(512, WARPS_PER_TB, P2); break;
+    case 192: LAUNCH_TOPK_ROUTE(192, WARPS_PER_TB, M64); break;
+    case 320: LAUNCH_TOPK_ROUTE(320, WARPS_PER_TB, M64); break;
+    case 384: LAUNCH_TOPK_ROUTE(384, WARPS_PER_TB, M64); break;
+    case 448: LAUNCH_TOPK_ROUTE(448, WARPS_PER_TB, M64); break;
+    case 576: LAUNCH_TOPK_ROUTE(576, WARPS_PER_TB, M64); break;
+    default:
+      TORCH_CHECK(false, "topk_softmax_route: unsupported num_experts ", num_experts);
+  }
+}
+#undef LAUNCH_TOPK_ROUTE
+
 }  // namespace moe
 }  // namespace vllm
 
@@ -994,4 +1167,94 @@ void topk_sigmoid(
   }
 
 #undef LAUNCH_TOPK
+}
+
+void topk_softmax_route(
+    torch::Tensor& topk_weights,          // fp32 [num_tokens, topk]
+    torch::Tensor& topk_indices,          // int32 [num_tokens, topk]: physical
+    torch::Tensor& token_expert_indices,  // int32 [num_tokens, topk]
+    torch::Tensor& gating_output,         // [num_tokens, num_experts]
+    const bool renormalize,
+    std::optional<torch::Tensor> is_padding,
+    const torch::Tensor& logical_to_physical,  // int32/64 [num_logical, slots]
+    const torch::Tensor& replica_count,        // int32/64 [num_logical]
+    torch::Tensor& expert_load,                // int32/64 [num_physical]
+    const torch::Tensor& record_enabled,       // bool []
+    std::optional<torch::Tensor> num_unpadded_tokens,  // int32 []
+    const int64_t sentinel,
+    const bool write_sentinel) {
+  const char* who = "topk_softmax_route";
+  const int num_experts = gating_output.size(-1);
+  const auto num_tokens = gating_output.numel() / num_experts;
+  const int topk = topk_weights.size(-1);
+  check_is_padding(is_padding, num_tokens);
+  TORCH_CHECK(
+      vllm::moe::topk_route_supported(num_experts), who,
+      ": num_experts ", num_experts, " has no single-kernel top-k");
+  TORCH_CHECK(gating_output.is_contiguous(), who, ": gating_output must be contiguous");
+  TORCH_CHECK(
+      topk_weights.scalar_type() == at::kFloat && topk_weights.is_contiguous() &&
+          topk_indices.scalar_type() == at::kInt && topk_indices.is_contiguous() &&
+          token_expert_indices.scalar_type() == at::kInt &&
+          token_expert_indices.is_contiguous(),
+      who, ": fp32 weights, int32 ids and int32 token_expert_indices, contiguous");
+  auto esz = [&](const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(
+        t.scalar_type() == at::kInt || t.scalar_type() == at::kLong, who, ": ",
+        name, " must be int32 or int64");
+    return static_cast<int>(t.element_size());
+  };
+  TORCH_CHECK(
+      logical_to_physical.dim() == 2 && logical_to_physical.stride(1) == 1,
+      who, ": logical_to_physical must be [num_logical, slots], slots contiguous");
+  TORCH_CHECK(
+      replica_count.dim() == 1 && replica_count.is_contiguous() &&
+          replica_count.size(0) == logical_to_physical.size(0),
+      who, ": replica_count must be contiguous [num_logical]");
+  TORCH_CHECK(
+      expert_load.dim() == 1 && expert_load.is_contiguous(), who,
+      ": expert_load must be contiguous [num_physical]");
+  TORCH_CHECK(
+      record_enabled.scalar_type() == at::kBool && record_enabled.numel() == 1,
+      who, ": record_enabled must be a bool scalar");
+  if (num_unpadded_tokens.has_value()) {
+    TORCH_CHECK(
+        num_unpadded_tokens->scalar_type() == at::kInt &&
+            num_unpadded_tokens->numel() == 1,
+        who, ": num_unpadded_tokens must be an int32 scalar");
+  }
+  vllm::moe::RouteArgs route;
+  route.l2p = logical_to_physical.data_ptr();
+  route.l2p_esz = esz(logical_to_physical, "logical_to_physical");
+  route.l2p_stride = logical_to_physical.stride(0);
+  route.replicas = replica_count.data_ptr();
+  route.rep_esz = esz(replica_count, "replica_count");
+  route.num_logical = replica_count.size(0);
+  route.load = expert_load.data_ptr();
+  route.load_esz = esz(expert_load, "expert_load");
+  route.num_physical = expert_load.size(0);
+  route.record_enabled = record_enabled.data_ptr<bool>();
+  route.num_unpadded = num_unpadded_tokens.has_value()
+                           ? num_unpadded_tokens->data_ptr<int32_t>()
+                           : nullptr;
+  route.sentinel = sentinel;
+  route.write_sentinel = write_sentinel;
+
+  const at::DeviceGuard device_guard(gating_output.device());
+  auto& queue = vllm::xpu::vllmGetQueue();
+  const bool* pad = is_padding.has_value() ? is_padding->data_ptr<bool>() : nullptr;
+  if (gating_output.scalar_type() == at::ScalarType::Float) {
+    vllm::moe::topk_route_kernel_launcher<float>(
+        gating_output.data_ptr<float>(), topk_weights.data_ptr<float>(),
+        topk_indices.data_ptr<int>(), token_expert_indices.data_ptr<int>(),
+        num_tokens, num_experts, topk, renormalize, pad, route, queue);
+  } else if (gating_output.scalar_type() == at::ScalarType::BFloat16) {
+    vllm::moe::topk_route_kernel_launcher<sycl::ext::oneapi::bfloat16>(
+        reinterpret_cast<sycl::ext::oneapi::bfloat16*>(gating_output.data_ptr()),
+        topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(),
+        token_expert_indices.data_ptr<int>(), num_tokens, num_experts, topk,
+        renormalize, pad, route, queue);
+  } else {
+    TORCH_CHECK(false, who, ": gating_output must be fp32 or bf16");
+  }
 }
