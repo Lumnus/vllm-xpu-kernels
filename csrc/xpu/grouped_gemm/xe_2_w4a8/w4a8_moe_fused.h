@@ -46,6 +46,23 @@ void moe_w4a8_route_quant_xe2(
     int64_t local_experts,
     int64_t tile_m);
 
+// As moe_w4a8_route_quant_xe2, for rows quantized once at the MoE entry by
+// _C.dynamic_per_token_scaled_int8_quant (the op 2. reproduces): the map,
+// then the int8 rows and their scales copied to the expert rows.
+void moe_w4a8_route_gather_q_xe2(
+    const at::Tensor& x_q,                    // int8 [T, H]
+    const at::Tensor& x_scale,                // fp32 [T] or [T, 1]
+    const at::Tensor& topk_ids,               // int32 / int64 [T, top_k]
+    const std::optional<at::Tensor>& expert_map,  // int32 [total] or none
+    at::Tensor& a_q,                          // int8 [T * top_k, H]
+    at::Tensor& a_scale,                      // fp32 [T * top_k]
+    at::Tensor& perm_pos,                     // int32 [T, top_k]
+    at::Tensor& rows_per_expert,              // int32 [local]
+    at::Tensor& tile_ws,                      // int32 [2 + 3 * umt]
+    int64_t total_experts,
+    int64_t local_experts,
+    int64_t tile_m);
+
 void moe_w4a8_tile_gemm_xe2(
     const at::Tensor& a,           // int8 [R, K], rows in tile-map order
     const at::Tensor& a_scale,     // fp32 [R] (or [R, 1])
