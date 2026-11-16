@@ -8,6 +8,7 @@
   #include "xpu/mono_decode/mono_decode_interface.h"
 #endif
 #include "xpu/lora/lora_ops.h"
+#include "xpu/mailbox_ar/mailbox_all_reduce.h"
 #include "cpu_experts/int4_moe_cpu.h"
 #include "cpu_experts/int4_moe_cpu_a8.h"
 
@@ -522,6 +523,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "Tensor num_sampled_tokens, int max_num_kept, int max_compact_support, "
       "int rows_per_request) -> (Tensor, Tensor, Tensor)");
   xpu_ops.impl("compact_sampling_mask", torch::kXPU, &compact_sampling_mask);
+
+  // Mailbox all-reduce over PCIe peer-to-peer (2 or 4 cards, recursive
+  // doubling, one launch per call): see mailbox_ar/mailbox_all_reduce.cpp.
+  // The mailboxes are IPC regions the caller maps (mono_ipc_*).
+  xpu_ops.def(
+      "mailbox_all_reduce(Tensor(a!) x, int[] inbox, int[] outbox, int state, "
+      "int host, int slot_bytes, bool fp32_partials, int timeout_cycles) -> "
+      "()");
+  xpu_ops.impl(
+      "mailbox_all_reduce", torch::kXPU, &vllm::mailbox_ar::mailbox_all_reduce);
+  xpu_ops.def("mailbox_ar_slot_bytes(int numel, bool fp32_partials) -> int");
+  xpu_ops.impl(
+      "mailbox_ar_slot_bytes", &vllm::mailbox_ar::mailbox_ar_slot_bytes);
+  xpu_ops.def("mailbox_ar_host_alloc() -> int");
+  xpu_ops.impl(
+      "mailbox_ar_host_alloc", &vllm::mailbox_ar::mailbox_ar_host_alloc);
+  xpu_ops.def("mailbox_ar_host_free(int host) -> ()");
+  xpu_ops.impl("mailbox_ar_host_free", &vllm::mailbox_ar::mailbox_ar_host_free);
+  xpu_ops.def("mailbox_ar_host_read(int host) -> int[]");
+  xpu_ops.impl("mailbox_ar_host_read", &vllm::mailbox_ar::mailbox_ar_host_read);
 
   // Virtual memory management on PyTorch's SYCL context, mirroring cuMem*:
   // reserve an address range, then map physical memory into it on demand.
