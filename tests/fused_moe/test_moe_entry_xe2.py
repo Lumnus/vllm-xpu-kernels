@@ -9,6 +9,8 @@
    with the token rows quantized by _C.dynamic_per_token_scaled_int8_quant.
 3. topk_softmax_route against topk_softmax followed by a torch EPLB map
    (vLLM's rule): weights, ids and the expert-load record.
+4. moe_gather with gate_logits (tier 2): per token, the gather fed torch's
+   sigmoid of the logits or the bf16 gate one ulp from it.
 
 QFN decode shapes: hidden 2560, 512 experts (128 local at EP4), top-10,
 1-33 tokens, NaN padding rows, moved placement."""
@@ -54,6 +56,41 @@ def test_moe_gather_shared_bits(t, topk):
     eps = torch.finfo(torch.bfloat16).eps
     bound = eps * (plain.float().abs() + (gate * sh).float().abs() + a.abs())
     assert bool(((a - b).abs()[fin] <= bound[fin] + 1e-30).all())
+
+
+@xpu
+@pytest.mark.parametrize("t", [1, 2, 4, 8, 13, 16, 33])
+@pytest.mark.parametrize("single_round", [False, True])
+def test_moe_gather_gate_logits_bits(t, single_round):
+    """gate_logits (tier 2): the gather's T(1 / (1 + exp(-x))) is torch's
+    sigmoid of the same bf16 logits or one bf16 ulp from it, per token; every
+    row equals the gather fed that gate (and the row count that needed the
+    neighbouring gate is printed)."""
+    import vllm_xpu_kernels._moe_C  # noqa: F401
+    g2, w, unp, sh, _ = _gather_case(t, 10, 2560, 128, t * 17 + single_round)
+    g = torch.Generator().manual_seed(t)
+    logit = (torch.randn((t, 1), generator=g) * 3).to(torch.bfloat16).xpu()
+    got = torch.empty((t, 2560), dtype=torch.bfloat16, device="xpu")
+    torch.ops._moe_C.moe_gather(got, g2, w, unp, 128, sh, logit, single_round,
+                                True)
+    gate = torch.sigmoid(logit)
+    moved = 0
+    for d in (0, -1, 1):
+        cand = (gate.view(torch.int16) + d).view(torch.bfloat16)
+        want = torch.empty_like(got)
+        torch.ops._moe_C.moe_gather(want, g2, w, unp, 128, sh, cand,
+                                    single_round)
+        same = (got.view(torch.int16) == want.view(torch.int16)) | (
+            got.isnan() & want.isnan())
+        rows = same.all(dim=1)
+        if d == 0:
+            ok = rows.clone()
+        else:
+            moved += int((rows & ~ok).sum())
+            ok |= rows
+    assert bool(ok.all()), (~ok).nonzero()
+    print(f"GATE-LOGITS t={t} single_round={single_round}: "
+          f"{moved} of {t} tokens took the neighbouring bf16 gate")
 
 
 @xpu

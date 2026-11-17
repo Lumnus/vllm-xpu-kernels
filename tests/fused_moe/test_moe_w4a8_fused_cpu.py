@@ -186,9 +186,10 @@ def _run_cases():
                                                                       topk]
 
     def moe_gather(output, g2, topk_weights, unp, num_experts, shared=None,
-                   shared_gate=None, single_round=False):
+                   shared_gate=None, single_round=False, gate_logits=False):
         """moe_gather.cpp; with the shared term, its SHARED instantiation:
-        T(float(T(acc)) + float(T(gate * shared))) per element."""
+        T(float(T(acc)) + float(T(gate * shared))) per element; with
+        gate_logits the gate is T(1 / (1 + exp(-logit))) first."""
         calls.append("gather")
         for t in range(output.shape[0]):
             acc = torch.zeros(output.shape[1], dtype=torch.float32)
@@ -200,6 +201,8 @@ def _run_cases():
                 output[t] = acc.to(output.dtype)
                 continue
             gate = shared_gate.reshape(-1)[t].float()
+            if gate_logits:
+                gate = (1.0 / (1.0 + torch.exp(-gate))).to(output.dtype).float()
             if single_round:
                 output[t] = (acc + gate * shared[t].float()).to(output.dtype)
                 continue
@@ -360,6 +363,7 @@ def _run_cases():
     moe_w4a8._FOPS = None
     moe_w4a8._GATHER_Q = None
     moe_w4a8._GATHER_SHARED = True  # the stand-in takes the shared term
+    moe_w4a8._GATHER_LOGITS = True  # and the gate's logits
 
     hidden, inter = 256, 128
 
@@ -470,14 +474,19 @@ def _run_cases():
         m_real = a.shape[0] - 3
         sh = (torch.randn(a.shape, generator=gen) / 4).to(torch.bfloat16)
         sh[m_real:] = float("nan")
-        gate = torch.sigmoid(torch.randn((a.shape[0], 1), generator=gen)).to(
-            torch.bfloat16)
+        # The expert gate's logits (bf16) and torch's sigmoid of them, as the
+        # engine's shared expert computes the gate.
+        logit = torch.randn((a.shape[0], 1), generator=gen).to(torch.bfloat16)
+        gate = torch.sigmoid(logit)
         xq, xs = quant_ref(a)
         for variant, extra in (("", {}), ("|xq", {"x_q": (xq, xs.view(-1, 1))}),
                                ("|xq+sh", {"x_q": (xq, xs.view(-1, 1)),
                                            "shared": (sh, gate)}),
                                ("|xq+sh1", {"x_q": (xq, xs.view(-1, 1)),
-                                            "shared": (sh, gate, True)})):
+                                            "shared": (sh, gate, True)}),
+                               ("|xq+shL", {"x_q": (xq, xs.view(-1, 1)),
+                                            "shared": (sh, logit, False,
+                                                       True)})):
             if rpe is not None:
                 rpe.fill_(fill)
             out = torch.full_like(a, 3.0)
@@ -496,7 +505,7 @@ def _run_cases():
                 "gemm_tiles": list(gemm_tiles),
                 "want_tile": moe_w4a8.gemm_tile(n_moe, impl.num_experts,
                                                 impl.total_experts_num),
-                "shared": (sh, gate),
+                "shared": (sh, gate, logit),
             }
     return results
 
@@ -539,8 +548,9 @@ def test_w4a8_fused_decode_bit_identical(tmp_path):
     base = torch.load(files["0"])
     # 13 case kinds (EP off; ranks 0 and 3 x raw, sentinel, owned sentinel,
     # out of range, moved, skew) x 11 (top-4 at 7 row counts, top-10 at 4),
-    # each plain, with entry rows, and with entry rows + the shared term.
-    assert len(base) == 4 * 143
+    # each plain, with entry rows, with entry rows + the shared term (tier 1,
+    # single round, the gate's sigmoid in the gather).
+    assert len(base) == 5 * 143
     plain = [k for k in base if "|" not in k]
     t2_stats = []
     assert len(plain) == 143
@@ -564,7 +574,20 @@ def test_w4a8_fused_decode_bit_identical(tmp_path):
                 assert xq["calls"][0] == "route_gather_q", (m, key)
                 assert xq["launches"] == (6 if m == "1" else 7), (m, key)
             sh = got[key + "|xq+sh"]
-            out_s, gate = sh["shared"]
+            out_s, gate, logit = sh["shared"]
+            # The gate's sigmoid in the gather (tier 2 on the card): with the
+            # gather's formula T(1 / (1 + exp(-x))) it is the tier-1 sum with
+            # that gate; the gate itself within one bf16 ulp of torch's.
+            shl = got[key + "|xq+shL"]
+            gate_l = (1.0 / (1.0 + torch.exp(-logit.float()))).to(
+                torch.bfloat16)
+            assert shl["folded"] is True, (m, key)
+            assert torch.equal(_bits(shl["out"]),
+                               _bits((gate_l * out_s) + ref)), (m, key)
+            assert shl["launches"] == xq["launches"], (m, key)
+            gulp = (gate_l.view(torch.int16).int()
+                    - gate.view(torch.int16).int()).abs()
+            assert int(gulp.max()) <= 1, (m, key)
             # The engine's unfused sequence: sigmoid(g) * shared (bf16), then
             # shared + routed (bf16), on the plain output.
             want = (gate * out_s) + ref

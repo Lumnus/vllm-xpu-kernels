@@ -59,6 +59,11 @@ do around the layer; neither changes a value:
           ``(out, gate, True)`` asks for one fp32 rounding of
           ``acc + gate * out`` instead (different bits: no T rounding of
           the routed sum or of the gated product).
+          ``(out, logits, single_round, True)``: ``logits`` is the expert
+          gate's output before the sigmoid; the gather computes
+          ``T(1 / (1 + exp(-logit)))`` itself (different bits: the device's
+          exp against torch's sigmoid kernel, at most one T ulp of the
+          gate), so the caller drops the sigmoid too.
 """
 
 import os
@@ -230,6 +235,7 @@ def _log_fused_moe_once(mode: int, tile_m: int) -> None:
 
 
 _GATHER_SHARED = None
+_GATHER_LOGITS = None
 _GATHER_Q = None
 
 
@@ -244,6 +250,20 @@ def gather_takes_shared() -> bool:
         except (AttributeError, RuntimeError):
             _GATHER_SHARED = False
     return _GATHER_SHARED
+
+
+def gather_takes_logits() -> bool:
+    """Whether ``_moe_C.moe_gather`` applies the shared expert gate's sigmoid
+    itself (``gate_logits``)."""
+    global _GATHER_LOGITS
+    if _GATHER_LOGITS is None:
+        try:
+            schema = torch.ops._moe_C.moe_gather.default._schema
+            _GATHER_LOGITS = any(a.name == "gate_logits"
+                                 for a in schema.arguments)
+        except (AttributeError, RuntimeError):
+            _GATHER_LOGITS = False
+    return _GATHER_LOGITS
 
 
 def load_gather_q_op():
@@ -273,6 +293,17 @@ def _entry_rows_ok(x_q, hs: torch.Tensor) -> bool:
 
 
 def _gather(output, g2, topk_weights, unp, num_experts, shared) -> bool:
+    if shared is not None and len(shared) > 3 and shared[3]:
+        # (out, gate logits, single_round, True): the gather applies the
+        # sigmoid (tier 2). Without that gather the caller keeps the work.
+        if not gather_takes_logits():
+            torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp,
+                                        num_experts)
+            return False
+        torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp,
+                                    num_experts, shared[0], shared[1],
+                                    bool(shared[2]), True)
+        return True
     if shared is not None and gather_takes_shared():
         out, gate = shared[0], shared[1]
         if len(shared) > 2 and shared[2]:

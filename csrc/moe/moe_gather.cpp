@@ -18,6 +18,11 @@ namespace moe {
 // slot gathers zeros and still gets the shared term, as the add did.
 // SINGLE_ROUND (tier 2, different bits): out = T(acc + gate * shared) in
 // fp32 with one rounding to T; the two intermediate T roundings are dropped.
+// GATE_LOGITS (tier 2, different bits): shared_gate holds the expert gate's
+// logits and the gate is T(1 / (1 + exp(-logit))) in fp32 with the device's
+// exp, rounded to T as torch's sigmoid output is; the separate sigmoid
+// kernel goes away. The gate can differ from torch's by one T ulp where the
+// two fp32 sigmoids round to different sides of a T boundary.
 // The shared row is read element by element (its row stride need not keep
 // the vector alignment of output / moe_output); the routed sum and the store
 // are the stock kernel's.
@@ -26,7 +31,8 @@ template <
     int TOPK,
     int ElemsPerItem,
     bool SHARED = false,
-    bool SINGLE_ROUND = false>
+    bool SINGLE_ROUND = false,
+    bool GATE_LOGITS = false>
 class MoeGather {
  public:
   using vec_t = vllm::xpu::aligned_vec<T, ElemsPerItem>;
@@ -128,6 +134,10 @@ class MoeGather {
     if constexpr (SHARED) {
       gate = static_cast<float>(
           shared_gate[static_cast<int64_t>(token_idx) * gate_stride]);
+      if constexpr (GATE_LOGITS) {
+        gate = static_cast<float>(
+            static_cast<T>(1.0f / (1.0f + sycl::exp(-gate))));
+      }
     }
     for (int v = local_id_x % lanes_per_token; v < num_vecs;
          v += lanes_per_token) {
@@ -202,7 +212,13 @@ class MoeGather {
   const int64_t gate_stride;
 };
 
-template <typename T, int TOPK, int ElemsPerItem, bool SHARED, bool SINGLE>
+template <
+    typename T,
+    int TOPK,
+    int ElemsPerItem,
+    bool SHARED,
+    bool SINGLE,
+    bool GATE_LOGITS = false>
 inline void submit_moe_gather(
     sycl::queue& queue,
     T* output,
@@ -216,7 +232,7 @@ inline void submit_moe_gather(
     const T* shared_gate,
     const int64_t shared_stride,
     const int64_t gate_stride) {
-  using K = MoeGather<T, TOPK, ElemsPerItem, SHARED, SINGLE>;
+  using K = MoeGather<T, TOPK, ElemsPerItem, SHARED, SINGLE, GATE_LOGITS>;
   const int lanes_per_token = K::get_lanes_per_token(hidden_size);
   vllm::xpu::sycl_kernel_submit(
       queue,
@@ -250,7 +266,8 @@ void MoeGatherLauncher(
     const T* shared_gate = nullptr,
     const int64_t shared_stride = 0,
     const int64_t gate_stride = 0,
-    const bool single_round = false) {
+    const bool single_round = false,
+    const bool gate_logits = false) {
   if (num_tokens == 0 || hidden_size == 0) {
     return;
   }
@@ -272,8 +289,14 @@ void MoeGatherLauncher(
       hidden_size, shared, shared_gate, shared_stride, gate_stride
 #define CASE_TOPK(TOPK, ElemsPerItem)                                       \
   case TOPK:                                                                \
-    if (shared != nullptr && single_round) {                                \
+    if (shared != nullptr && single_round && gate_logits) {                 \
+      submit_moe_gather<T, TOPK, ElemsPerItem, true, true, true>(           \
+          GATHER_ARGS);                                                     \
+    } else if (shared != nullptr && single_round) {                         \
       submit_moe_gather<T, TOPK, ElemsPerItem, true, true>(GATHER_ARGS);    \
+    } else if (shared != nullptr && gate_logits) {                          \
+      submit_moe_gather<T, TOPK, ElemsPerItem, true, false, true>(          \
+          GATHER_ARGS);                                                     \
     } else if (shared != nullptr) {                                         \
       submit_moe_gather<T, TOPK, ElemsPerItem, true, false>(GATHER_ARGS);   \
     } else {                                                                \
@@ -323,7 +346,8 @@ void moe_gather(
     const int64_t num_experts,
     const std::optional<torch::Tensor>& shared,       // [num_tokens, hidden]
     const std::optional<torch::Tensor>& shared_gate,  // [num_tokens, 1]
-    const bool single_round) {
+    const bool single_round,
+    const bool gate_logits) {
   // Implementation of the gather operation
   const int num_tokens = topk_weights.size(0);
   const int topk = topk_weights.size(1);
@@ -335,6 +359,9 @@ void moe_gather(
   TORCH_CHECK(
       shared.has_value() == shared_gate.has_value(),
       "moe_gather: shared and shared_gate come together");
+  TORCH_CHECK(
+      !gate_logits || shared.has_value(),
+      "moe_gather: gate_logits needs the shared term");
   int64_t shared_stride = 0, gate_stride = 0;
   if (shared.has_value()) {
     TORCH_CHECK(
@@ -385,7 +412,8 @@ void moe_gather(
           : nullptr,                                                      \
       shared_stride,                                                      \
       gate_stride,                                                        \
-      single_round);
+      single_round,                                                       \
+      gate_logits);
 
   if (output.scalar_type() == torch::kFloat16) {
     using scalar_t = sycl::half;

@@ -107,7 +107,8 @@ void moe_gather(
     const int64_t num_experts,
     const std::optional<torch::Tensor>& shared,
     const std::optional<torch::Tensor>& shared_gate,
-    const bool single_round);
+    const bool single_round,
+    const bool gate_logits);
 
 void init_expert_map(
     torch::Tensor& expert_map,
