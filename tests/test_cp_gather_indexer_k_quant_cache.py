@@ -198,3 +198,67 @@ def test_cp_gather_indexer_k_quant_cache_correctness(batch_seq_lens,
 
     assert all_fp8_match, f"FP8 data mismatch [{tag}]"
     assert all_scale_match, f"Scale mismatch [{tag}]"
+
+
+@pytest.mark.parametrize("batch_seq_lens", [[3], [5, 4], [7, 8, 5]])
+@pytest.mark.parametrize("extra_rows", [1, 13])
+def test_cp_gather_indexer_k_quant_cache_upper_bound_dst(
+        batch_seq_lens, extra_rows):
+    """dst sized to an upper bound of cu_seq_lens[-1] (callers pass a
+    max-tokens bound): rows past cu_seq_lens[-1] are left untouched, as in
+    CUDA, instead of being gathered as batch 0."""
+    head_dim, quant_block_size, block_size = 128, 128, 16
+    num_tokens = sum(batch_seq_lens)
+    num_groups = head_dim // quant_block_size
+    cache_stride = head_dim + num_groups * 4
+    num_seq_blocks = [(s + block_size - 1) // block_size
+                      for s in batch_seq_lens]
+    max_blocks = max(num_seq_blocks)
+
+    torch.manual_seed(0)
+    k = torch.randn((num_tokens, head_dim), device=DEVICE,
+                    dtype=torch.bfloat16)
+    rows, slots, nxt = [], [], 0
+    for seq_len, nb in zip(batch_seq_lens, num_seq_blocks):
+        blocks = list(range(nxt, nxt + nb))
+        nxt += nb
+        rows.append(blocks + [0] * (max_blocks - nb))
+        slots += [blocks[p // block_size] * block_size + p % block_size
+                  for p in range(seq_len)]
+    block_table = torch.tensor(rows, dtype=torch.int32, device=DEVICE)
+    slot_mapping = torch.tensor(slots, dtype=torch.int64, device=DEVICE)
+    cu = [0]
+    for s in batch_seq_lens:
+        cu.append(cu[-1] + s)
+    cu_seq_lens = torch.tensor(cu, dtype=torch.int32, device=DEVICE)
+
+    kv_cache = torch.zeros((nxt, block_size, cache_stride),
+                           dtype=torch.uint8,
+                           device=DEVICE)
+    ops.indexer_k_quant_and_cache(k, kv_cache, slot_mapping,
+                                  quant_block_size, "ue8m0")
+
+    sentinel = 0xAB
+    total = num_tokens + extra_rows
+    dst_k_ref = torch.zeros((num_tokens, head_dim),
+                            dtype=torch.uint8,
+                            device=DEVICE)
+    dst_s_ref = torch.zeros((num_tokens, num_groups * 4),
+                            dtype=torch.uint8,
+                            device=DEVICE)
+    ref_cp_gather_indexer_k_quant_cache(kv_cache, dst_k_ref, dst_s_ref,
+                                        block_table, cu_seq_lens)
+    dst_k = torch.full((total, head_dim), sentinel, dtype=torch.uint8,
+                       device=DEVICE)
+    dst_s = torch.full((total, num_groups * 4), sentinel,
+                       dtype=torch.uint8,
+                       device=DEVICE)
+    ops.cp_gather_indexer_k_quant_cache(kv_cache, dst_k, dst_s, block_table,
+                                        cu_seq_lens)
+
+    assert torch.equal(dst_k[:num_tokens], dst_k_ref)
+    assert torch.equal(dst_s[:num_tokens], dst_s_ref)
+    assert bool((dst_k[num_tokens:] == sentinel).all()), \
+        "rows past cu_seq_lens[-1] were written"
+    assert bool((dst_s[num_tokens:] == sentinel).all()), \
+        "scales past cu_seq_lens[-1] were written"
