@@ -60,6 +60,21 @@ void topk_softmax(
     std::optional<torch::Tensor> bias,
     std::optional<torch::Tensor> is_padding);
 
+void topk_softmax_route(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& token_expert_indices,
+    torch::Tensor& gating_output,
+    const bool renormalize,
+    std::optional<torch::Tensor> is_padding,
+    const torch::Tensor& logical_to_physical,
+    const torch::Tensor& replica_count,
+    torch::Tensor& expert_load,
+    const torch::Tensor& record_enabled,
+    std::optional<torch::Tensor> num_unpadded_tokens,
+    const int64_t sentinel,
+    const bool write_sentinel);
+
 void topk_sigmoid(
     torch::Tensor& topk_weights,
     torch::Tensor& topk_indices,
@@ -89,7 +104,10 @@ void moe_gather(
     const torch::Tensor& moe_output,
     const torch::Tensor& topk_weights,
     const torch::Tensor& unpermuted_row_to_permuted_row,
-    const int64_t num_experts);
+    const int64_t num_experts,
+    const std::optional<torch::Tensor>& shared,
+    const std::optional<torch::Tensor>& shared_gate,
+    const bool single_round);
 
 void init_expert_map(
     torch::Tensor& expert_map,

@@ -49,6 +49,20 @@ void moe_w4a8_route_quant(
     int64_t local_experts,
     int64_t tile_m);
 
+void moe_w4a8_route_gather_q(
+    torch::Tensor x_q,
+    torch::Tensor x_scale,
+    torch::Tensor topk_ids,
+    const c10::optional<at::Tensor>& expert_map,
+    torch::Tensor a_q,
+    torch::Tensor a_scale,
+    torch::Tensor perm_pos,
+    torch::Tensor rows_per_expert,
+    torch::Tensor tile_ws,
+    int64_t total_experts,
+    int64_t local_experts,
+    int64_t tile_m);
+
 void moe_w4a8_tile_gemm(
     torch::Tensor a,
     torch::Tensor a_scale,

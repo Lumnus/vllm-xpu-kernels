@@ -65,6 +65,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "token_expert_indices, Tensor gating_output, bool renormalize, Tensor? "
       "bias, Tensor? is_padding) -> ()");
   m.impl("topk_softmax", torch::kXPU, &topk_softmax);
+  // topk_softmax with the EPLB logical -> physical mapping, the expert-load
+  // record and the unowned-id sentinel in the same kernel.
+  m.def(
+      "topk_softmax_route(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
+      "token_expert_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "is_padding, Tensor logical_to_physical, Tensor replica_count, Tensor! "
+      "expert_load, Tensor record_enabled, Tensor? num_unpadded_tokens, "
+      "int sentinel, bool write_sentinel) -> ()");
+  m.impl("topk_softmax_route", torch::kXPU, &topk_softmax_route);
   // Apply topk sigmoid to the gating outputs.
   m.def(
       "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
@@ -83,7 +92,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def(
       "moe_gather(Tensor! output, Tensor moe_output, Tensor topk_weights, "
       "Tensor unpermuted_row_to_permuted_row, "
-      "int num_experts) -> ()");
+      "int num_experts, Tensor? shared=None, Tensor? shared_gate=None, "
+      "bool single_round=False) -> ()");
   m.impl("moe_gather", torch::kXPU, &moe_gather);
   m.def(
       "init_expert_map(Tensor expert_map,"

@@ -144,6 +144,30 @@ void moe_w4a8_route_quant(
 #endif
 }
 
+void moe_w4a8_route_gather_q(
+    torch::Tensor x_q,
+    torch::Tensor x_scale,
+    torch::Tensor topk_ids,
+    const c10::optional<at::Tensor>& expert_map,
+    torch::Tensor a_q,
+    torch::Tensor a_scale,
+    torch::Tensor perm_pos,
+    torch::Tensor rows_per_expert,
+    torch::Tensor tile_ws,
+    int64_t total_experts,
+    int64_t local_experts,
+    int64_t tile_m) {
+#ifdef VLLM_XPU_ENABLE_XE2
+  TORCH_CHECK(
+      vllm::xpu::is_xe2_arch(), "moe_w4a8_route_gather_q needs an Xe2 GPU");
+  moe_w4a8_route_gather_q_xe2(
+      x_q, x_scale, topk_ids, expert_map, a_q, a_scale, perm_pos,
+      rows_per_expert, tile_ws, total_experts, local_experts, tile_m);
+#else
+  TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
+#endif
+}
+
 void moe_w4a8_tile_gemm(
     torch::Tensor a,
     torch::Tensor a_scale,

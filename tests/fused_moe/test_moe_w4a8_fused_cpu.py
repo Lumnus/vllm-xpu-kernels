@@ -22,6 +22,13 @@ The device ops are torch references:
    the tile-map GEMM grid with surplus tiles; silu + quant up to the
    map's row count.
 
+Each case also runs with the token rows quantized once outside the layer
+(``x_q``, as the engine's MoE entry passes them) and with the shared
+expert's term added in the gather (``shared``): the output must equal the
+plain run's, and the plain output followed by torch's bf16 multiply and add
+(``sigmoid(g) * shared``, then ``shared + routed``, the engine's unfused
+sequence), bit for bit, NaN padding rows included.
+
 What it proves is the composition: the map, the tile map and the gather
 through it reproduce the unfused remap, grouped GEMM and gather. That the
 device kernels compute each element as the references do is the card test
@@ -45,7 +52,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 # counter and runs (2); route_quant runs map and quant+gather (2).
 LAUNCHES = {
     "quant": 1, "remap": 3, "gemm": 2, "act": 1, "gather": 1,
-    "route_quant": 2, "tile_gemm": 1, "silu_quant": 1,
+    "route_quant": 2, "tile_gemm": 1, "silu_quant": 1, "route_gather_q": 2,
 }
 
 
@@ -69,6 +76,8 @@ def _run_cases():
     shuffle_gen = torch.Generator().manual_seed(5)
 
     # ---------------------------------------------------------- shared ops
+    gemm_tiles = []
+
     def quant_ref(x):
         """int8_quant_math.h for bf16 rows: (int8 [T, H], fp32 scale [T])."""
         xf = x.float()
@@ -133,6 +142,7 @@ def _run_cases():
     def grouped_gemm_w4a8(a, a_scale, w, w_scale, bias, d, rows_per_expert,
                           n, k, num_experts, tile=None):
         calls.append("gemm")
+        gemm_tiles.append(tile)
         start = 0
         for e, rows in enumerate(rows_per_expert.tolist()):
             if rows:
@@ -175,7 +185,10 @@ def _run_cases():
             remapped_hidden_states_scales[row] = hidden_states_scales[slot //
                                                                       topk]
 
-    def moe_gather(output, g2, topk_weights, unp, num_experts):
+    def moe_gather(output, g2, topk_weights, unp, num_experts, shared=None,
+                   shared_gate=None, single_round=False):
+        """moe_gather.cpp; with the shared term, its SHARED instantiation:
+        T(float(T(acc)) + float(T(gate * shared))) per element."""
         calls.append("gather")
         for t in range(output.shape[0]):
             acc = torch.zeros(output.shape[1], dtype=torch.float32)
@@ -183,7 +196,18 @@ def _run_cases():
                 if row == -1:
                     continue
                 acc += g2[row].float() * topk_weights[t, k].float()
-            output[t] = acc.to(output.dtype)
+            if shared is None:
+                output[t] = acc.to(output.dtype)
+                continue
+            gate = shared_gate.reshape(-1)[t].float()
+            if single_round:
+                output[t] = (acc + gate * shared[t].float()).to(output.dtype)
+                continue
+            routed = acc.to(output.dtype)
+            gated = (gate * shared[t].float()).to(output.dtype)
+            output[t] = (routed.float() + gated.float()).to(output.dtype)
+
+    moe_gather.__dict__["_schema_shared"] = True
 
     # ---------------------------------------------------------- fused ops
     MAP_WG, MAX_ROUTES, MAX_LOCAL = 256, 2048, 512
@@ -248,6 +272,25 @@ def _run_cases():
                 a_q[pp[r]] = q[r // topk]
                 a_scale[pp[r]] = s[r // topk]
 
+    def route_gather_q(x_q, x_scale, topk_ids, expert_map, a_q, a_scale,
+                       perm_pos, rows_per_expert, tile_ws, total, local,
+                       tile_m):
+        """launch_map + launch_gather_q: the map of route_quant, then the
+        rows quantized at the entry copied to the expert rows."""
+        n = len(calls)
+        route_quant(torch.zeros((x_q.shape[0], x_q.shape[1]),
+                                dtype=torch.bfloat16), topk_ids, expert_map,
+                    a_q, a_scale, perm_pos, rows_per_expert, tile_ws, total,
+                    local, tile_m)
+        del calls[n:]
+        calls.append("route_gather_q")
+        topk = topk_ids.shape[1]
+        pp = perm_pos.view(-1)
+        for r in range(pp.numel()):
+            if pp[r] >= 0:
+                a_q[pp[r]] = x_q[r // topk]
+                a_scale[pp[r]] = x_scale.reshape(-1)[r // topk]
+
     def tile_gemm(a, a_scale, b, b_scale, bias, d, tile_ws, n, k, tile_m):
         """w4a8_moe_fused_gemm.cpp: grid umt x N tiles, surplus tiles
         leave, each tile one expert's rows at row0."""
@@ -279,6 +322,7 @@ def _run_cases():
     xpu_ns = types.SimpleNamespace(
         cutlass_grouped_gemm_w4a8=grouped_gemm_w4a8,
         moe_w4a8_route_quant=route_quant,
+        moe_w4a8_route_gather_q=route_gather_q,
         moe_w4a8_tile_gemm=tile_gemm,
         moe_w4a8_silu_mul_quant=silu_quant)
 
@@ -314,6 +358,8 @@ def _run_cases():
     moe_w4a8._OP = None
     moe_w4a8._GLU = None
     moe_w4a8._FOPS = None
+    moe_w4a8._GATHER_Q = None
+    moe_w4a8._GATHER_SHARED = True  # the stand-in takes the shared term
 
     hidden, inter = 256, 128
 
@@ -413,23 +459,45 @@ def _run_cases():
     for name, impl, a, w, ids, kw in cases:
         kw = dict(kw)
         rpe = None
+        fill = 0
         if kw.get("rows_per_expert") is not None:
-            rpe = torch.full((impl.num_experts, ),
-                             7 if kw["rows_per_expert"] == "stale" else 0,
-                             dtype=torch.int32)
+            fill = 7 if kw["rows_per_expert"] == "stale" else 0
+            rpe = torch.full((impl.num_experts, ), fill, dtype=torch.int32)
             kw["rows_per_expert"] = rpe
-        out = torch.full_like(a, 3.0)
-        calls.clear()
-        fmi.XpuFusedMoe.apply(impl, output=out, hidden_states=a,
-                              topk_weights=w, topk_ids=ids, w4a8=True, **kw)
         n_moe = a.shape[0] * impl.n_experts_per_token
-        results[name] = {
-            "out": out.clone(),
-            "rows_per_expert": None if rpe is None else rpe.clone(),
-            "calls": list(calls),
-            "launches": sum(LAUNCHES[c] for c in calls),
-            "tile_m": moe_w4a8.unfused_tile(n_moe, impl.num_experts),
-        }
+        # The shared expert's output and gate column; NaN on padding rows,
+        # as the shared expert computes them from NaN rows.
+        m_real = a.shape[0] - 3
+        sh = (torch.randn(a.shape, generator=gen) / 4).to(torch.bfloat16)
+        sh[m_real:] = float("nan")
+        gate = torch.sigmoid(torch.randn((a.shape[0], 1), generator=gen)).to(
+            torch.bfloat16)
+        xq, xs = quant_ref(a)
+        for variant, extra in (("", {}), ("|xq", {"x_q": (xq, xs.view(-1, 1))}),
+                               ("|xq+sh", {"x_q": (xq, xs.view(-1, 1)),
+                                           "shared": (sh, gate)}),
+                               ("|xq+sh1", {"x_q": (xq, xs.view(-1, 1)),
+                                            "shared": (sh, gate, True)})):
+            if rpe is not None:
+                rpe.fill_(fill)
+            out = torch.full_like(a, 3.0)
+            calls.clear()
+            gemm_tiles.clear()
+            folded = fmi.XpuFusedMoe.apply(impl, output=out, hidden_states=a,
+                                           topk_weights=w, topk_ids=ids,
+                                           w4a8=True, **kw, **extra)
+            results[name + variant] = {
+                "out": out.clone(),
+                "rows_per_expert": None if rpe is None else rpe.clone(),
+                "calls": list(calls),
+                "launches": sum(LAUNCHES[c] for c in calls),
+                "tile_m": moe_w4a8.unfused_tile(n_moe, impl.num_experts),
+                "folded": folded,
+                "gemm_tiles": list(gemm_tiles),
+                "want_tile": moe_w4a8.gemm_tile(n_moe, impl.num_experts,
+                                                impl.total_experts_num),
+                "shared": (sh, gate),
+            }
     return results
 
 
@@ -470,12 +538,66 @@ def test_w4a8_fused_decode_bit_identical(tmp_path):
         _run(m, f)
     base = torch.load(files["0"])
     # 13 case kinds (EP off; ranks 0 and 3 x raw, sentinel, owned sentinel,
-    # out of range, moved, skew) x 11 (top-4 at 7 row counts, top-10 at 4).
-    assert len(base) == 143
+    # out of range, moved, skew) x 11 (top-4 at 7 row counts, top-10 at 4),
+    # each plain, with entry rows, and with entry rows + the shared term.
+    assert len(base) == 4 * 143
+    plain = [k for k in base if "|" not in k]
+    t2_stats = []
+    assert len(plain) == 143
+    for m in ("0", "1", "2"):
+        got = torch.load(files[m])
+        for key in plain:
+            ref = base[key]["out"]
+            xq = got[key + "|xq"]
+            # The unfused GEMMs get the tile of the corrected rule.
+            if m == "0":
+                g = got[key]
+                assert g["gemm_tiles"] == [g["want_tile"]] * 2, (key, g)
+            # Entry rows: same output and counts as the layer's own quant.
+            assert torch.equal(_bits(xq["out"]), _bits(ref)), (m, key)
+            assert xq["folded"] is False, (m, key)
+            # No quant of the token rows (the act quant before gemm2 stays).
+            assert xq["calls"][0] != "quant", (m, key, xq["calls"])
+            if m == "0":
+                assert xq["launches"] == 10, (m, key, xq)
+            else:
+                assert xq["calls"][0] == "route_gather_q", (m, key)
+                assert xq["launches"] == (6 if m == "1" else 7), (m, key)
+            sh = got[key + "|xq+sh"]
+            out_s, gate = sh["shared"]
+            # The engine's unfused sequence: sigmoid(g) * shared (bf16), then
+            # shared + routed (bf16), on the plain output.
+            want = (gate * out_s) + ref
+            assert sh["folded"] is True, (m, key)
+            assert torch.equal(_bits(sh["out"]), _bits(want)), (m, key)
+            assert sh["launches"] == xq["launches"], (m, key)
+            # Tier 2 (single fp32 rounding): bounded against tier 1.
+            t2 = got[key + "|xq+sh1"]
+            assert t2["folded"] is True, (m, key)
+            a1, a2 = want.float(), t2["out"].float()
+            fin = torch.isfinite(a1)
+            assert torch.equal(fin, torch.isfinite(a2)), (m, key)
+            d = (a2[fin] - a1[fin]).abs()
+            rel = d / a1[fin].abs().clamp_min(1e-3)
+            t2_stats.append((rel.max().item(), rel.mean().item(),
+                             (d > 0).float().mean().item()))
+            # Tier 1 rounds the routed sum, the gated product and the sum to
+            # bf16 (half an ulp each); tier 2 rounds once. So the two differ
+            # by at most an ulp of each operand plus one of the result.
+            eps = torch.finfo(torch.bfloat16).eps
+            bound = eps * (ref.float()[fin].abs()
+                           + (gate * out_s).float()[fin].abs()
+                           + a1[fin].abs()) + torch.finfo(torch.bfloat16).tiny
+            assert bool((d <= bound).all()), (m, key, d.max().item())
+    mx = max(r[0] for r in t2_stats)
+    mean = sum(r[1] for r in t2_stats) / len(t2_stats)
+    frac = sum(r[2] for r in t2_stats) / len(t2_stats)
+    print(f"TIER2-SINGLE-ROUND cases={len(t2_stats)} max_rel={mx:.3e} "
+          f"mean_rel={mean:.3e} frac_elems_differ={frac:.4f}")
     for m in ("1", "2"):
         got = torch.load(files[m])
         assert got.keys() == base.keys()
-        for key in base:
+        for key in plain:
             a, b = got[key], base[key]
             # Bit for bit, NaN rows (owned sentinel) included.
             assert torch.equal(_bits(a["out"]), _bits(b["out"])), (m, key)
@@ -487,8 +609,9 @@ def test_w4a8_fused_decode_bit_identical(tmp_path):
             assert b["calls"][0] == "quant" and b["launches"] == 11, key
             assert a["calls"][0] == "route_quant", (m, key)
             assert a["launches"] == (6 if m == "1" else 7), (m, key, a)
-        # Padding rows with unowned / negative ids are zeros.
-        for key in base:
+        # Padding rows with unowned / negative ids are zeros (plain runs;
+        # with the shared term they carry the shared expert's NaN rows).
+        for key in plain:
             if key.endswith(("-raw", "-sentinel", "-oob", "-moved",
                              "-skew")) or (
                     "-ep1-" in key):

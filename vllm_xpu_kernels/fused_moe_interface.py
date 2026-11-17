@@ -436,6 +436,8 @@ class XpuFusedMoe:
         w4a8: bool = False,
         ids_valid: bool = False,
         rows_per_expert: Optional[torch.Tensor] = None,
+        x_q=None,
+        shared=None,
     ):
         """Run the fused MoE, optionally updating grouped intermediates.
 
@@ -467,6 +469,13 @@ class XpuFusedMoe:
                 (on every path: kernel, reference and W4A8); it must stay
                 untouched until the MoE's kernels have run on the current
                 queue.
+            x_q, shared: W4A8 path only (``moe_w4a8.apply``): the token rows
+                already quantized at the MoE entry, and the shared expert's
+                ``(output, gate)`` to add in the gather. Other paths ignore
+                them.
+
+        Returns True when the shared expert's term was added (W4A8 path with
+        ``shared``); None otherwise, and the caller adds it.
         """
         if expert_map is None:
             expert_map = self.expert_map
@@ -494,10 +503,11 @@ class XpuFusedMoe:
                 else:
                     # The W4A8 remap fills rows_per_expert as the kernel
                     # path's does: no torch re-count.
-                    moe_w4a8.apply(self, output, hidden_states, topk_weights,
-                                   topk_ids, expert_map,
-                                   rows_per_expert=rows_per_expert)
-                return
+                    return moe_w4a8.apply(self, output, hidden_states,
+                                          topk_weights, topk_ids, expert_map,
+                                          rows_per_expert=rows_per_expert,
+                                          x_q=x_q, shared=shared)
+                return None
         if self._use_ref:
             self._apply_ref(output, hidden_states,
                             topk_weights, topk_ids,

@@ -6,7 +6,22 @@
 namespace vllm {
 namespace moe {
 
-template <typename T, int TOPK, int ElemsPerItem>
+// SHARED: the shared expert's gated output is added in the same pass, with
+// each rounding point of the unfused sequence kept:
+//   out = T(float(T(acc)) + float(T(float(gate) * float(shared))))
+// T(acc) is the stock store; T(gate * shared) is torch's T multiply of the
+// gate column and the shared expert's output (a product of two bf16 values
+// is exact in fp32, so only its rounding to T remains); the sum is torch's T
+// add of the routed and the gated shared output. A row with no computed
+// slot gathers zeros and still gets the shared term, as the add did.
+// SINGLE_ROUND (tier 2, different bits): out = T(acc + gate * shared) in
+// fp32 with one rounding to T; the two intermediate T roundings are dropped.
+template <
+    typename T,
+    int TOPK,
+    int ElemsPerItem,
+    bool SHARED = false,
+    bool SINGLE_ROUND = false>
 class MoeGather {
  public:
   MoeGather(
@@ -16,14 +31,22 @@ class MoeGather {
       const int* unpermuted_row_to_permuted_row,
       const int num_experts,
       const int num_tokens,
-      const int hidden_size)
+      const int hidden_size,
+      const T* shared = nullptr,
+      const T* shared_gate = nullptr,
+      const int64_t shared_stride = 0,
+      const int64_t gate_stride = 0)
       : output(output),
         moe_output(moe_output),
         topk_weights(topk_weights),
         unpermuted_row_to_permuted_row(unpermuted_row_to_permuted_row),
         num_experts(num_experts),
         num_tokens(num_tokens),
-        hidden_size(hidden_size) {}
+        hidden_size(hidden_size),
+        shared(shared),
+        shared_gate(shared_gate),
+        shared_stride(shared_stride),
+        gate_stride(gate_stride) {}
 
   static constexpr int GroupWorkItem = 256;
   static constexpr int WARP_SIZE = 32;
@@ -79,9 +102,27 @@ class MoeGather {
                 scores[k];
           }
         }
+        if constexpr (SHARED) {
+          const float gate =
+              static_cast<float>(shared_gate[token_idx * gate_stride]);
+          const T* srow = shared + token_idx * shared_stride + hidden_idx;
 #pragma unroll
-        for (int e = 0; e < ElemsPerItem; ++e) {
-          output[token_idx * hidden_size + hidden_idx + e] = accum[e];
+          for (int e = 0; e < ElemsPerItem; ++e) {
+            if constexpr (SINGLE_ROUND) {
+              output[token_idx * hidden_size + hidden_idx + e] =
+                  static_cast<T>(accum[e] + gate * static_cast<float>(srow[e]));
+              continue;
+            }
+            const T routed = static_cast<T>(accum[e]);
+            const T gated = static_cast<T>(gate * static_cast<float>(srow[e]));
+            output[token_idx * hidden_size + hidden_idx + e] = static_cast<T>(
+                static_cast<float>(routed) + static_cast<float>(gated));
+          }
+        } else {
+#pragma unroll
+          for (int e = 0; e < ElemsPerItem; ++e) {
+            output[token_idx * hidden_size + hidden_idx + e] = accum[e];
+          }
         }
       }
     }
@@ -95,6 +136,10 @@ class MoeGather {
   const int num_experts;
   const int num_tokens;
   const int hidden_size;
+  const T* shared;
+  const T* shared_gate;
+  const int64_t shared_stride;
+  const int64_t gate_stride;
 };
 
 template <typename T>
@@ -107,25 +152,70 @@ void MoeGatherLauncher(
     const int num_tokens,
     const int topk,
     const int hidden_size,
-    sycl::queue& queue) {
+    sycl::queue& queue,
+    const T* shared = nullptr,
+    const T* shared_gate = nullptr,
+    const int64_t shared_stride = 0,
+    const int64_t gate_stride = 0,
+    const bool single_round = false) {
   int elems_per_item = sizeof(float) * 4 / sizeof(T);
   while (hidden_size % elems_per_item != 0) {
     elems_per_item /= 2;
   }
-#define CASE_TOPK(TOPK, ElemsPerItem)                                 \
-  case TOPK:                                                          \
-    queue.submit([&](sycl::handler& cgh) {                            \
-      cgh.parallel_for(                                               \
-          MoeGather<T, TOPK, ElemsPerItem>::get_nd_range(num_tokens), \
-          MoeGather<T, TOPK, ElemsPerItem>{                           \
-              output,                                                 \
-              moe_output,                                             \
-              topk_weights,                                           \
-              unpermuted_row_to_permuted_row,                         \
-              num_experts,                                            \
-              num_tokens,                                             \
-              hidden_size});                                          \
-    });                                                               \
+  // The stock kernel (SHARED = false) is the code it was; the shared variant
+  // is a separate instantiation.
+#define CASE_TOPK(TOPK, ElemsPerItem)                                       \
+  case TOPK:                                                                \
+    if (shared != nullptr && single_round) {                                \
+      queue.submit([&](sycl::handler& cgh) {                                \
+        cgh.parallel_for(                                                   \
+            MoeGather<T, TOPK, ElemsPerItem, true, true>::get_nd_range(     \
+                num_tokens),                                                \
+            MoeGather<T, TOPK, ElemsPerItem, true, true>{                   \
+                output,                                                     \
+                moe_output,                                                 \
+                topk_weights,                                               \
+                unpermuted_row_to_permuted_row,                             \
+                num_experts,                                                \
+                num_tokens,                                                 \
+                hidden_size,                                                \
+                shared,                                                     \
+                shared_gate,                                                \
+                shared_stride,                                              \
+                gate_stride});                                              \
+      });                                                                   \
+    } else if (shared != nullptr) {                                         \
+      queue.submit([&](sycl::handler& cgh) {                                \
+        cgh.parallel_for(                                                   \
+            MoeGather<T, TOPK, ElemsPerItem, true>::get_nd_range(           \
+                num_tokens),                                                \
+            MoeGather<T, TOPK, ElemsPerItem, true>{                         \
+                output,                                                     \
+                moe_output,                                                 \
+                topk_weights,                                               \
+                unpermuted_row_to_permuted_row,                             \
+                num_experts,                                                \
+                num_tokens,                                                 \
+                hidden_size,                                                \
+                shared,                                                     \
+                shared_gate,                                                \
+                shared_stride,                                              \
+                gate_stride});                                              \
+      });                                                                   \
+    } else {                                                                \
+      queue.submit([&](sycl::handler& cgh) {                                \
+        cgh.parallel_for(                                                   \
+            MoeGather<T, TOPK, ElemsPerItem>::get_nd_range(num_tokens),     \
+            MoeGather<T, TOPK, ElemsPerItem>{                               \
+                output,                                                     \
+                moe_output,                                                 \
+                topk_weights,                                               \
+                unpermuted_row_to_permuted_row,                             \
+                num_experts,                                                \
+                num_tokens,                                                 \
+                hidden_size});                                              \
+      });                                                                   \
+    }                                                                       \
     break;
 
 #define CASE_ElemsPerItem(TOPK, ElemsPerItem)                                  \
@@ -166,7 +256,10 @@ void moe_gather(
     const torch::Tensor& moe_output,    // [num_tokens * topk, hidden_size]
     const torch::Tensor& topk_weights,  // [num_tokens, topk]
     const torch::Tensor& unpermuted_row_to_permuted_row,  // [num_tokens * topk]
-    const int64_t num_experts) {
+    const int64_t num_experts,
+    const std::optional<torch::Tensor>& shared,       // [num_tokens, hidden]
+    const std::optional<torch::Tensor>& shared_gate,  // [num_tokens, 1]
+    const bool single_round) {
   // Implementation of the gather operation
   const int num_tokens = topk_weights.size(0);
   const int topk = topk_weights.size(1);
@@ -175,6 +268,37 @@ void moe_gather(
   TORCH_CHECK(
       topk_weights.scalar_type() == torch::kFloat32,
       "topk_weights must be float32");
+  TORCH_CHECK(
+      shared.has_value() == shared_gate.has_value(),
+      "moe_gather: shared and shared_gate come together");
+  int64_t shared_stride = 0, gate_stride = 0;
+  if (shared.has_value()) {
+    TORCH_CHECK(
+        output.scalar_type() == torch::kBFloat16 ||
+            output.scalar_type() == torch::kFloat16,
+        "moe_gather: the shared term needs a bf16 or fp16 output");
+    TORCH_CHECK(
+        shared->scalar_type() == output.scalar_type() &&
+            shared_gate->scalar_type() == output.scalar_type(),
+        "moe_gather: shared and shared_gate must have the output's dtype");
+    TORCH_CHECK(
+        shared->dim() == 2 && shared->size(0) == num_tokens &&
+            shared->size(1) == hidden_size && shared->stride(1) == 1,
+        "moe_gather: shared must be [num_tokens, hidden], hidden contiguous");
+    TORCH_CHECK(
+        shared_gate->numel() == num_tokens &&
+            (shared_gate->dim() == 1 ||
+             (shared_gate->dim() == 2 && shared_gate->size(1) == 1)),
+        "moe_gather: shared_gate must be [num_tokens, 1]");
+    TORCH_CHECK(
+        output.is_contiguous(), "moe_gather: output must be contiguous");
+    TORCH_CHECK(
+        shared->device() == output.device() &&
+            shared_gate->device() == output.device(),
+        "moe_gather: shared tensors on the output's device");
+    shared_stride = shared->stride(0);
+    gate_stride = shared_gate->stride(0);
+  }
 
   const at::DeviceGuard device_guard(output.device());
   auto& queue = vllm::xpu::vllmGetQueue();
@@ -189,7 +313,15 @@ void moe_gather(
       num_tokens,                                                        \
       topk,                                                              \
       hidden_size,                                                       \
-      queue);
+      queue,                                                             \
+      shared.has_value() ? reinterpret_cast<const T*>(shared->data_ptr()) \
+                         : nullptr,                                      \
+      shared_gate.has_value()                                            \
+          ? reinterpret_cast<const T*>(shared_gate->data_ptr())          \
+          : nullptr,                                                     \
+      shared_stride,                                                     \
+      gate_stride,                                                       \
+      single_round);
 
   if (output.scalar_type() == torch::kFloat16) {
     using scalar_t = sycl::half;

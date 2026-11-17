@@ -146,6 +146,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "int local_experts, int tile_m) -> ()");
   xpu_ops.impl("moe_w4a8_route_quant", torch::kXPU, &moe_w4a8_route_quant);
   xpu_ops.def(
+      "moe_w4a8_route_gather_q(Tensor x_q, Tensor x_scale, Tensor topk_ids, "
+      "Tensor? expert_map, Tensor! a_q, Tensor! a_scale, Tensor! perm_pos, "
+      "Tensor! rows_per_expert, Tensor! tile_ws, int total_experts, "
+      "int local_experts, int tile_m) -> ()");
+  xpu_ops.impl(
+      "moe_w4a8_route_gather_q", torch::kXPU, &moe_w4a8_route_gather_q);
+  xpu_ops.def(
       "moe_w4a8_tile_gemm(Tensor a, Tensor a_scale, Tensor b, Tensor b_scale, "
       "Tensor? bias, Tensor! d, Tensor tile_ws, int N, int K, int tile_m) -> "
       "()");

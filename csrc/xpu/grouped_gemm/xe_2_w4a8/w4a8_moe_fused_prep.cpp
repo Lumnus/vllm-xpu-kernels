@@ -61,6 +61,7 @@ struct alignas(kVec) out_vec_t {
 template <typename IDT>
 class W4A8FMapName;
 class W4A8FQuantGatherName;
+class W4A8FGatherQName;
 class W4A8FSiluQuantName;
 
 // ---------------------------------------------------------------------------
@@ -246,6 +247,61 @@ void launch_quant_gather(
 }
 
 // ---------------------------------------------------------------------------
+// 2b. gather of rows already quantized at the MoE entry (the same per-token
+// op, run once for every consumer of the row): one work-group per token
+// copies the token's int8 row and scale to each of its expert rows. No
+// arithmetic, so the expert rows hold the bits 2. would have written.
+// ---------------------------------------------------------------------------
+void launch_gather_q(
+    sycl::queue& q,
+    const int8_t* xq,
+    int64_t xq_stride,
+    const float* xs,
+    int64_t xs_stride,
+    int T,
+    int H,
+    int topk,
+    const int32_t* perm_pos,
+    int8_t* a_q,
+    float* a_scale) {
+  const int wg = quant_wg(H);
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<W4A8FGatherQName>(
+        sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(T) * wg),
+                          sycl::range<1>(wg)),
+        [=](sycl::nd_item<1> item) {
+          const int tid = item.get_local_id(0);
+          const int nthr = item.get_local_range(0);
+          const int64_t row = item.get_group(0);
+          const int nvec = H / kVec;
+          auto const* vin = reinterpret_cast<out_vec_t const*>(xq + row * xq_stride);
+          int dst[kMaxTopK];
+#pragma unroll
+          for (int k = 0; k < kMaxTopK; ++k) {
+            dst[k] = k < topk ? perm_pos[row * topk + k] : -1;
+          }
+          if (tid == 0) {
+            const float s = xs[row * xs_stride];
+#pragma unroll
+            for (int k = 0; k < kMaxTopK; ++k) {
+              if (dst[k] >= 0) a_scale[dst[k]] = s;
+            }
+          }
+          for (int i = tid; i < nvec; i += nthr) {
+            const out_vec_t qv = vin[i];
+#pragma unroll
+            for (int k = 0; k < kMaxTopK; ++k) {
+              if (dst[k] >= 0) {
+                reinterpret_cast<out_vec_t*>(
+                    a_q + static_cast<int64_t>(dst[k]) * H)[i] = qv;
+              }
+            }
+          }
+        });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // 4. silu_and_mul + quant: one work-group per expert row below ws[1] (the
 // rows past it hold no route). The element is silu_and_mul's
 // (w4a8f_silu_mul_bits, compiled under activation.cpp's model); the quant is
@@ -403,6 +459,101 @@ void moe_w4a8_route_quant_xe2(
   launch_quant_gather(
       q, reinterpret_cast<const scalar_t*>(x.data_ptr()), x.stride(0), T, H, topk,
       perm_pos.data_ptr<int32_t>(), a_q.data_ptr<int8_t>(), a_scale.data_ptr<float>());
+}
+
+void moe_w4a8_route_gather_q_xe2(
+    const at::Tensor& x_q,
+    const at::Tensor& x_scale,
+    const at::Tensor& topk_ids,
+    const std::optional<at::Tensor>& expert_map,
+    at::Tensor& a_q,
+    at::Tensor& a_scale,
+    at::Tensor& perm_pos,
+    at::Tensor& rows_per_expert,
+    at::Tensor& tile_ws,
+    int64_t total_experts,
+    int64_t local_experts,
+    int64_t tile_m) {
+  using namespace w4a8f;
+  const char* who = "moe_w4a8_route_gather_q";
+  TORCH_CHECK(
+      x_q.is_xpu() && x_q.scalar_type() == at::kChar && x_q.dim() == 2 &&
+          x_q.stride(1) == 1,
+      who, ": x_q must be int8 [T, H] on XPU, H contiguous");
+  const int64_t T = x_q.size(0), H = x_q.size(1);
+  TORCH_CHECK(
+      x_scale.scalar_type() == at::kFloat && x_scale.numel() == T &&
+          (x_scale.dim() == 1 || (x_scale.dim() == 2 && x_scale.size(1) == 1)),
+      who, ": x_scale must be fp32 [T] or [T, 1]");
+  TORCH_CHECK(
+      topk_ids.dim() == 2 && topk_ids.size(0) == T && topk_ids.is_contiguous() &&
+          (topk_ids.scalar_type() == at::kInt || topk_ids.scalar_type() == at::kLong),
+      who, ": topk_ids must be contiguous int32/int64 [T, top_k]");
+  const int64_t topk = topk_ids.size(1);
+  const int64_t R = T * topk;
+  TORCH_CHECK(topk >= 1 && topk <= kMaxTopK, who, ": top_k must be 1..", kMaxTopK);
+  TORCH_CHECK(R <= kMaxRoutes, who, ": T * top_k must be <= ", kMaxRoutes);
+  TORCH_CHECK(
+      local_experts >= 1 && local_experts <= kMaxLocal && total_experts >= 1,
+      who, ": 1 <= local_experts <= ", kMaxLocal);
+  TORCH_CHECK(
+      H % kVec == 0 && x_q.stride(0) % kVec == 0 &&
+          reinterpret_cast<uintptr_t>(x_q.data_ptr()) % 16 == 0,
+      who, ": H and the row stride must be multiples of ", kVec, ", x_q 16-byte aligned");
+  TORCH_CHECK(
+      a_q.scalar_type() == at::kChar && a_q.is_contiguous() && a_q.dim() == 2 &&
+          a_q.size(0) == R && a_q.size(1) == H,
+      who, ": a_q must be contiguous int8 [T * top_k, H]");
+  TORCH_CHECK(
+      a_scale.scalar_type() == at::kFloat && a_scale.is_contiguous() &&
+          a_scale.numel() == R,
+      who, ": a_scale must be contiguous fp32 [T * top_k]");
+  TORCH_CHECK(
+      perm_pos.scalar_type() == at::kInt && perm_pos.is_contiguous() &&
+          perm_pos.numel() == R,
+      who, ": perm_pos must be contiguous int32 [T, top_k]");
+  TORCH_CHECK(
+      rows_per_expert.scalar_type() == at::kInt && rows_per_expert.is_contiguous() &&
+          rows_per_expert.numel() == local_experts,
+      who, ": rows_per_expert must be contiguous int32 [local_experts]");
+  TORCH_CHECK(
+      tile_ws.scalar_type() == at::kInt && tile_ws.is_contiguous() &&
+          tile_ws.numel() >= 2 && (tile_ws.numel() - 2) % 3 == 0,
+      who, ": tile_ws must be contiguous int32 [2 + 3 * umt]");
+  const int shift = tile_shift(tile_m);
+  const int64_t umt = (tile_ws.numel() - 2) / 3;
+  const int64_t need =
+      std::min<int64_t>(R, R / tile_m + std::min<int64_t>(R, local_experts));
+  TORCH_CHECK(umt >= need, who, ": tile_ws holds ", umt, " tiles, routing may need ", need);
+  const int32_t* emap = nullptr;
+  if (expert_map.has_value()) {
+    TORCH_CHECK(
+        expert_map->scalar_type() == at::kInt && expert_map->is_contiguous() &&
+            expert_map->numel() == total_experts,
+        who, ": expert_map must be contiguous int32 [total_experts]");
+    emap = expert_map->data_ptr<int32_t>();
+  }
+  for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&x_scale, &topk_ids, &a_q, &a_scale, &perm_pos, &rows_per_expert, &tile_ws}) {
+    TORCH_CHECK(t->device() == x_q.device(), who, ": all tensors on x_q's device");
+  }
+
+  const at::DeviceGuard guard(x_q.device());
+  auto& q = c10::xpu::getCurrentXPUStream(x_q.device().index()).queue();
+  int32_t* ws = tile_ws.data_ptr<int32_t>();
+  if (topk_ids.scalar_type() == at::kInt) {
+    launch_map<int32_t>(
+        q, topk_ids.data_ptr<int32_t>(), emap, R, total_experts, local_experts,
+        shift, umt, perm_pos.data_ptr<int32_t>(), rows_per_expert.data_ptr<int32_t>(), ws);
+  } else {
+    launch_map<int64_t>(
+        q, topk_ids.data_ptr<int64_t>(), emap, R, total_experts, local_experts,
+        shift, umt, perm_pos.data_ptr<int32_t>(), rows_per_expert.data_ptr<int32_t>(), ws);
+  }
+  if (T == 0) return;
+  launch_gather_q(
+      q, x_q.data_ptr<int8_t>(), x_q.stride(0), x_scale.data_ptr<float>(),
+      x_scale.stride(0), T, H, topk, perm_pos.data_ptr<int32_t>(),
+      a_q.data_ptr<int8_t>(), a_scale.data_ptr<float>());
 }
 
 void moe_w4a8_silu_mul_quant_xe2(
