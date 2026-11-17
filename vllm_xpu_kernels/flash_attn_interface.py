@@ -117,6 +117,36 @@ _LOGGED_META_CACHE = False
 INT8_DOT_DECODE = True
 _LOGGED_INT8_DOT = False
 
+# INT8 per-token-head KV at prefill (``int8_prefill`` with an INT8 KV cache, a
+# bfloat16 query, paged causal attention without window or sinks, head size
+# 256): the chunk-prefill kernel reads the int8 codes and fp32 scales in place
+# (no dequantized scratch). 1: Q*K and P*V on the bfloat16 query and P over the
+# widened codes (the paged decode kernel's arithmetic); 2: Q*K as
+# s8 x s8 -> s32 DPAS with the query quantized in the kernel by the rule of
+# ``int8_dot`` (scale = absmax / 127, codes half away from zero, both divisions
+# exactly rounded), P*V as 1; 3: as 2 with P*V as s8 x s8 -> s32 (P * v_scale
+# quantized per query row of each 32-slot KV tile: scale = row max / 127 and
+# its inverse exactly rounded, codes half up). Decode rows of a mixed batch
+# take the paged decode kernel (with ``int8_dot`` if passed). INT8_PREFILL
+# tells callers the argument exists.
+INT8_PREFILL = True
+INT8_PREFILL_MODES = {1: "bf16 dots over the widened codes",
+                      2: "Q*K s8 x s8 -> s32, P*V bf16",
+                      3: "Q*K and P*V s8 x s8 -> s32"}
+_LOGGED_INT8_PREFILL: set = set()
+
+
+def _int8_prefill_kwargs(int8_prefill: int) -> dict:
+    if not int8_prefill:
+        return {}
+    if int8_prefill not in _LOGGED_INT8_PREFILL:
+        _LOGGED_INT8_PREFILL.add(int8_prefill)
+        _logger.warning(
+            "FA chunk prefill on INT8 KV: int8_prefill=%d (%s), cache read in "
+            "place, no dequantized scratch", int8_prefill,
+            INT8_PREFILL_MODES.get(int8_prefill, "?"))
+    return {"int8_prefill": int(int8_prefill)}
+
 
 def _int8_dot_kwargs(int8_dot: bool) -> dict:
     global _LOGGED_INT8_DOT
@@ -565,6 +595,7 @@ def flash_attn_varlen_func(
     dynamic_causal: Optional[torch.Tensor] = None,
     spec_decode_meta_cache: Optional[dict] = None,
     int8_dot: bool = False,
+    int8_prefill: int = 0,
 ):
     """
     FlashAttention interface for variable-length sequences, with optional
@@ -599,7 +630,11 @@ def flash_attn_varlen_func(
             ``spec_decode_metadata``). None builds it in every call.
         int8_dot: INT8 per-token-head KV with a bfloat16 query, decode and
             spec-decode verify rows only: Q*K in int8 on the matrix engine
-            (see INT8_DOT_DECODE).
+            (see INT8_DOT_DECODE). With ``int8_prefill`` set it also applies
+            to the decode rows of a mixed batch.
+        int8_prefill: INT8 per-token-head KV with a bfloat16 query, prefill
+            rows (query length > 1) of paged causal batches: 1, 2 or 3 (see
+            INT8_PREFILL); 0 keeps the refusal (dequantize for prefill).
     """
     if host_kv_lens is not None:
         if seqused_k is not None:
@@ -635,8 +670,20 @@ def flash_attn_varlen_func(
     else:
         k_descale = _normalize_descale_tensor(k_descale, "k_descale")
         v_descale = _normalize_descale_tensor(v_descale, "v_descale")
+    if int8_prefill and (int8_prefill not in INT8_PREFILL_MODES
+                         or k.dtype != torch.int8 or q.dtype != torch.bfloat16
+                         or block_table is None or not causal
+                         or dynamic_causal is not None or s_aux is not None
+                         or return_softmax_lse
+                         or (window_size is not None
+                             and tuple(window_size) != (-1, -1))):
+        raise ValueError(
+            "int8_prefill needs 1, 2 or 3, an INT8 KV cache, a bfloat16 query "
+            "and paged causal attention without window, sinks, softmax_lse or "
+            f"dynamic_causal; got {int8_prefill}, k {k.dtype}, q {q.dtype}")
     if int8_dot and (k.dtype != torch.int8 or q.dtype != torch.bfloat16
-                     or max_seqlen_q > max(_SPEC_DECODE_MAX_QLEN, 1)):
+                     or (not int8_prefill
+                         and max_seqlen_q > max(_SPEC_DECODE_MAX_QLEN, 1))):
         raise ValueError(
             "int8_dot needs an INT8 KV cache, a bfloat16 query and decode "
             f"rows (max_seqlen_q <= {max(_SPEC_DECODE_MAX_QLEN, 1)}); got "
@@ -767,6 +814,7 @@ def flash_attn_varlen_func(
                 work_list_dev,
                 dynamic_causal,
                 **_int8_dot_kwargs(int8_dot),
+                **_int8_prefill_kwargs(int8_prefill),
             )
         except RuntimeError as e:
             # The reference fallback takes per-tensor descales only; INT8

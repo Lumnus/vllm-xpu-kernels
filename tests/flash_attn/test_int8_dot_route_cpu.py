@@ -3,9 +3,11 @@
 int8_dot argument when true (plain decode rows and the spec-decode route),
 not at all when false (so the call is the one without the argument), and is
 refused for a non-INT8 cache, a non-bfloat16 query or rows above the
-spec-decode bound. CPU only: the op is a stand-in that records its keyword
-arguments; it runs in a subprocess so the stand-in never reaches this
-session."""
+spec-decode bound (unless int8_prefill is set). int8_prefill reaches the op
+as its argument for prefill rows, not on the spec-decode route, and is refused
+outside 1-3, for a non-INT8 cache, a non-bfloat16 query, a window or
+sinks. CPU only: the op is a stand-in that records its keyword arguments; it
+runs in a subprocess so the stand-in never reaches this session."""
 
 import os
 import subprocess
@@ -40,7 +42,7 @@ def _check():
     table = torch.ones(1, 2, dtype=torch.int32)
     seqused = torch.tensor([100], dtype=torch.int32)
 
-    def call(rows, dot, q_dtype=torch.bfloat16, kv=k):
+    def call(rows, dot, q_dtype=torch.bfloat16, kv=k, prefill=0, **kw):
         q = torch.zeros(rows, hq, d, dtype=q_dtype)
         cu = torch.tensor([0, rows], dtype=torch.int32)
         seen.clear()
@@ -49,7 +51,7 @@ def _check():
                                    causal=True, block_table=table,
                                    out=torch.empty_like(q), k_descale=sc,
                                    v_descale=sc, spec_decode_meta_cache={},
-                                   int8_dot=dot)
+                                   int8_dot=dot, int8_prefill=prefill, **kw)
         return list(seen)
 
     assert call(1, True) == [{"int8_dot": True}]
@@ -70,6 +72,23 @@ def _check():
         assert "int8_dot" in str(e)
     else:
         raise AssertionError("accepted rows above the spec-decode bound")
+    # int8_prefill
+    assert fai.INT8_PREFILL and set(fai.INT8_PREFILL_MODES) == {1, 2, 3}
+    assert call(40, False, prefill=2) == [{"int8_prefill": 2}]
+    assert call(40, True, prefill=3) == [{"int8_dot": True, "int8_prefill": 3}]
+    assert call(40, False, prefill=1) == [{"int8_prefill": 1}]
+    assert call(4, False, prefill=2) == [{}]  # spec-decode route: decode kernel
+    assert call(40, False) == [{}]
+    for bad in (dict(prefill=4), dict(prefill=2, q_dtype=torch.half),
+                dict(prefill=2, kv=k.to(torch.bfloat16)),
+                dict(prefill=2, window_size=[127, 0]),
+                dict(prefill=2, s_aux=torch.zeros(hq))):
+        try:
+            call(40, False, **bad)
+        except ValueError as e:
+            assert "int8_prefill" in str(e)
+        else:
+            raise AssertionError(f"accepted {bad}")
     print("int8_dot route: ok")
 
 
