@@ -118,7 +118,7 @@ def _run_cases():
 
     @ref
     def grouped_gemm_w4a8(a, a_scale, w, w_scale, bias, d, rows_per_expert,
-                          n, k, num_experts):
+                          n, k, num_experts, tile=None):
         start = 0
         for e, rows in enumerate(rows_per_expert.tolist()):
             if rows == 0:
