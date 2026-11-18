@@ -194,7 +194,7 @@ def ref_attn_pv8(q, k, kv_codes, kv_scales, scale, q_pos):
 
 def run_and_check(q_lens, seq_lens, hq, hkv, head_size, block_size, window,
                   sinks, dtype, dev, pad_bytes=0, fill=None, int8_dot=False,
-                  int8_prefill=0, tol=1.5e-2):
+                  int8_prefill=0, tol=1.5e-2, return_ref=False):
     kc, vc, ks, vs, block_table, keys, values = build_int8_cache(
         seq_lens, block_size, hkv, head_size, dtype, dev, pad_bytes, fill,
         codes=int8_prefill == 3)
@@ -250,16 +250,45 @@ def run_and_check(q_lens, seq_lens, hq, hkv, head_size, block_size, window,
         ref.append(
             ref_attn(q_rows[q0:q0 + ql], keys[i], v_deq, scale, q_pos, window,
                      sinks))
-    torch.testing.assert_close(out.float(),
-                               torch.cat(ref),
-                               atol=tol,
-                               rtol=tol)
-    return out
+    ref = torch.cat(ref)
+    torch.testing.assert_close(out.float(), ref, atol=tol, rtol=tol)
+    return (out, ref) if return_ref else out
 
 
 def _int8_query(q):
     qc, qs = quantize_query_rule(q)
     return qc.float() * qs[..., None]
+
+
+# The int8_dot contract (the decode kernel at int8_decode_dot=qk): the output
+# is the fp32 attention of the int8 query of the shared rule over the cached
+# codes and scales, up to the BF16 output-rounding floor (0.2-0.3 % relative
+# L2 over this test's cases in a CPU model of the kernel, at most 0.48 % in a
+# single row; the same floor as the int8 prefill kernels on the same tokens).
+# It differs from the BF16-query kernel by the query rounding by design
+# (0.5-1.2 % relative L2, up to 0.12 in single elements of peaked rows), so
+# the two kernels are not compared element by element.
+INT8_DOT_ROW_REL_L2 = 1.0e-2  # per (token, head) row, against its reference
+INT8_DOT_CONTRACT_RATIO = 0.75  # error vs own reference / vs the BF16 query's
+
+
+def check_int8_dot_contract(out8, ref8, ref16):
+    """Per row: relative L2 against the int8-query reference within the
+    bound (a wrong code, scale or layout in any row shows there). Globally:
+    the output sits on the int8-query contract, not on the BF16-query one
+    (catches the BF16 query running where int8_dot was asked for)."""
+    o = out8.float()
+    assert torch.isfinite(o).all()
+    row = (o - ref8).norm(dim=-1) / ref8.norm(dim=-1).clamp_min(1e-6)
+    worst = int(row.flatten().argmax())
+    assert float(row.max()) <= INT8_DOT_ROW_REL_L2, (
+        f"row {divmod(worst, row.shape[1])} relative L2 {float(row.max()):.4%}"
+        f" > {INT8_DOT_ROW_REL_L2:.1%} against the int8-query reference")
+    e8 = float((o - ref8).norm() / ref8.norm())
+    e16 = float((o - ref16).norm() / ref16.norm())
+    assert e8 <= INT8_DOT_CONTRACT_RATIO * e16, (
+        f"relative L2 {e8:.4%} against the int8-query reference, {e16:.4%}"
+        " against the BF16-query reference: not on the int8 contract")
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -315,8 +344,9 @@ def test_varlen_int8_kv_int8_dot(mode, num_heads, head_size, block_size,
                                  window, is_sink):
     """int8_dot: Q quantized per (token, query head) in the kernel, Q*K on
     s8 x s8 -> s32 DPAS. Checked against the fp32 reference over the int8
-    query of the shared rule (codes x scales) and the same cache; and, more
-    loosely, against the BF16-query kernel."""
+    query of the shared rule (codes x scales) and the same cache, element-wise
+    and per row in relative L2, and placed on the int8 contract against the
+    BF16-query reference (check_int8_dot_contract)."""
     if mode != "decode" and _SPEC_DECODE_MAX_QLEN < 5:
         pytest.skip("speculative-decode route disabled "
                     "(VLLM_XPU_SPEC_DECODE_MAX_QLEN)")
@@ -334,12 +364,15 @@ def test_varlen_int8_kv_int8_dot(mode, num_heads, head_size, block_size,
     args = (q_lens, seq_lens, hq, hkv, head_size, block_size, window, sinks,
             torch.bfloat16, dev)
     torch.manual_seed(1)
-    out8 = run_and_check(*args, fill=0x7F, int8_dot=True)
+    out8, ref8 = run_and_check(*args,
+                               fill=0x7F,
+                               int8_dot=True,
+                               return_ref=True)
+    # The same data again (same seed): the BF16-query kernel against its own
+    # reference, and that reference for the contract check.
     torch.manual_seed(1)
-    out16 = run_and_check(*args, fill=0x7F)
-    assert torch.isfinite(out8).all()
-    torch.testing.assert_close(out8.float(), out16.float(), atol=4e-2,
-                               rtol=4e-2)
+    _, ref16 = run_and_check(*args, fill=0x7F, return_ref=True)
+    check_int8_dot_contract(out8, ref8, ref16)
 
 
 def test_varlen_int8_kv_int8_dot_refusals():
