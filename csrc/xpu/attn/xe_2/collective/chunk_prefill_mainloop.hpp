@@ -141,6 +141,19 @@ static inline float int8_attn_query_code(float x, float inv_scale) {
 static inline float int8_attn_p_scale(float rowmax) {
   return sycl::fmax(int8_attn_div_rn(rowmax, 127.0f), 1.0e-30f);
 }
+// The same code for a P value (P * v_scale >= 0), from y2 = P * (2 * inv):
+// 2 * inv is exact and x * (2 * inv) = 2 * (x * inv) exactly (a power-of-two
+// scaling commutes with round-to-nearest; values small enough to differ round
+// to code 0 either way), so trunc(y2) = trunc(2 |y|) and the code is
+// (trunc(y2) + 1) >> 1. fmin(y2, 254) gives codes past 127 the clamp
+// (2 |y| >= 255 -> 254 -> 127) and NaN its 127 as int8_attn_query_code does,
+// and keeps the conversion in range (t + 1 cannot overflow). Equal to
+// int8_attn_query_code(x, inv) for every x * inv >= 0 and NaN (the only inputs
+// P has: exp2 >= 0, v_scale >= 0); five instructions instead of ten.
+static inline float int8_attn_p_code2(float y2) {
+  const int t = static_cast<int>(sycl::fmin(y2, 254.0f));
+  return static_cast<float>((t + 1) >> 1);
+}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -966,8 +979,10 @@ struct FMHAFwdMainloop<
       prefetch(prefetch_q, pQgQ(_, _, _, D));
     }
 
-    auto phys_block = [&](int k_tile) {
-      int page_local = k_tile * tile_k / params.page_size;
+    // Physical block of the sequence's page_local-th page (clamped as the base
+    // walk's get_paged_idx). The KV loop walks (page, tile in page) by
+    // increments, so it divides by the page size only here, once.
+    auto block_of_page = [&](int page_local) {
       page_local = page_local < params.max_pages_per_seq
                        ? page_local
                        : params.max_pages_per_seq - 1;
@@ -977,19 +992,33 @@ struct FMHAFwdMainloop<
     // fp32 scales of this tile's columns (this lane's: lane, lane + 16, ...);
     // 0 at and past seq_len, where the cache may hold stale bytes. A tile lies
     // inside one block: its slot is t * tile_k + column (t = tile in block).
-    auto tile_scales = [&](void* cache, int k_tile, int t, int pblk) {
+    // The lanes' slot offsets are computed once; per tile only the block's,
+    // the head's and the tile's offset (sc_off, uniform) are added.
+    constexpr int kColsPerLane = tile_k / intel::sg_size;
+    int64_t lane_slot_off[kColsPerLane];
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kColsPerLane; i++) {
+      lane_slot_off[i] =
+          int64_t(lane + i * intel::sg_size) * params.scale_stride_slot;
+    }
+    const int64_t tile_slot_stride = int64_t(tile_k) * params.scale_stride_slot;
+    auto scale_offset = [&](int t, int pblk) {
+      return int64_t(pblk) * params.scale_stride_block +
+             int64_t(head_kv) * params.scale_stride_head +
+             int64_t(t) * tile_slot_stride;
+    };
+    auto tile_scales = [&](void* cache, int k_tile, int64_t sc_off) {
       FragSCol sc;
-      const float* base = static_cast<const float*>(cache) +
-                          int64_t(pblk) * params.scale_stride_block +
-                          int64_t(head_kv) * params.scale_stride_head;
+      static_assert(decltype(size(sc.tensor()))::value == kColsPerLane);
+      const float* base = static_cast<const float*>(cache) + sc_off;
       int k = k_tile * tile_k + lane;
-      int slot = t * tile_k + lane;
+      // The slot lies inside the block (t * tile_k + column < page_size), so
+      // the load is always in bounds: load unconditionally, then select, so
+      // the loads issue without divergent branches around them.
       CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < sc.size();
-           i++, k += intel::sg_size, slot += intel::sg_size) {
-        sc(i) = (k < seq_len)
-                    ? ElementS(base[int64_t(slot) * params.scale_stride_slot])
-                    : ElementS(0);
+      for (int i = 0; i < kColsPerLane; i++, k += intel::sg_size) {
+        const ElementS s = ElementS(base[lane_slot_off[i]]);
+        sc(i) = (k < seq_len) ? s : ElementS(0);
       }
       return sc;
     };
@@ -1122,6 +1151,28 @@ struct FMHAFwdMainloop<
     auto stv = tSrS.tv_layout();  // (lane, value) -> (q, k), sub-group local
     constexpr int kSVals = decltype(size(tSrS.tensor()))::value;
 
+    // Int8Dot: the softmax scale times q_scale[row], in the softmax's row
+    // layout, built once per work tile (a row reduction of S filled with its
+    // rows' values), so the KV loop multiplies S by k_scale only.
+    FragSRow qk_row_scale;
+    if constexpr (Int8Dot) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int v = 0; v < kSVals; v++) {
+        const int r = int(get<0>(stv(lane, v))) % kSGRows;
+        float qs = row_scale[0];
+        CUTLASS_PRAGMA_UNROLL
+        for (int rr = 1; rr < kSGRows; rr++) {
+          qs = (r == rr) ? row_scale[rr] : qs;
+        }
+        tSrS.data()[v] = qs;
+      }
+      qk_row_scale = reduce<1>(tSrS, sycl::maximum{});
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < qk_row_scale.size(); i++) {
+        qk_row_scale(i) *= params.scale;
+      }
+    }
+
     // ---- INT8 P*V: s8 P (A operand), V codes as the s8 B operand ----
     using TiledCopyV8 =
         decltype(make_block_2d_copy_B(TiledMMAPV8{}, TensorV2D{}));
@@ -1149,16 +1200,16 @@ struct FMHAFwdMainloop<
     auto tKrKw = thr_copy_kw.partition_sg_fragment_D(gKb(_, _, 0, 0));
     auto tSrKw = thr_mma_qk.partition_sg_fragment_B(gKb(_, _, 0, 0));
 
-    auto prefetch_k_tile = [&](int k_tile) {
+    // K prefetch of tile k_tile, at tile t of block pblk.
+    auto prefetch_k_tile = [&](int k_tile, int pblk, int t) {
       if (k_tile >= blk_k1) return;
-      const int pblk = phys_block(k_tile);
       if constexpr (Int8Dot) {
         TiledCopyK8 copy_blk{k_block(pblk)};
         auto pf = make_block_2d_prefetch(copy_blk);
         auto pKg = pf.get_slice(thr_id).partition_S(gKb8);
         CUTLASS_PRAGMA_UNROLL
         for (int D = 0; D < size<4>(pKg); D++) {
-          prefetch(pf, pKg(_, _, _, k_tile % tiles_per_page, D));
+          prefetch(pf, pKg(_, _, _, t, D));
         }
       } else {
         TiledCopyKw copy_blk{k_block(pblk)};
@@ -1166,12 +1217,17 @@ struct FMHAFwdMainloop<
         auto pKg = pf.get_slice(thr_id).partition_S(gKb);
         CUTLASS_PRAGMA_UNROLL
         for (int D = 0; D < size<4>(pKg); D++) {
-          prefetch(pf, pKg(_, _, _, k_tile % tiles_per_page, D));
+          prefetch(pf, pKg(_, _, _, t, D));
         }
       }
     };
 
-    prefetch_k_tile(blk_k0);
+    // Tile K is tile t_cur of the sequence's page page_cur, in block
+    // pblk_cur; advanced by one tile per iteration.
+    int t_cur = blk_k0 % tiles_per_page;
+    int page_cur = blk_k0 / tiles_per_page;
+    int pblk_cur = block_of_page(page_cur);
+    prefetch_k_tile(blk_k0, pblk_cur, t_cur);
 
     /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1; K++) {
@@ -1182,10 +1238,23 @@ struct FMHAFwdMainloop<
         need_causal = K >= blk_k1_causal;
       }
 
-      const int pblk = phys_block(K);
-      const int t = K % tiles_per_page;
-      FragSCol ksc = tile_scales(params.scale_k, K, t, pblk);
-      FragSCol vsc = tile_scales(params.scale_v, K, t, pblk);
+      const int pblk = pblk_cur;
+      const int t = t_cur;
+      // The next tile: the next slot range of this block, or the first of
+      // the next page's block (read from the page table only then).
+      int t_next = t + 1;
+      int page_next = page_cur;
+      int pblk_next = pblk;
+      if (t_next == tiles_per_page) {
+        t_next = 0;
+        page_next++;
+        if (K + 1 < blk_k1) {
+          pblk_next = block_of_page(page_next);
+        }
+      }
+      const int64_t sc_off = scale_offset(t, pblk);
+      FragSCol ksc = tile_scales(params.scale_k, K, sc_off);
+      FragSCol vsc = tile_scales(params.scale_v, K, sc_off);
       auto V_blk = v_block(pblk);
       TiledCopyV copy_v_blk{V_blk};
 
@@ -1197,9 +1266,8 @@ struct FMHAFwdMainloop<
       /* GEMM 1: S = Q * K^T */
       if constexpr (Int8Dot) {
         TiledCopyK8 copy_k8_blk{k_block(pblk)};
-        clear(tSrS8);
         const int d8_chunks = size<4>(tKgK8);
-        for (int D = 0; D < d8_chunks; D++) {
+        auto qk8_chunk = [&](int D) {
           copy(copy_k8_blk, tKgK8(_, _, _, t, D), tKrK8);
           // Sub-group block reads: lane l gets bytes [i * 16 + l] of each
           // 256-byte block, i.e. its fragment elements in register order.
@@ -1222,18 +1290,20 @@ struct FMHAFwdMainloop<
             }
           }
           reorder(tKrK8, tSrK8);
+        };
+        // First head chunk without an accumulator (DPAS null src0: no clear
+        // of the s32 S registers), the others accumulate.
+        qk8_chunk(0);
+        cute::gemm<true>(mma_qk8, tSrQ8, tSrK8, tSrS8);
+        for (int D = 1; D < d8_chunks; D++) {
+          qk8_chunk(D);
           cute::gemm(mma_qk8, tSrQ8, tSrK8, tSrS8);
         }
-        // S = s32 * q_scale[row] (k_scale below), exact int32 dot.
+        // S = float(s32) (exact int32 dot); k_scale below, q_scale[row] is
+        // folded into the softmax's per-row scale (qk_row_scale).
         CUTLASS_PRAGMA_UNROLL
         for (int v = 0; v < kSVals; v++) {
-          const int r = int(get<0>(stv(lane, v))) % kSGRows;
-          float qs = row_scale[0];
-          CUTLASS_PRAGMA_UNROLL
-          for (int rr = 1; rr < kSGRows; rr++) {
-            qs = (r == rr) ? row_scale[rr] : qs;
-          }
-          tSrS.data()[v] = static_cast<ElementS>(tSrS8.data()[v]) * qs;
+          tSrS.data()[v] = static_cast<ElementS>(tSrS8.data()[v]);
         }
       } else {
         TiledCopyKw copy_k_blk{k_block(pblk)};
@@ -1247,7 +1317,7 @@ struct FMHAFwdMainloop<
           cute::gemm(mma_qk, tSrQ, tSrKw, tSrS);
         }
       }
-      prefetch_k_tile(K + 1);
+      prefetch_k_tile(K + 1, pblk_next, t_next);
 
       // S(:, j) *= k_scale[j]: per-token K dequantization (before masking).
       CUTLASS_PRAGMA_UNROLL
@@ -1290,8 +1360,12 @@ struct FMHAFwdMainloop<
       }
 
       /* Softmax; then P(:, j) *= v_scale[j] after the row sums */
-      auto rescale =
-          softmax(effective_scale, K == blk_k0, tSrS, tA_max, tA_sum);
+      FragSRow rescale;
+      if constexpr (Int8Dot) {
+        rescale = softmax_rows(qk_row_scale, K == blk_k0, tSrS, tA_max, tA_sum);
+      } else {
+        rescale = softmax(effective_scale, K == blk_k0, tSrS, tA_max, tA_sum);
+      }
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tSrS.size(); i++) {
         tSrS(i) *= broadcast<1>(vsc, tSrS, i);
@@ -1300,32 +1374,54 @@ struct FMHAFwdMainloop<
       if constexpr (Int8PV) {
         /* P to int8 per query row of this tile; GEMM 2 in s8 x s8 -> s32 */
         auto pmax = reduce<1>(tSrS, sycl::maximum{});
-        decltype(pmax) pscale, pinv;
+        decltype(pmax) pscale, pinv2;
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < pmax.size(); i++) {
           pscale(i) = int8_attn_p_scale(pmax(i));
-          pinv(i) = int8_attn_div_rn(1.0f, pscale(i));
+          pinv2(i) = 2.0f * int8_attn_div_rn(1.0f, pscale(i));
         }
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tSrS.size(); i++) {
-          tSrS(i) = int8_attn_query_code(tSrS(i), broadcast<0>(pinv, tSrS, i));
+          tSrS(i) = int8_attn_p_code2(tSrS(i) * broadcast<0>(pinv2, tSrS, i));
         }
         reorder(tSrS, tArP8);  // exact integers -> s8 A operand
+        // O *= rescale only when some row's max moved in this tile: with
+        // rescale == 1 for every row the product is O itself, so skipping it
+        // changes no bit. At the first tile O is zero (and rescale finite),
+        // so the product is zero either way. The test is uniform over the
+        // sub-group (the rows' values are), so the branch does not diverge.
+        bool any_rescale = false;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < rescale.size(); i++) {
+          any_rescale = any_rescale || (rescale(i) != ElementS(1));
+        }
+        any_rescale = sycl::any_of_group(get_sub_group(), any_rescale);
         TiledCopyV8 copy_v8_blk{V_blk};
         CUTLASS_PRAGMA_UNROLL
         for (int VV = 0; VV < VTiles; VV++) {
           copy(copy_v8_blk, tVgV8(_, _, _, VV, t), tVrV8);
           reorder(tVrV8, tArV8);  // relayout only, codes as loaded
-          clear(tArO8);
-          cute::gemm(mma_pv8, tArP8, tArV8, tArO8);
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArA.size() / VTiles; i++) {
-            ElementA o = tArA(_, _, _, VV)(i);
-            if (K != blk_k0) {
-              o *= broadcast<0>(rescale, tArA, i);
+          // One K-step (tile_k == 32): D = P * V with a null accumulator,
+          // no clear of the s32 registers.
+          cute::gemm<true>(mma_pv8, tArP8, tArV8, tArO8);
+          // O = fma(float(s32), p_scale, O * rescale): the same expression
+          // in both branches (O * 1 == O), one fused rounding of the sum.
+          if (any_rescale) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++) {
+              tArA(_, _, _, VV)(i) = sycl::fma(
+                  static_cast<ElementA>(tArO8(i)),
+                  broadcast<0>(pscale, tArA, i),
+                  tArA(_, _, _, VV)(i) * broadcast<0>(rescale, tArA, i));
             }
-            tArA(_, _, _, VV)(i) = o + static_cast<ElementA>(tArO8(i)) *
-                                           broadcast<0>(pscale, tArA, i);
+          } else {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++) {
+              tArA(_, _, _, VV)(i) = sycl::fma(
+                  static_cast<ElementA>(tArO8(i)),
+                  broadcast<0>(pscale, tArA, i),
+                  tArA(_, _, _, VV)(i));
+            }
           }
         }
       } else {
@@ -1345,6 +1441,9 @@ struct FMHAFwdMainloop<
         }
       }
 
+      t_cur = t_next;
+      page_cur = page_next;
+      pblk_cur = pblk_next;
       barrier_wait(ScopeWorkgroup);
     }
   }
@@ -1384,6 +1483,46 @@ struct FMHAFwdMainloop<
     }
 
     /* Update sums */
+    auto tS_bsum = reduce<1>(tS, sycl::plus<void>{});
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS_sum.size(); i++) {
+      tS_sum(i) += tS_bsum(i);
+    }
+    return rescale;
+  }
+
+  // softmax() with one scale per query row (> 0): the INT8 Q*K path folds
+  // q_scale[row] into it, so S arrives as float(s32) * k_scale.
+  CUTLASS_DEVICE
+  FragSRow softmax_rows(
+      FragSRow const& scale,  // softmax scale * q_scale, per row
+      bool first_block,
+      FragS& tS,
+      FragSRow& tS_max,
+      FragSRow& tS_sum) {
+    auto tS_bmax = reduce<1>(tS, sycl::maximum{});
+
+    FragSRow rescale;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS_max.size(); i++) {
+      ElementS new_max = sycl::max(tS_max(i), scale(i) * tS_bmax(i));
+      rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
+      tS_max(i) = new_max;
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS.size(); i++) {
+      tS(i) = sycl::native::exp2(
+          broadcast<0>(scale, tS, i) * tS(i) - broadcast<0>(tS_max, tS, i));
+    }
+
+    if (!first_block) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_sum.size(); i++) {
+        tS_sum(i) *= rescale(i);
+      }
+    }
+
     auto tS_bsum = reduce<1>(tS, sycl::plus<void>{});
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_sum.size(); i++) {
